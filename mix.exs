@@ -80,10 +80,11 @@ defmodule Scriba.MixProject do
 
   defp aliases do
     [
-      # Fast suite — excludes property tests. Property tests are auto-tagged
-      # `property: true` by ExUnitProperties' `property` macro. Use this for
-      # normal development.
-      "test.fast": ["test --exclude property"],
+      # Fast suite — strictly DB-free, regardless of whether SCRIBA_TEST_DB_*
+      # is configured. Excludes both `:property` (auto-tagged on
+      # ExUnitProperties' property tests) and `:property_db` (real-Postgres
+      # tests in test/property_db/). Use this for normal development.
+      "test.fast": ["test --exclude property --exclude property_db"],
 
       # Real-Postgres property tests only. Function alias rather than string
       # alias because we need to gate on SCRIBA_TEST_DB_* env vars BEFORE

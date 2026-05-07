@@ -97,6 +97,7 @@ defmodule Scriba.Projection.Pipeline do
         :skip
       else
         meta = %{
+          id: event.id,
           stream_id: event.stream_id,
           position: event.position,
           type: event.type,

@@ -37,7 +37,7 @@ defmodule Scriba.Target.EctoTest do
 
     test "{:insert, struct} adds an insert step keyed by event id" do
       events = [event("e1", 1, "stream-a")]
-      result = {:insert, %ReadModel{name: "n", status: "open"}}
+      result = {:insert, %ReadModel{event_id: "e1", stream_id: "stream-a", position: 1}}
       multi = EctoTarget.build_multi(events, [result], projection(), advances_for(events))
 
       assert {:scriba_event, "e1"} in keys(multi)
@@ -46,7 +46,7 @@ defmodule Scriba.Target.EctoTest do
 
     test "{:update, schema, filter, [set: changes]} adds an update_all step" do
       events = [event("e1", 1, "stream-a")]
-      result = {:update, ReadModel, [name: "n"], set: [status: "shipped"]}
+      result = {:update, ReadModel, [event_id: "e1"], set: [position: 99]}
       multi = EctoTarget.build_multi(events, [result], projection(), advances_for(events))
 
       assert {:scriba_event, "e1"} in keys(multi)
@@ -54,7 +54,7 @@ defmodule Scriba.Target.EctoTest do
 
     test "{:delete, schema, filter} adds a delete_all step" do
       events = [event("e1", 1, "stream-a")]
-      result = {:delete, ReadModel, [name: "n"]}
+      result = {:delete, ReadModel, [event_id: "e1"]}
       multi = EctoTarget.build_multi(events, [result], projection(), advances_for(events))
 
       assert {:scriba_event, "e1"} in keys(multi)
@@ -87,9 +87,9 @@ defmodule Scriba.Target.EctoTest do
       ]
 
       results = [
-        {:insert, %ReadModel{name: "a"}},
+        {:insert, %ReadModel{event_id: "e1", stream_id: "stream-a", position: 1}},
         :skip,
-        {:delete, ReadModel, [name: "a"]}
+        {:delete, ReadModel, [event_id: "e1"]}
       ]
 
       multi = EctoTarget.build_multi(events, results, projection(), advances_for(events))
@@ -138,7 +138,10 @@ defmodule Scriba.Target.EctoTest do
   describe "build_multi/4 — position updates appended after handler ops" do
     test "all per-stream position steps come after handler steps" do
       events = [event("e1", 1, "stream-a"), event("e2", 2, "stream-b")]
-      results = [{:insert, %ReadModel{name: "a"}}, {:insert, %ReadModel{name: "b"}}]
+      results = [
+        {:insert, %ReadModel{event_id: "e1", stream_id: "stream-a", position: 1}},
+        {:insert, %ReadModel{event_id: "e2", stream_id: "stream-b", position: 2}}
+      ]
 
       multi = EctoTarget.build_multi(events, results, projection(), advances_for(events))
       ks = keys(multi)

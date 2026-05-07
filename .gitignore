@@ -18,3 +18,8 @@ erl_crash.dump
 # Editor / OS
 .DS_Store
 Thumbs.db
+
+# Local secrets (real credentials for SCRIBA_TEST_DB_*; see .env.local.example
+# for the template). Never commit.
+.env.local
+.env.*.local

@@ -33,34 +33,28 @@ case Application.get_env(:scriba, Scriba.Test.Repo) do
 
     {:ok, _pid} = Scriba.Test.Repo.start_link()
 
-    # Run the projection-tables migration. The migration module
-    # (Scriba.Test.Migrations.CreateScribaTables) is a proper Ecto migration
-    # that delegates to Scriba.Migrations.up/0 — same integration shape a
-    # real user gets when they invoke Scriba.Migrations.up/0 from their own
-    # migration file. Idempotent: Ecto.Migrator skips versions already
-    # tracked in `schema_migrations`.
+    # Run the test-suite migrations:
+    #   1 — Scriba's own scriba_positions + scriba_dead_letters via the
+    #       CreateScribaTables module that delegates to Scriba.Migrations.up/0.
+    #       Same integration shape a real user gets.
+    #   2 — test_read_models for property_db handlers' read-model writes.
+    # Idempotent: Ecto.Migrator skips versions already tracked in
+    # `schema_migrations`.
     Ecto.Migrator.run(
       Scriba.Test.Repo,
-      [{1, Scriba.Test.Migrations.CreateScribaTables}],
+      [
+        {1, Scriba.Test.Migrations.CreateScribaTables},
+        {2, Scriba.Test.Migrations.CreateTestReadModels}
+      ],
       :up,
       all: true
     )
 
-    # Sandbox in :manual mode — tests must explicitly check out a connection.
-    #
-    # For single-process tests the standard pattern is:
-    #
-    #     setup do
-    #       :ok = Ecto.Adapters.SQL.Sandbox.checkout(Scriba.Test.Repo)
-    #     end
-    #
-    # That is NOT enough for property_db tests in (PD1/PD2/
-    # PD3). Those exercise the projection's full process tree — Coordinator,
-    # Pipeline, Broadway processors, batchers — and ALL of those processes
-    # need to share the same sandboxed connection, which `checkout/1` won't
-    # span. will use `Ecto.Adapters.SQL.Sandbox.start_owner!/2`
-    # + `allow/3` (or the {:shared, owner_pid} mode) to share the owner's
-    # connection across the projection's processes. See Ecto.Adapters.SQL.Sandbox
-    # docs §"Allowance and ownership". TODO when lands.
+    # Sandbox in :manual mode — tests explicitly check out a connection.
+    # Property_db tests use the shared-mode helper in
+    # `Scriba.Test.PropertyDbHelpers.setup_sandbox/1` to make the connection
+    # visible across the projection's process tree (Coordinator, Pipeline,
+    # Broadway producer/processors/batchers, Ecto target transaction). See
+    # `test/property_db/sandbox_harness_test.exs` for the foundation test.
     Ecto.Adapters.SQL.Sandbox.mode(Scriba.Test.Repo, :manual)
 end

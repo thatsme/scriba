@@ -13,6 +13,46 @@ import Config
 #   * Partial config → raise here with a diagnostic naming the missing vars.
 #     Treating partial config as a misconfiguration prevents silent fall-back
 #     to nil credentials.
+#
+# Local dev convenience: a `.env.local` file in the project root is loaded
+# here (if present) before the env-var checks below. `.env.local` is
+# gitignored; `.env.local.example` is committed as a template. Real shell
+# environment variables still win — `.env.local` only fills in vars that
+# aren't already set.
+
+env_local_path = Path.expand("../.env.local", __DIR__)
+
+if File.exists?(env_local_path) do
+  env_local_path
+  |> File.read!()
+  |> String.split("\n", trim: true)
+  |> Enum.each(fn line ->
+    trimmed = String.trim(line)
+
+    cond do
+      trimmed == "" ->
+        :ok
+
+      String.starts_with?(trimmed, "#") ->
+        :ok
+
+      true ->
+        case String.split(trimmed, "=", parts: 2) do
+          [key, value] ->
+            key = String.trim(key)
+            value = value |> String.trim() |> String.trim("\"") |> String.trim("'")
+
+            # Don't overwrite a real shell env var.
+            if System.get_env(key) in [nil, ""] do
+              System.put_env(key, value)
+            end
+
+          _ ->
+            :ok
+        end
+    end
+  end)
+end
 
 required = ~w(SCRIBA_TEST_DB_HOST SCRIBA_TEST_DB_PORT SCRIBA_TEST_DB_NAME SCRIBA_TEST_DB_USER SCRIBA_TEST_DB_PASS)
 
