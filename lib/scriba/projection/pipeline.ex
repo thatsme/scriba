@@ -109,6 +109,15 @@ defmodule Scriba.Projection.Pipeline do
            ctx.target_state
          ) do
       {:ok, _state} ->
+        # Postgres-first, ETS-after. The Multi has already committed durably;
+        # these cache_put calls are a hot-read optimization for Scriba.info/2.
+        # The window where ETS lags behind Postgres is bounded by Coordinator
+        # restart: when :repo is configured (mandatory for Scriba.Target.Ecto;
+        # see Coordinator.resolve_repo/2), Position.init_cache preloads from
+        # Postgres on entry to :running and the cache catches back up. Test
+        # target users have no :repo and no Postgres — for them, the cache is
+        # only-ever-correct under the assumption the projection isn't restarted
+        # mid-run, which the test harness controls explicitly.
         Enum.each(stream_advances, fn {sid, pos} ->
           Scriba.Position.cache_put(ctx.projection.name, ctx.projection.version, sid, pos)
         end)

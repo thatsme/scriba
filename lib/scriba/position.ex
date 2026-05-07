@@ -54,9 +54,10 @@ defmodule Scriba.Position do
   already exists.
 
   Pass `repo: SomeRepo` to preload up to #{@preload_cap} `(stream_id, position)`
-  rows from Postgres. Beyond the cap, callers should rely on `cache_get/3`
-  falling back to `read_from_repo/4` on miss (not yet implemented; tracked
-  in the cache itself returning `:error` for now).
+  rows from Postgres. Beyond the cap, the cache stays sparse — `cache_get/4`
+  with `repo:` will lazily fetch un-preloaded streams from Postgres on miss
+  and back-fill the cache. `cache_get/3` (no opts) is pure ETS and returns
+  `:error` on miss without any fallback.
 
   Emits `[:scriba, :projection, :cache_initialized]` telemetry with metadata
   `%{name, version, source, stream_count}` where `source` is `:postgres`
@@ -133,21 +134,64 @@ defmodule Scriba.Position do
 
   @doc """
   Returns `{:ok, position}` for one stream from the ETS cache, or `:error`
-  on cache miss. Does **not** fall back to Postgres — callers wanting
-  durable lookup should call `read_from_repo/4` explicitly on miss.
+  on cache miss.
+
+  Pure ETS lookup — no I/O. If you want a cache-then-Postgres lookup that
+  also backfills the cache on miss, use `cache_get/4` with `repo:`.
   """
   @spec cache_get(name(), version(), stream_id()) :: {:ok, position()} | :error
   def cache_get(name, version, stream_id) do
+    cache_get(name, version, stream_id, [])
+  end
+
+  @doc """
+  Cache-first lookup with optional Postgres fallback.
+
+  Behaviour:
+
+    * Hit in ETS → `{:ok, position}` (no Postgres call).
+    * Miss in ETS, no `:repo` opt → `:error`.
+    * Miss in ETS, `:repo` opt set → reads from Postgres via
+      `read_from_repo/4`. If the row exists, the cache is back-filled and
+      `{:ok, position}` is returned. If the row does not exist (no commit
+      for this stream yet), returns `:error`.
+
+  's source-side dedup is the primary caller of the
+  `:repo`-backed form: dedup needs the durable cursor for a stream that
+  hasn't appeared in the cache yet (e.g. a newly-discovered stream after
+  Coordinator restart with a cache preloaded only up to `@preload_cap`
+  rows).
+  """
+  @spec cache_get(name(), version(), stream_id(), keyword()) ::
+          {:ok, position()} | :error
+  def cache_get(name, version, stream_id, opts) do
     table = table_name(name, version)
 
     case :ets.whereis(table) do
       :undefined ->
-        :error
+        lazy_load(opts, name, version, stream_id)
 
       _ ->
         case :ets.lookup(table, stream_id) do
           [{_sid, pos}] -> {:ok, pos}
-          [] -> :error
+          [] -> lazy_load(opts, name, version, stream_id)
+        end
+    end
+  end
+
+  defp lazy_load(opts, name, version, stream_id) do
+    case Keyword.get(opts, :repo) do
+      nil ->
+        :error
+
+      repo ->
+        case read_from_repo(repo, name, version, stream_id) do
+          nil ->
+            :error
+
+          pos ->
+            cache_put(name, version, stream_id, pos)
+            {:ok, pos}
         end
     end
   end

@@ -12,6 +12,7 @@ defmodule Scriba.MixProject do
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
+      aliases: aliases(),
       name: "Scriba",
       source_url: @source_url,
       description: description(),
@@ -25,6 +26,10 @@ defmodule Scriba.MixProject do
       extra_applications: [:logger],
       mod: {Scriba.Application, []}
     ]
+  end
+
+  def cli do
+    [preferred_envs: ["test.fast": :test]]
   end
 
   defp elixirc_paths(:test), do: ["lib", "test/support"]
@@ -64,6 +69,16 @@ defmodule Scriba.MixProject do
       main: "readme",
       extras: ["README.md", "CHANGELOG.md"],
       source_ref: "v#{@version}"
+    ]
+  end
+
+  defp aliases do
+    [
+      # Fast suite — excludes property tests. Property tests are auto-tagged
+      # `property: true` by ExUnitProperties' `property` macro. Use this for
+      # normal development; run `mix test` for the full suite (slow + the
+      # in-flight property-test rewrite from ).
+      "test.fast": ["test --exclude property"]
     ]
   end
 end
