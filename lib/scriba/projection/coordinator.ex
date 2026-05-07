@@ -141,7 +141,15 @@ defmodule Scriba.Projection.Coordinator do
 
   def handle_event(:enter, _from, :paused, _data), do: :keep_state_and_data
   def handle_event(:enter, _from, :draining, _data), do: :keep_state_and_data
-  def handle_event(:enter, _from, :stopped, _data), do: :keep_state_and_data
+
+  def handle_event(:enter, _from, :stopped, data) do
+    # Permanent stop — clean up this projection's rows in the shared cache.
+    # Crash-driven Coordinator restarts are covered by init_cache/3's
+    # wipe-on-entry; this drop matters for projections the user explicitly
+    # stops and never restarts.
+    Scriba.Position.drop_cache(data.name, data.version)
+    :keep_state_and_data
+  end
 
   ## :idle → :running
 

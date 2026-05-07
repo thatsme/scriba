@@ -18,6 +18,14 @@ defmodule Scriba.Projection.Pipeline do
 
     {:ok, target_state} = target_module.init(target_opts)
 
+    # Capture parallelism in the partition_by closure so each call goes
+    # through Scriba.Partitioner.partition/2 with the right partition count.
+    # Broadway's `concurrency` and our partition function's modulus are kept
+    # in lockstep this way.
+    partition_by = fn %Message{data: %Scriba.Event{stream_id: sid}} ->
+      Scriba.Partitioner.partition(sid, parallelism)
+    end
+
     Broadway.start_link(__MODULE__,
       name: via_tuple(name, version),
       producer: [
@@ -27,7 +35,7 @@ defmodule Scriba.Projection.Pipeline do
       processors: [
         default: [
           concurrency: parallelism,
-          partition_by: &partition_by_stream/1
+          partition_by: partition_by
         ]
       ],
       batchers: [
@@ -61,11 +69,13 @@ defmodule Scriba.Projection.Pipeline do
 
   @impl Broadway
   def process_name({:via, Registry, {Scriba.Registry, {:pipeline, name, version}}}, suffix) do
-    :"scriba_pipeline_#{name}_v#{version}_#{suffix}"
-  end
-
-  defp partition_by_stream(%Message{data: %Scriba.Event{stream_id: sid}}) do
-    :erlang.phash2(sid)
+    # Broadway-internal processes (producer, processors, batchers, terminator)
+    # register in Scriba.Internals.Registry — separate from the public
+    # Scriba.Registry so :observer / Registry.lookup callers debugging public
+    # addresses don't see a flood of internal entries. Projection identity
+    # lives in the tuple key, not in the Registry's atom name, so the BEAM
+    # atom table stays bounded regardless of projection count.
+    {:via, Registry, {Scriba.Internals.Registry, {name, version, suffix}}}
   end
 
   @impl Broadway

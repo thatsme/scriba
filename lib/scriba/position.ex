@@ -8,20 +8,40 @@ defmodule Scriba.Position do
       atomically with read-model writes inside the target's `Ecto.Multi`
       via `multi/5`. Per-stream rows: PK `(projection_name,
       projection_version, stream_id)`.
-    * **ETS** (one table per projection, `:public + :named_table`) — hot-read
-      cache for `Scriba.info/1`. **Not authoritative**.
+    * **ETS** (one **shared** named table for the whole BEAM, keyed on
+      `{name, version, stream_id}` tuples) — hot-read cache for
+      `Scriba.info/1`. **Not authoritative**.
 
-  No `PositionStore` GenServer mediates either. The Coordinator creates the
-  ETS table on entering `:running`. The Pipeline writes one cache entry per
-  stream per batch via `cache_put/4`.
+  ## Shared-table model
 
-  ## TODO
+  The cache lives in a single named ETS table — `Scriba.Position.Cache` — that
+  is created once by `Scriba.Supervisor.init/1` and lives for the
+  application's lifetime. Each cached entry is keyed by a
+  `{name, version, stream_id}` tuple; `init_cache/3` and `drop_cache/2`
+  scope all their work to one projection's rows in that shared table.
 
-  Per-projection named ETS tables generate atoms unboundedly when projection
-  names are not bounded (e.g. property tests with `:erlang.unique_integer/1`).
-  collapses this into a single shared ETS table keyed on
-  `{name, version, stream_id}`. Until then, `init_cache/3` and `drop_cache/2`
-  manage per-projection tables.
+  This replaces the earlier per-projection `:named_table` design, which
+  generated a fresh atom per projection — unbounded growth of the BEAM
+  atom table when projection names were not bounded (e.g. property tests
+  with `:erlang.unique_integer/1`-derived names). The shared table allocates
+  exactly **one** atom regardless of projection count.
+
+  No `PositionStore` GenServer mediates the cache. Workers (the Pipeline)
+  write directly to the shared table via `cache_put/4`. Readers
+  (`Scriba.info/2`, telemetry) read directly via `cache_get/3` /
+  `stream_positions/2` / `safe_position/2`.
+
+  ## Lifecycle
+
+    * `Scriba.Supervisor.init/1` calls `create_shared_table/0` once at boot.
+    * `Coordinator` on entering `:running` calls `init_cache/3` —
+      **wipe-then-preload**: deletes any stale rows for this projection
+      (from a previously-crashed Coordinator), then preloads from Postgres
+      if `:repo` is set. Idempotent across pause→resume cycles.
+    * `Coordinator` on entering `:stopped` calls `drop_cache/2` to clean up
+      this projection's rows. (Crash recovery is covered by the wipe in
+      the next `init_cache/3`; `:stopped` cleanup matters for projections
+      that the user explicitly stops permanently.)
 
   ## Why no schema module
 
@@ -36,40 +56,36 @@ defmodule Scriba.Position do
   @type stream_id :: String.t()
   @type position :: non_neg_integer()
 
+  # Single shared cache table. One atom for the whole BEAM, allocated at
+  # module compile time.
+  @cache_table __MODULE__.Cache
+
   # Cap on the rows preloaded from Postgres at init_cache time. Beyond this,
-  # missing entries fall back to a lazy lookup from Postgres on cache_get
-  # miss. Trade-off documented in 
+  # un-preloaded streams fall back to lazy lookup via `cache_get/4` with
+  # `repo:`. Trade-off documented in 
   @preload_cap 10_000
 
-  ## ETS cache
-
-  @doc "Returns the atom name of the per-projection ETS cache table."
-  @spec table_name(name(), version()) :: atom()
-  def table_name(name, version) do
-    String.to_atom("scriba.position.#{name}.v#{version}")
-  end
+  ## Shared cache table
 
   @doc """
-  Creates the per-projection ETS cache. Idempotent: a no-op if the table
-  already exists.
-
-  Pass `repo: SomeRepo` to preload up to #{@preload_cap} `(stream_id, position)`
-  rows from Postgres. Beyond the cap, the cache stays sparse — `cache_get/4`
-  with `repo:` will lazily fetch un-preloaded streams from Postgres on miss
-  and back-fill the cache. `cache_get/3` (no opts) is pure ETS and returns
-  `:error` on miss without any fallback.
-
-  Emits `[:scriba, :projection, :cache_initialized]` telemetry with metadata
-  `%{name, version, source, stream_count}` where `source` is `:postgres`
-  (preloaded) or `:empty` (no repo configured).
+  Returns the atom name of the shared ETS cache table. Useful for
+  introspection (`:ets.info/1`, `:observer`).
   """
-  @spec init_cache(name(), version(), keyword()) :: atom()
-  def init_cache(name, version, opts \\ []) do
-    table = table_name(name, version)
+  @spec cache_table() :: atom()
+  def cache_table, do: @cache_table
 
-    case :ets.whereis(table) do
+  @doc """
+  Creates the shared ETS cache table. Called once from
+  `Scriba.Supervisor.init/1`. Idempotent — safe to call when the table
+  already exists (returns `:ok` either way).
+
+  The supervisor process owns the table; it dies with the application.
+  """
+  @spec create_shared_table() :: :ok
+  def create_shared_table do
+    case :ets.whereis(@cache_table) do
       :undefined ->
-        :ets.new(table, [
+        :ets.new(@cache_table, [
           :set,
           :public,
           :named_table,
@@ -78,30 +94,54 @@ defmodule Scriba.Position do
           {:decentralized_counters, true}
         ])
 
-        {source, count} =
-          case Keyword.get(opts, :repo) do
-            nil ->
-              {:empty, 0}
-
-            repo ->
-              n = preload_from_repo(table, repo, name, version)
-              {:postgres, n}
-          end
-
-        :telemetry.execute(
-          [:scriba, :projection, :cache_initialized],
-          %{stream_count: count},
-          %{name: name, version: version, source: source}
-        )
+        :ok
 
       _ ->
         :ok
     end
-
-    table
   end
 
-  defp preload_from_repo(table, repo, name, version) do
+  ## Per-projection lifecycle
+
+  @doc """
+  Wipes any existing cache entries for `(name, version)` and (optionally)
+  preloads up to #{@preload_cap} rows from Postgres into the shared table.
+
+  Pass `repo: SomeRepo` to enable Postgres preload. Beyond the
+  `@preload_cap` cutoff, un-preloaded streams fall back to lazy lookup via
+  `cache_get/4` with `repo:`.
+
+  Returns `:ok`.
+
+  Emits `[:scriba, :projection, :cache_initialized]` telemetry with
+  measurements `%{wiped_count, preloaded_count}` and metadata
+  `%{name, version, source}` where `source` is `:postgres` (preloaded) or
+  `:empty` (no repo configured).
+  """
+  @spec init_cache(name(), version(), keyword()) :: :ok
+  def init_cache(name, version, opts \\ []) do
+    wiped = drop_cache(name, version)
+
+    {source, preloaded} =
+      case Keyword.get(opts, :repo) do
+        nil ->
+          {:empty, 0}
+
+        repo ->
+          n = preload_from_repo(repo, name, version)
+          {:postgres, n}
+      end
+
+    :telemetry.execute(
+      [:scriba, :projection, :cache_initialized],
+      %{wiped_count: wiped, preloaded_count: preloaded},
+      %{name: name, version: version, source: source}
+    )
+
+    :ok
+  end
+
+  defp preload_from_repo(repo, name, version) do
     %{rows: rows} =
       Ecto.Adapters.SQL.query!(
         repo,
@@ -116,21 +156,33 @@ defmodule Scriba.Position do
         [name, version, @preload_cap]
       )
 
-    Enum.each(rows, fn [sid, pos] -> :ets.insert(table, {sid, pos}) end)
+    Enum.each(rows, fn [sid, pos] ->
+      :ets.insert(@cache_table, {{name, version, sid}, pos})
+    end)
 
     length(rows)
   end
 
-  @doc "Removes the per-projection ETS cache. Used on Coordinator stop."
-  @spec drop_cache(name(), version()) :: :ok
-  def drop_cache(name, version) do
-    table = table_name(name, version)
+  @doc """
+  Removes all cache entries belonging to `(name, version)` from the shared
+  table. Returns the number of rows deleted.
 
-    case :ets.whereis(table) do
-      :undefined -> :ok
-      _ -> :ets.delete(table) && :ok
+  No-op (returns 0) if the shared table doesn't exist yet — this can happen
+  in unit-tested code paths that bypass the application supervisor.
+  """
+  @spec drop_cache(name(), version()) :: non_neg_integer()
+  def drop_cache(name, version) do
+    case :ets.whereis(@cache_table) do
+      :undefined ->
+        0
+
+      _ ->
+        match_spec = [{{{name, version, :_}, :_}, [], [true]}]
+        :ets.select_delete(@cache_table, match_spec)
     end
   end
+
+  ## Reads / writes
 
   @doc """
   Returns `{:ok, position}` for one stream from the ETS cache, or `:error`
@@ -165,15 +217,13 @@ defmodule Scriba.Position do
   @spec cache_get(name(), version(), stream_id(), keyword()) ::
           {:ok, position()} | :error
   def cache_get(name, version, stream_id, opts) do
-    table = table_name(name, version)
-
-    case :ets.whereis(table) do
+    case :ets.whereis(@cache_table) do
       :undefined ->
         lazy_load(opts, name, version, stream_id)
 
       _ ->
-        case :ets.lookup(table, stream_id) do
-          [{_sid, pos}] -> {:ok, pos}
+        case :ets.lookup(@cache_table, {name, version, stream_id}) do
+          [{_key, pos}] -> {:ok, pos}
           [] -> lazy_load(opts, name, version, stream_id)
         end
     end
@@ -197,54 +247,49 @@ defmodule Scriba.Position do
   end
 
   @doc """
-  Writes one stream's position into the ETS cache. Silently no-ops if the
-  cache table does not exist (e.g. the projection isn't running, or the
-  Coordinator is mid-restart).
+  Writes one stream's position into the shared cache. Silently no-ops if
+  the shared table doesn't exist (path used by unit-test code that bypasses
+  the supervisor).
   """
   @spec cache_put(name(), version(), stream_id(), position()) :: :ok
   def cache_put(name, version, stream_id, position) do
-    table = table_name(name, version)
-
-    case :ets.whereis(table) do
+    case :ets.whereis(@cache_table) do
       :undefined -> :ok
-      _ -> :ets.insert(table, {stream_id, position}) && :ok
+      _ -> :ets.insert(@cache_table, {{name, version, stream_id}, position}) && :ok
     end
   end
 
   @doc """
-  Returns a `%{stream_id => position}` map of all streams known to the cache
-  for this projection. Empty map if the cache table doesn't exist.
+  Returns a `%{stream_id => position}` map of all streams known to the
+  cache for this projection. Empty map if the shared table doesn't exist
+  or no streams are tracked.
   """
   @spec stream_positions(name(), version()) :: %{stream_id() => position()}
   def stream_positions(name, version) do
-    table = table_name(name, version)
+    case :ets.whereis(@cache_table) do
+      :undefined ->
+        %{}
 
-    case :ets.whereis(table) do
-      :undefined -> %{}
-      _ -> :ets.tab2list(table) |> Map.new()
+      _ ->
+        @cache_table
+        |> :ets.match_object({{name, version, :_}, :_})
+        |> Map.new(fn {{_n, _v, sid}, pos} -> {sid, pos} end)
     end
   end
 
   @doc """
   Returns the **safe replay point**: the minimum position across all
-  streams in the cache. A new replica resuming from this position is
-  guaranteed not to miss any event in any stream.
+  streams in the cache for this projection. A new replica resuming from
+  this position is guaranteed not to miss any event in any stream.
 
-  Returns 0 when the cache is empty (no streams have committed yet).
+  Returns 0 when the projection has no cached streams (cache was just
+  initialized, or the table doesn't exist).
   """
   @spec safe_position(name(), version()) :: position()
   def safe_position(name, version) do
-    table = table_name(name, version)
-
-    case :ets.whereis(table) do
-      :undefined ->
-        0
-
-      _ ->
-        case :ets.tab2list(table) do
-          [] -> 0
-          rows -> rows |> Enum.map(fn {_sid, pos} -> pos end) |> Enum.min()
-        end
+    case stream_positions(name, version) do
+      empty when map_size(empty) == 0 -> 0
+      positions -> positions |> Map.values() |> Enum.min()
     end
   end
 
