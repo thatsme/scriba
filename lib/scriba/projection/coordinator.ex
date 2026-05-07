@@ -92,38 +92,18 @@ defmodule Scriba.Projection.Coordinator do
       parallelism: Keyword.fetch!(opts, :parallelism),
       handler: Keyword.fetch!(opts, :handler),
       supervisor_pid: Keyword.fetch!(opts, :supervisor_pid),
-      repo: resolve_repo(opts, target_spec)
+      repo: Scriba.Position.resolve_repo(opts, target_spec)
     }
+
+    # Initialize the position cache once per Coordinator-process lifetime.
+    # The wipe-then-preload runs here (not on every :running enter) so that
+    # pause→resume preserves the cache that source-side dedup depends on.
+    # Coordinator crash → init/1 re-runs → cache is wiped and reloaded from
+    # Postgres, which is the crash-recovery semantic we want.
+    Scriba.Position.init_cache(data.name, data.version, repo: data.repo)
 
     {:ok, :idle, data, [{:next_event, :internal, :auto_start}]}
   end
-
-  # Resolve the :repo the Coordinator hands to Position.init_cache.
-  #
-  # Order:
-  #   1. Explicit `:repo` opt on the projection wins (override path; e.g. a
-  #      custom target that also wants cache preload from Postgres).
-  #   2. Scriba.Target.Ecto's target_spec carries `:repo` in its target opts —
-  #      extract it so Ecto-target projections always have a repo for cache
-  #      rebuild on Coordinator restart. This is what bounds the ETS-lag-
-  #      behind-Postgres window after crashes.
-  #   3. Otherwise nil (e.g. Test target — Agent is its own truth, no cache
-  #      rebuild needed).
-  defp resolve_repo(opts, target_spec) do
-    case Keyword.fetch(opts, :repo) do
-      {:ok, repo} -> repo
-      :error -> repo_from_target_spec(target_spec)
-    end
-  end
-
-  defp repo_from_target_spec({Scriba.Target.Ecto, target_opts}) when is_list(target_opts) do
-    # Scriba.Target.Ecto.init/1 itself raises if :repo is missing, but the
-    # Coordinator runs first and needs the repo for cache preload — so we
-    # surface a clear error here rather than letting init/1 fail later.
-    Keyword.fetch!(target_opts, :repo)
-  end
-
-  defp repo_from_target_spec(_), do: nil
 
   ## :enter handlers — required by :state_enter callback mode
 
@@ -131,8 +111,6 @@ defmodule Scriba.Projection.Coordinator do
   def handle_event(:enter, _from, :idle, _data), do: :keep_state_and_data
 
   def handle_event(:enter, _from, :running, data) do
-    Scriba.Position.init_cache(data.name, data.version, repo: data.repo)
-
     case ensure_monitored(data) do
       {:ok, new_data} -> {:keep_state, new_data}
       :pending -> {:keep_state, data, [{:state_timeout, @poll_interval, :monitor_pipeline}]}

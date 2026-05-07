@@ -293,6 +293,41 @@ defmodule Scriba.Position do
     end
   end
 
+  ## Repo resolution (shared by Coordinator + Pipeline)
+
+  @doc """
+  Resolves the `Ecto.Repo` to use for position-tracking I/O — both the
+  Coordinator's `init_cache/3` preload and the Pipeline's source-side
+  dedup `cache_get/4` fallback consult this.
+
+  Single source of truth: keeping repo resolution in one place means the
+  Coordinator and Pipeline can never disagree about which repo backs the
+  cache. Diverging would silently break source-side dedup (Pipeline reads
+  one repo, Coordinator writes another).
+
+  Order:
+
+    1. Explicit `:repo` opt on the projection wins (override path; e.g. a
+       custom target that also wants cache preload from Postgres).
+    2. `Scriba.Target.Ecto`'s target_spec carries `:repo` in its target
+       opts — extract it. Raises if missing, since the Ecto target needs
+       it anyway.
+    3. Otherwise `nil` (Test target, custom non-Postgres targets).
+  """
+  @spec resolve_repo(keyword(), {module(), keyword()}) :: module() | nil
+  def resolve_repo(opts, target_spec) do
+    case Keyword.fetch(opts, :repo) do
+      {:ok, repo} -> repo
+      :error -> repo_from_target_spec(target_spec)
+    end
+  end
+
+  defp repo_from_target_spec({Scriba.Target.Ecto, target_opts}) when is_list(target_opts) do
+    Keyword.fetch!(target_opts, :repo)
+  end
+
+  defp repo_from_target_spec(_), do: nil
+
   ## Postgres (authoritative)
 
   @doc """

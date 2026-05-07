@@ -18,6 +18,11 @@ defmodule Scriba.Projection.Pipeline do
 
     {:ok, target_state} = target_module.init(target_opts)
 
+    # Same repo resolution as Coordinator — single source of truth in
+    # Scriba.Position.resolve_repo/2. Used by source-side dedup's
+    # cache_get/4 fallback when a stream's cursor isn't preloaded in cache.
+    repo = Scriba.Position.resolve_repo(opts, {target_module, target_opts})
+
     # Capture parallelism in the partition_by closure so each call goes
     # through Scriba.Partitioner.partition/2 with the right partition count.
     # Broadway's `concurrency` and our partition function's modulus are kept
@@ -49,7 +54,8 @@ defmodule Scriba.Projection.Pipeline do
         projection: %{name: name, version: version},
         target_module: target_module,
         target_state: target_state,
-        handler: handler
+        handler: handler,
+        repo: repo
       }
     )
   end
@@ -80,17 +86,47 @@ defmodule Scriba.Projection.Pipeline do
 
   @impl Broadway
   def handle_message(_processor, %Message{data: %Scriba.Event{} = event} = msg, ctx) do
-    meta = %{
-      stream_id: event.stream_id,
-      position: event.position,
-      type: event.type,
-      metadata: event.metadata,
-      occurred_at: event.occurred_at
-    }
+    handler_result =
+      if already_committed?(event, ctx) do
+        # Source-side dedup: the source has redelivered
+        # an event whose position is at or below our committed cursor for
+        # this stream. The handler effect has already been applied; we
+        # return :skip so the target doesn't double-apply, and so
+        # handle_batch/4's stream_advances filter (below) keeps the cursor
+        # where it is rather than regressing it.
+        :skip
+      else
+        meta = %{
+          stream_id: event.stream_id,
+          position: event.position,
+          type: event.type,
+          metadata: event.metadata,
+          occurred_at: event.occurred_at
+        }
 
-    handler_result = ctx.handler.handle(event.data, meta)
+        ctx.handler.handle(event.data, meta)
+      end
 
     Message.put_data(msg, %{event: event, handler_result: handler_result})
+  end
+
+  # Cache-first lookup; falls back to Postgres if `:repo` is configured
+  # (Ecto target). Test target users have repo: nil — dedup is bounded to a
+  # single Coordinator lifetime. On Coordinator restart the cache is wiped
+  # (init_cache in init/1) and the Test source re-yields from zero, so
+  # cross-restart dedup requires `:repo` to preload the cursor from
+  # Postgres. 's real-Postgres property tests will exercise that
+  # path.
+  defp already_committed?(%Scriba.Event{} = event, ctx) do
+    case Scriba.Position.cache_get(
+           ctx.projection.name,
+           ctx.projection.version,
+           event.stream_id,
+           repo: ctx.repo
+         ) do
+      {:ok, committed} -> event.position <= committed
+      :error -> false
+    end
   end
 
   @impl Broadway
@@ -98,14 +134,19 @@ defmodule Scriba.Projection.Pipeline do
     events = Enum.map(messages, & &1.data.event)
     handler_results = Enum.map(messages, & &1.data.handler_result)
 
-    # Per-stream max position. With Broadway's partition_by(stream_id) above,
-    # one stream's events all arrive at the same processor and reach the
-    # batcher in source order — so the max position per stream within a
-    # batch is monotonic w.r.t. the previous batch's max for that same
-    # stream. The global cross-partition reorder bug that motivated the
-    # max(current, batch_max) clamp is moot under per-stream cursors.
+    # stream_advances only includes events whose handler returned a non-:skip
+    # result — i.e. events that were actually applied to the read model.
+    # Skipped events (dedup-induced OR user-handler :skip) leave the cursor
+    # alone. Crucially, this prevents the dedup case from regressing the
+    # cursor: a redelivered batch of events all below the current cursor
+    # would otherwise overwrite it via Position.multi/5's unconditional
+    # `ON CONFLICT SET position = EXCLUDED.position`. A stream that contains
+    # only :skip events in this batch is absent from stream_advances —
+    # correctly, since there's nothing to advance.
     stream_advances =
-      events
+      messages
+      |> Enum.reject(fn msg -> msg.data.handler_result == :skip end)
+      |> Enum.map(& &1.data.event)
       |> Enum.group_by(& &1.stream_id)
       |> Map.new(fn {sid, evts} ->
         {sid, evts |> Enum.map(& &1.position) |> Enum.max()}
@@ -120,14 +161,13 @@ defmodule Scriba.Projection.Pipeline do
          ) do
       {:ok, _state} ->
         # Postgres-first, ETS-after. The Multi has already committed durably;
-        # these cache_put calls are a hot-read optimization for Scriba.info/2.
-        # The window where ETS lags behind Postgres is bounded by Coordinator
-        # restart: when :repo is configured (mandatory for Scriba.Target.Ecto;
-        # see Coordinator.resolve_repo/2), Position.init_cache preloads from
-        # Postgres on entry to :running and the cache catches back up. Test
-        # target users have no :repo and no Postgres — for them, the cache is
-        # only-ever-correct under the assumption the projection isn't restarted
-        # mid-run, which the test harness controls explicitly.
+        # these cache_put calls are a hot-read optimization for Scriba.info/2
+        # and source-side dedup. The window where ETS lags behind Postgres is
+        # bounded by Coordinator lifetime: Coordinator.init/1 calls
+        # Position.init_cache, which preloads from Postgres when `:repo` is
+        # configured (mandatory for Scriba.Target.Ecto via
+        # Position.resolve_repo/2). Test target users have no `:repo`; their
+        # cache only-ever-reflects state since the current Coordinator started.
         Enum.each(stream_advances, fn {sid, pos} ->
           Scriba.Position.cache_put(ctx.projection.name, ctx.projection.version, sid, pos)
         end)

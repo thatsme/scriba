@@ -8,6 +8,84 @@ defmodule Scriba.Projection.PipelineTest do
   alias Scriba.Target.Test, as: TestTarget
   alias Scriba.Test
 
+  describe "source-side dedup" do
+    @tag :integration
+    test "redelivered events are skipped — Pipeline restart, source replays, no duplicates" do
+      agent = start_supervised!({TestTarget, []})
+      events = Test.Events.list(10, streams: 3)
+      name = "pipeline-dedup-#{:erlang.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        version: 1,
+        source: {Scriba.Test.Source, events: events},
+        target: {TestTarget, agent: agent},
+        parallelism: 2,
+        handler: Scriba.Test.Projection,
+        batch_size: 5,
+        batch_timeout: 50
+      ]
+
+      start_supervised!({ProjSup, opts})
+
+      # Phase 1 — initial pass: every event flows through the handler.
+      eventually(fn -> assert length(TestTarget.commits(agent)) == 10 end, 2_000)
+      first_pass = TestTarget.commits(agent)
+      initial_positions = Scriba.Position.stream_positions(name, 1)
+      assert length(first_pass) == 10
+      assert map_size(initial_positions) == 3
+
+      # Phase 2 — arm a deterministic completion signal for the replay.
+      # Broadway emits [:broadway, :processor, :message, :stop] exactly once
+      # per message after handle_message returns. Counting 10 of these
+      # post-restart proves the replay flowed end-to-end through the dedup
+      # check, without sleep-based timing assumptions.
+      ref = make_ref()
+      handler_id = {:dedup_message_counter, ref}
+
+      :telemetry.attach(
+        handler_id,
+        [:broadway, :processor, :message, :stop],
+        &__MODULE__.forward_broadway_message/4,
+        %{test_pid: self(), ref: ref}
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      # Phase 3 — kill the Pipeline child, restart it. Coordinator and the
+      # position cache survive (they live above and beside the Pipeline in
+      # the rest_for_one tree). The new Pipeline brings up a fresh
+      # Scriba.Test.Source which re-yields all 10 events. Using direct
+      # Supervisor.terminate_child / restart_child rather than
+      # Coordinator.pause/resume — those wrap the same primitives but
+      # the names imply pause/resume semantics that aren't real until .
+      [{sup_pid, _}] = Registry.lookup(Scriba.Registry, {:projection_supervisor, name, 1})
+      :ok = Supervisor.terminate_child(sup_pid, Scriba.Projection.Pipeline)
+      {:ok, _} = Supervisor.restart_child(sup_pid, Scriba.Projection.Pipeline)
+
+      # Phase 4 — drain 10 broadway-message-stop events. Once all 10
+      # replayed events have completed handle_message, dedup has had its
+      # chance on every one of them.
+      for _ <- 1..10 do
+        assert_receive {^ref, :broadway_message_stop}, 5_000
+      end
+
+      # Phase 5 — dedup caught every replayed event:
+      #  - Test target commit log unchanged (handle_message returned :skip
+      #    for the redelivered events; Test.apply_batch filters :skip).
+      #  - Per-stream cursors unchanged (handle_batch's stream_advances
+      #    filter excludes :skip results, so cache_put isn't called for
+      #    streams whose batch contained only redelivered events).
+      assert TestTarget.commits(agent) == first_pass
+      assert Scriba.Position.stream_positions(name, 1) == initial_positions
+    end
+  end
+
+  @doc false
+  def forward_broadway_message(_event, _measurements, _metadata, %{test_pid: pid, ref: ref}) do
+    send(pid, {ref, :broadway_message_stop})
+  end
+
   describe "partitioner integration" do
     @tag :integration
     test "Scriba.Partitioner.partition/2 is on the Pipeline's runtime path" do
