@@ -29,7 +29,13 @@ defmodule Scriba.MixProject do
   end
 
   def cli do
-    [preferred_envs: ["test.fast": :test]]
+    [
+      preferred_envs: [
+        "test.fast": :test,
+        "test.property_db": :test,
+        "test.all": :test
+      ]
+    ]
   end
 
   defp elixirc_paths(:test), do: ["lib", "test/support"]
@@ -76,9 +82,50 @@ defmodule Scriba.MixProject do
     [
       # Fast suite — excludes property tests. Property tests are auto-tagged
       # `property: true` by ExUnitProperties' `property` macro. Use this for
-      # normal development; run `mix test` for the full suite (slow + the
-      # in-flight property-test rewrite from ).
-      "test.fast": ["test --exclude property"]
+      # normal development.
+      "test.fast": ["test --exclude property"],
+
+      # Real-Postgres property tests only. Function alias rather than string
+      # alias because we need to gate on SCRIBA_TEST_DB_* env vars BEFORE
+      # invoking ExUnit. A naive `test --only property_db` doesn't work:
+      # ExUnit's `--only` replaces (rather than merges with) the
+      # `exclude: [property_db: true]` that test_helper.exs sets when env
+      # is unconfigured, so property_db tests would run and fail with
+      # connection errors instead of skipping cleanly. Verified empirically
+      # during 
+      "test.property_db": &__MODULE__.test_property_db/1,
+
+      # Everything ExUnit will run with the current environment. Includes
+      # the surviving P1 ordering property; with SCRIBA_TEST_DB_* set, also
+      # includes property_db tests. Without those env vars, property_db is
+      # excluded by test_helper.exs and this alias still passes cleanly.
+      "test.all": ["test"]
     ]
+  end
+
+  @scriba_test_db_vars ~w(
+    SCRIBA_TEST_DB_HOST
+    SCRIBA_TEST_DB_PORT
+    SCRIBA_TEST_DB_NAME
+    SCRIBA_TEST_DB_USER
+    SCRIBA_TEST_DB_PASS
+  )
+
+  @doc false
+  def test_property_db(args) do
+    if Enum.all?(@scriba_test_db_vars, fn v -> System.get_env(v) not in [nil, ""] end) do
+      Mix.Task.run("test", ["--only", "property_db"] ++ args)
+    else
+      Mix.shell().info("""
+
+      mix test.property_db skipped: SCRIBA_TEST_DB_* env vars are not set.
+
+      Set all of: #{Enum.join(@scriba_test_db_vars, ", ")}
+
+      The fast suite (mix test.fast) runs without any of this.
+      """)
+
+      :ok
+    end
   end
 end

@@ -20,15 +20,15 @@ defmodule Scriba.Property.OrderingTest do
         try do
           assert {:ok, _} = H.wait_until_unique(agent, length(events), 5_000)
 
-          id_to_stream = Map.new(events, fn e -> {e.id, e.stream_id} end)
+          # commits are 3-tuples {event_id, stream_id, position} in commit
+          # order (changed the shape). Group by stream_id
+          # field directly rather than reconstructing it from event_id.
           commits = TestTarget.commits(agent)
 
-          # Per stream: positions in commit order must be non-decreasing
-          # (handlers see same-stream events in source order).
           commits
-          |> Enum.group_by(fn {id, _pos} -> Map.fetch!(id_to_stream, id) end)
+          |> Enum.group_by(fn {_id, sid, _pos} -> sid end)
           |> Enum.each(fn {stream_id, stream_commits} ->
-            positions = Enum.map(stream_commits, fn {_id, p} -> p end)
+            positions = Enum.map(stream_commits, fn {_id, _sid, pos} -> pos end)
 
             assert positions == Enum.sort(positions),
                    "stream #{stream_id} commits out of order: #{inspect(positions)}"
