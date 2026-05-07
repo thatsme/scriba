@@ -133,7 +133,21 @@ defmodule Scriba.Test.PropertyDbHelpers do
     end
   end
 
-  defp read_model_count(name_prefix) do
+  @doc """
+  Returns the count of `test_read_models` rows whose `event_id` starts
+  with `<name_prefix>-`. Same query the wait function uses internally —
+  exposed publicly for test assertions on accumulated rows.
+
+  As with `wait_for_read_model/4`, `name_prefix` must not contain SQL
+  `LIKE` wildcards.
+  """
+  @spec read_model_count(String.t()) :: non_neg_integer()
+  def read_model_count(name_prefix) do
+    if String.contains?(name_prefix, ["%", "_"]) do
+      raise ArgumentError,
+            "name_prefix must not contain LIKE wildcards % or _: #{inspect(name_prefix)}"
+    end
+
     %{rows: [[count]]} =
       Ecto.Adapters.SQL.query!(
         Repo,
@@ -142,5 +156,44 @@ defmodule Scriba.Test.PropertyDbHelpers do
       )
 
     count
+  end
+
+  @doc """
+  Looks up the running `Scriba.Test.Source` (Broadway producer) pid for
+  a projection.
+
+  Broadway names internal processes via `process_name(broadway_name,
+  base_name)`; for `concurrency: 1` producers it's called with
+  `base_name = "Producer_0"` (Broadway 1.3 — see
+  `Broadway.Topology.process_name/3` and `process_names/3`,
+  `deps/broadway/lib/broadway/topology.ex` lines 475–504, which
+  interpolate `"\#{type}_\#{index}"`).
+
+  Our `Scriba.Projection.Pipeline.process_name/2` returns
+  `{:via, Registry, {Scriba.Internals.Registry, {name, version, suffix}}}`,
+  so the producer is registered under key `{name, version, "Producer_0"}`.
+
+  This lookup is **load-bearing on the Broadway internal naming
+  convention**. If a future Broadway version changes the producer suffix
+  format, this helper raises and tests fail loudly — preferable to silent
+  drift.
+  """
+  @spec lookup_source(String.t(), pos_integer()) :: pid()
+  def lookup_source(name, version) do
+    case Registry.lookup(Scriba.Internals.Registry, {name, version, "Producer_0"}) do
+      [{pid, _}] ->
+        pid
+
+      [] ->
+        raise """
+        Scriba.Test.Source producer not found for #{inspect({name, version})}.
+
+        If this is a fresh Broadway version, verify the producer's
+        process_name suffix is still "Producer_0" (see
+        Broadway.Topology in deps/broadway). Otherwise, the projection
+        may not be running yet — call this AFTER start_supervised!
+        returns.
+        """
+    end
   end
 end

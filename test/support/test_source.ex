@@ -60,6 +60,18 @@ defmodule Scriba.Test.Source do
   @spec acked_cursor(GenServer.server()) :: non_neg_integer()
   def acked_cursor(source), do: GenStage.call(source, :acked_cursor)
 
+  @doc """
+  Returns the number of events still in the source's internal queue —
+  events that the source could still yield on a future `handle_demand`.
+
+  Useful for property tests that want to assert `:start_from` filtered
+  the queue down to empty, without poking at GenStage internals (the
+  Broadway ProducerStage wraps this state, so `:sys.get_state/1` would
+  require digging through `.state.module_state.queue`).
+  """
+  @spec pending_count(GenServer.server()) :: non_neg_integer()
+  def pending_count(source), do: GenStage.call(source, :pending_count)
+
   ## GenStage producer callbacks
 
   @impl GenStage
@@ -90,6 +102,10 @@ defmodule Scriba.Test.Source do
   @impl GenStage
   def handle_call(:acked_cursor, _from, state) do
     {:reply, state.acked_cursor, [], state}
+  end
+
+  def handle_call(:pending_count, _from, state) do
+    {:reply, length(state.queue), [], state}
   end
 
   @impl GenStage
