@@ -1,0 +1,20 @@
+scriba-*.tar
+
+# Build / deps
+/_build/
+/cover/
+/deps/
+/doc/
+/.fetch
+erl_crash.dump
+*.ez
+
+# Tooling
+/.elixir_ls/
+/.lexical/
+.dialyzer_plt
+.dialyxir_*
+
+# Editor / OS
+.DS_Store
+Thumbs.db
