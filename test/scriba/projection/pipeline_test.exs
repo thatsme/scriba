@@ -86,6 +86,46 @@ defmodule Scriba.Projection.PipelineTest do
     send(pid, {ref, :broadway_message_stop})
   end
 
+  describe "cache update path" do
+    @tag :integration
+    test "Position.stream_positions reflects per-stream max after a successful run" do
+      agent = start_supervised!({TestTarget, []})
+      events = Test.Events.list(10, streams: 3)
+      name = "pipeline-cache-#{:erlang.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        version: 1,
+        source: {Scriba.Test.Source, events: events},
+        target: {TestTarget, agent: agent},
+        parallelism: 2,
+        handler: Scriba.Test.Projection,
+        batch_size: 5,
+        batch_timeout: 50
+      ]
+
+      start_supervised!({ProjSup, opts})
+
+      eventually(fn -> assert length(TestTarget.commits(agent)) == 10 end, 2_000)
+
+      # The Pipeline calls Scriba.Position.cache_put/4 for every stream
+      # in the batch's stream_advances after a successful target.apply_batch.
+      # After all 10 events flow through, the cache should hold the per-stream
+      # max position for each of the 3 streams from Test.Events.list.
+      expected =
+        events
+        |> Enum.group_by(& &1.stream_id)
+        |> Map.new(fn {sid, evts} -> {sid, evts |> Enum.map(& &1.position) |> Enum.max()} end)
+
+      actual = Scriba.Position.stream_positions(name, 1)
+
+      assert actual == expected,
+             "cache cursors differ from expected per-stream max:\n" <>
+               "  expected: #{inspect(expected)}\n" <>
+               "  actual:   #{inspect(actual)}"
+    end
+  end
+
   describe "partitioner integration" do
     @tag :integration
     test "Scriba.Partitioner.partition/2 is on the Pipeline's runtime path" do
