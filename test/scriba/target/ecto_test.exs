@@ -27,10 +27,10 @@ defmodule Scriba.Target.EctoTest do
     |> Map.new(fn {sid, evts} -> {sid, evts |> Enum.map(& &1.position) |> Enum.max()} end)
   end
 
-  describe "build_multi/4 — handler return shapes (§4.2)" do
+  describe "build_multi/5 — handler return shapes (§4.2)" do
     test ":skip yields no event op, only the per-stream position update" do
       events = [event("e1", 1, "stream-a")]
-      multi = EctoTarget.build_multi(events, [:skip], projection(), advances_for(events))
+      multi = EctoTarget.build_multi(events, [:skip], projection(), advances_for(events), [])
 
       assert keys(multi) == [{:scriba_position, "stream-a"}]
     end
@@ -38,7 +38,7 @@ defmodule Scriba.Target.EctoTest do
     test "{:insert, struct} adds an insert step keyed by event id" do
       events = [event("e1", 1, "stream-a")]
       result = {:insert, %ReadModel{event_id: "e1", stream_id: "stream-a", position: 1}}
-      multi = EctoTarget.build_multi(events, [result], projection(), advances_for(events))
+      multi = EctoTarget.build_multi(events, [result], projection(), advances_for(events), [])
 
       assert {:scriba_event, "e1"} in keys(multi)
       assert {:scriba_position, "stream-a"} in keys(multi)
@@ -47,7 +47,7 @@ defmodule Scriba.Target.EctoTest do
     test "{:update, schema, filter, [set: changes]} adds an update_all step" do
       events = [event("e1", 1, "stream-a")]
       result = {:update, ReadModel, [event_id: "e1"], set: [position: 99]}
-      multi = EctoTarget.build_multi(events, [result], projection(), advances_for(events))
+      multi = EctoTarget.build_multi(events, [result], projection(), advances_for(events), [])
 
       assert {:scriba_event, "e1"} in keys(multi)
     end
@@ -55,7 +55,7 @@ defmodule Scriba.Target.EctoTest do
     test "{:delete, schema, filter} adds a delete_all step" do
       events = [event("e1", 1, "stream-a")]
       result = {:delete, ReadModel, [event_id: "e1"]}
-      multi = EctoTarget.build_multi(events, [result], projection(), advances_for(events))
+      multi = EctoTarget.build_multi(events, [result], projection(), advances_for(events), [])
 
       assert {:scriba_event, "e1"} in keys(multi)
     end
@@ -64,19 +64,11 @@ defmodule Scriba.Target.EctoTest do
       events = [event("e1", 1, "stream-a")]
       user_multi = Ecto.Multi.new() |> Ecto.Multi.run(:user_op, fn _, _ -> {:ok, :done} end)
       result = {:multi, user_multi}
-      multi = EctoTarget.build_multi(events, [result], projection(), advances_for(events))
+      multi = EctoTarget.build_multi(events, [result], projection(), advances_for(events), [])
 
       ks = keys(multi)
       assert {:scriba_position, "stream-a"} in ks
       assert :merge in ks
-    end
-
-    test "{:error, reason} adds a step that fails the transaction" do
-      events = [event("e1", 1, "stream-a")]
-      result = {:error, :boom}
-      multi = EctoTarget.build_multi(events, [result], projection(), advances_for(events))
-
-      assert {:scriba_event, "e1"} in keys(multi)
     end
 
     test "mixed batch — insert + skip + delete on same stream" do
@@ -92,7 +84,7 @@ defmodule Scriba.Target.EctoTest do
         {:delete, ReadModel, [event_id: "e1"]}
       ]
 
-      multi = EctoTarget.build_multi(events, results, projection(), advances_for(events))
+      multi = EctoTarget.build_multi(events, results, projection(), advances_for(events), [])
       ks = keys(multi)
 
       assert {:scriba_event, "e1"} in ks
@@ -102,7 +94,58 @@ defmodule Scriba.Target.EctoTest do
     end
   end
 
-  describe "build_multi/4 — multi-stream batches" do
+  describe "build_multi/5 — dead-letter routing" do
+    test "{:error, _} dead-letter produces a :scriba_dead_letter step, NOT a failing transaction step" do
+      # regression: the previous build_multi/4 inserted an
+      # Ecto.Multi.run/3 step that returned {:error, _}, poisoning the
+      # whole transaction. The Pipeline now partitions {:error, _} into
+      # the dead_letters argument; this assertion pins that the resulting
+      # Multi carries a dead-letter insert keyed `{:scriba_dead_letter, _}`
+      # and NOT a `{:scriba_event, _}` failing step.
+      e = event("e1", 1, "stream-a")
+      dead_letters = [{e, {:error, :boom}}]
+
+      multi = EctoTarget.build_multi([], [], projection(), advances_for([e]), dead_letters)
+      ks = keys(multi)
+
+      assert {:scriba_dead_letter, "e1"} in ks
+      refute {:scriba_event, "e1"} in ks
+      assert {:scriba_position, "stream-a"} in ks
+    end
+
+    test "{:exception, exception, stacktrace} produces a :scriba_dead_letter step" do
+      e = event("e1", 1, "stream-a")
+      exception = %RuntimeError{message: "boom"}
+      dead_letters = [{e, {:exception, exception, []}}]
+
+      multi = EctoTarget.build_multi([], [], projection(), advances_for([e]), dead_letters)
+
+      assert {:scriba_dead_letter, "e1"} in keys(multi)
+    end
+
+    test "mixed batch — successes go to :scriba_event, failures go to :scriba_dead_letter, cursor advances past both" do
+      good = event("e1", 1, "stream-a")
+      bad = event("e2", 2, "stream-a")
+      good_result = {:insert, %ReadModel{event_id: "e1", stream_id: "stream-a", position: 1}}
+
+      events = [good]
+      handler_results = [good_result]
+      dead_letters = [{bad, {:error, :nope}}]
+
+      # stream_advances reflects max position across BOTH good AND bad
+      # for stream-a — i.e. 2 (the dead-lettered event), not 1.
+      advances = %{"stream-a" => 2}
+
+      multi = EctoTarget.build_multi(events, handler_results, projection(), advances, dead_letters)
+      ks = keys(multi)
+
+      assert {:scriba_event, "e1"} in ks
+      assert {:scriba_dead_letter, "e2"} in ks
+      assert {:scriba_position, "stream-a"} in ks
+    end
+  end
+
+  describe "build_multi/5 — multi-stream batches" do
     test "appends one position step per distinct stream in the batch" do
       events = [
         event("e1", 1, "stream-a"),
@@ -111,7 +154,7 @@ defmodule Scriba.Target.EctoTest do
       ]
 
       results = Enum.map(events, fn _ -> :skip end)
-      multi = EctoTarget.build_multi(events, results, projection(), advances_for(events))
+      multi = EctoTarget.build_multi(events, results, projection(), advances_for(events), [])
       ks = keys(multi)
 
       assert {:scriba_position, "stream-a"} in ks
@@ -130,12 +173,12 @@ defmodule Scriba.Target.EctoTest do
 
       assert advances == %{"stream-a" => 5}
 
-      multi = EctoTarget.build_multi(events, results, projection(), advances)
+      multi = EctoTarget.build_multi(events, results, projection(), advances, [])
       assert {:scriba_position, "stream-a"} in keys(multi)
     end
   end
 
-  describe "build_multi/4 — position updates appended after handler ops" do
+  describe "build_multi/5 — position updates appended after handler ops" do
     test "all per-stream position steps come after handler steps" do
       events = [event("e1", 1, "stream-a"), event("e2", 2, "stream-b")]
       results = [
@@ -143,7 +186,7 @@ defmodule Scriba.Target.EctoTest do
         {:insert, %ReadModel{event_id: "e2", stream_id: "stream-b", position: 2}}
       ]
 
-      multi = EctoTarget.build_multi(events, results, projection(), advances_for(events))
+      multi = EctoTarget.build_multi(events, results, projection(), advances_for(events), [])
       ks = keys(multi)
 
       handler_keys = [{:scriba_event, "e1"}, {:scriba_event, "e2"}]

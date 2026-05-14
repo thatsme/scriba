@@ -14,6 +14,7 @@ defmodule Scriba.Telemetry do
   | `[:scriba, :projection, :event, :stop]` | same | `duration`, `monotonic_time` | same as `:start` |
   | `[:scriba, :projection, :event, :exception]` | same | `duration`, `monotonic_time` | start metadata + `kind`, `reason`, `stacktrace` |
   | `[:scriba, :projection, :batch, :stop]` | `Scriba.Projection.Pipeline.handle_batch/4` (manual emit, success branch only) | `duration`, `batch_size` | `projection` |
+  | `[:scriba, :projection, :dead_letter]` | `Scriba.Projection.Pipeline.handle_batch/4` (one per dead-lettered event, after Multi commit) | `system_time` | `projection`, `position`, `stream_id`, `event_type`, `error_kind` |
   | `[:scriba, :projection, :cache_initialized]` | `Scriba.Position.init_cache/3` | `wiped_count`, `preloaded_count` | `name`, `version`, `source` |
 
   `projection` is `%{name: String.t(), version: pos_integer()}`. `event_type`

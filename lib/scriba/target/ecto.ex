@@ -10,13 +10,22 @@ defmodule Scriba.Target.Ecto do
 
   ## Handler return contract (§4.2)
 
-    * `:skip` — no Multi op for this event (its stream's cursor still advances).
+    * `:skip` — no Multi op for this event (its stream's cursor still advances
+      if the event was not dedup-skipped; see Pipeline `stream_advances`).
     * `{:insert, schema_struct}` — `Ecto.Multi.insert/3`.
     * `{:update, schema_module, filter_keyword, [set: keyword]}` —
       `Ecto.Multi.update_all/4` filtered by `filter_keyword`.
     * `{:delete, schema_module, filter_keyword}` — `Ecto.Multi.delete_all/3`.
     * `{:multi, %Ecto.Multi{}}` — merged into the batch's Multi.
-    * `{:error, reason}` — appended as a step that fails the transaction.
+
+  Failure-shape results (`{:error, reason}` and the internal
+  `{:exception, exception, stacktrace}` tag produced when a handler raises)
+  do NOT reach `apply_handler_result/3`. Pipeline partitions them out and
+  hands them to `apply_batch/6` as the `dead_letters` list; this module
+  appends a `Scriba.DeadLetter.multi/4` step per dead-letter to the same
+  `Ecto.Multi` that carries read-model writes and cursor advances. Result:
+  one atomic transaction commits success rows, dead-letter rows, and
+  advanced cursors together.
 
   ## Usage
 
@@ -36,8 +45,15 @@ defmodule Scriba.Target.Ecto do
   end
 
   @impl Scriba.Target
-  def apply_batch(events, handler_results, projection, stream_advances, %{repo: repo} = state) do
-    multi = build_multi(events, handler_results, projection, stream_advances)
+  def apply_batch(
+        events,
+        handler_results,
+        projection,
+        stream_advances,
+        dead_letters,
+        %{repo: repo} = state
+      ) do
+    multi = build_multi(events, handler_results, projection, stream_advances, dead_letters)
 
     case repo.transaction(multi) do
       {:ok, _changes} ->
@@ -57,14 +73,26 @@ defmodule Scriba.Target.Ecto do
   `stream_advances` is `%{stream_id => max_position}` for each stream the
   batch touches. One position-update step is appended per stream, keyed
   `{:scriba_position, stream_id}`.
+
+  `dead_letters` is a list of `{event, error}` tuples for events whose
+  handler returned `{:error, _}` or raised. One dead-letter step is
+  appended per failed event, keyed `{:scriba_dead_letter, event.id}` (the
+  same key shape `Scriba.DeadLetter.multi/4` produces).
+
+  Order of steps in the assembled Multi:
+
+    1. Read-model ops (one `{:scriba_event, event.id}` per success event).
+    2. Per-stream cursor advances (one `{:scriba_position, stream_id}`).
+    3. Dead-letter inserts (one `{:scriba_dead_letter, event.id}`).
   """
   @spec build_multi(
           [Scriba.Event.t()],
           [term()],
           %{name: String.t(), version: pos_integer()},
-          %{String.t() => non_neg_integer()}
+          %{String.t() => non_neg_integer()},
+          [{Scriba.Event.t(), term()}]
         ) :: Ecto.Multi.t()
-  def build_multi(events, handler_results, projection, stream_advances) do
+  def build_multi(events, handler_results, projection, stream_advances, dead_letters) do
     multi =
       events
       |> Enum.zip(handler_results)
@@ -72,12 +100,23 @@ defmodule Scriba.Target.Ecto do
         apply_handler_result(acc, event, result)
       end)
 
-    Enum.reduce(stream_advances, multi, fn {sid, pos}, acc ->
-      Scriba.Position.multi(acc, projection.name, projection.version, sid, pos)
+    multi =
+      Enum.reduce(stream_advances, multi, fn {sid, pos}, acc ->
+        Scriba.Position.multi(acc, projection.name, projection.version, sid, pos)
+      end)
+
+    Enum.reduce(dead_letters, multi, fn {event, error}, acc ->
+      Scriba.DeadLetter.multi(acc, projection, event, error)
     end)
   end
 
   ## Per-event Multi step
+  #
+  # Only success-shape handler returns reach here. Pipeline.handle_batch
+  # partitions {:error, _} and {:exception, _, _} into the dead_letters
+  # argument before calling apply_batch/6, so they never appear in
+  # handler_results. No clause for them — a FunctionClauseError surfaces
+  # any future Pipeline partitioning bug loudly.
 
   defp apply_handler_result(multi, _event, :skip), do: multi
 
@@ -97,12 +136,6 @@ defmodule Scriba.Target.Ecto do
 
   defp apply_handler_result(multi, _event, {:multi, %Ecto.Multi{} = user_multi}) do
     Ecto.Multi.merge(multi, fn _changes -> user_multi end)
-  end
-
-  defp apply_handler_result(multi, event, {:error, reason}) do
-    Ecto.Multi.run(multi, {:scriba_event, event.id}, fn _repo, _changes ->
-      {:error, reason}
-    end)
   end
 
   defp build_filter_query(schema, filter) do

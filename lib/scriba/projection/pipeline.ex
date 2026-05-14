@@ -110,11 +110,13 @@ defmodule Scriba.Projection.Pipeline do
           occurred_at: event.occurred_at
         }
 
-        # :telemetry.span/3 emits start/stop on success and start/exception
-        # on raise (then re-raises — Broadway still sees the failure and
-        # marks the message). (retry) and 3 (dead-letter)
-        # will wrap OUTSIDE this span to intercept before Broadway's default
-        # failure path.
+        # :telemetry.span/3 emits :start/:stop on success and :start/:exception
+        # on raise (then re-raises). Wrapping the span in try/rescue (
+        # item 2) intercepts the re-raise here — Broadway never sees it as a
+        # failed message — and tags the handler_result so handle_batch/4 can
+        # route it to dead-letter. will wrap a retry loop
+        # around this try/rescue: same internal tag shape, retry sits between
+        # the catch and the batch.
         #
         # Pass the same metadata map for both start and stop so both events
         # carry projection / event_type / stream_id / position. On exception,
@@ -127,14 +129,22 @@ defmodule Scriba.Projection.Pipeline do
           position: event.position
         }
 
-        :telemetry.span(
-          [:scriba, :projection, :event],
-          span_metadata,
-          fn ->
-            result = ctx.handler.handle(event.data, meta)
-            {result, span_metadata}
-          end
-        )
+        try do
+          :telemetry.span(
+            [:scriba, :projection, :event],
+            span_metadata,
+            fn ->
+              result = ctx.handler.handle(event.data, meta)
+              {result, span_metadata}
+            end
+          )
+        rescue
+          # Internal tag shape — never returned by user handlers, only
+          # produced here. Matches `Scriba.DeadLetter.normalize_error/1`'s
+          # `{:exception, exception, stacktrace}` 3-tuple clause.
+          exception ->
+            {:exception, exception, __STACKTRACE__}
+        end
       end
 
     Message.put_data(msg, %{event: event, handler_result: handler_result})
@@ -161,18 +171,24 @@ defmodule Scriba.Projection.Pipeline do
 
   @impl Broadway
   def handle_batch(_batcher, messages, _batch_info, ctx) do
-    events = Enum.map(messages, & &1.data.event)
-    handler_results = Enum.map(messages, & &1.data.handler_result)
+    # Partition into success-shape and failure-shape results. Failure-shape
+    #: handler returned {:error, _} OR the engine caught a
+    # handler raise and tagged it {:exception, exception, stacktrace}. Those
+    # go to dead-letter; the rest get their normal Multi step.
+    {good_messages, bad_messages} =
+      Enum.split_with(messages, fn msg -> success_shape?(msg.data.handler_result) end)
 
-    # stream_advances only includes events whose handler returned a non-:skip
-    # result — i.e. events that were actually applied to the read model.
-    # Skipped events (dedup-induced OR user-handler :skip) leave the cursor
-    # alone. Crucially, this prevents the dedup case from regressing the
-    # cursor: a redelivered batch of events all below the current cursor
-    # would otherwise overwrite it via Position.multi/5's unconditional
-    # `ON CONFLICT SET position = EXCLUDED.position`. A stream that contains
-    # only :skip events in this batch is absent from stream_advances —
-    # correctly, since there's nothing to advance.
+    good_events = Enum.map(good_messages, & &1.data.event)
+    good_results = Enum.map(good_messages, & &1.data.handler_result)
+    dead_letters = Enum.map(bad_messages, fn msg -> {msg.data.event, msg.data.handler_result} end)
+
+    # stream_advances includes events whose handler returned non-:skip —
+    # both success-shape AND dead-lettered results. Per architecture §9.2:
+    # dead-lettering advances the cursor past the failed event so the
+    # projection doesn't get stuck. Skipped events (dedup-induced OR user
+    # :skip) leave the cursor alone — critical for the dedup case where a
+    # redelivered batch of below-cursor events must not regress the cursor
+    # via Position.multi/5's unconditional ON CONFLICT update.
     stream_advances =
       messages
       |> Enum.reject(fn msg -> msg.data.handler_result == :skip end)
@@ -190,10 +206,11 @@ defmodule Scriba.Projection.Pipeline do
     start_time = System.monotonic_time()
 
     case ctx.target_module.apply_batch(
-           events,
-           handler_results,
+           good_events,
+           good_results,
            ctx.projection,
            stream_advances,
+           dead_letters,
            ctx.target_state
          ) do
       {:ok, _state} ->
@@ -210,14 +227,32 @@ defmodule Scriba.Projection.Pipeline do
         end)
 
         # batch_size = events Broadway saw in this batch, including those
-        # whose handler returned :skip. Skipped events still consumed
-        # pipeline capacity, so the operationally useful "what did this
-        # batch process" count includes them.
+        # whose handler returned :skip and those that dead-lettered.
+        # Skipped/failed events still consumed pipeline capacity, so the
+        # operationally useful "what did this batch process" count includes
+        # them.
         :telemetry.execute(
           [:scriba, :projection, :batch, :stop],
           %{duration: System.monotonic_time() - start_time, batch_size: length(messages)},
           %{projection: ctx.projection}
         )
+
+        # One :dead_letter event per dead-lettered event, emitted AFTER the
+        # Multi commits — otherwise we'd emit telemetry for rows that didn't
+        # actually persist. Metadata shape per architecture §9.3.
+        Enum.each(dead_letters, fn {event, error} ->
+          :telemetry.execute(
+            [:scriba, :projection, :dead_letter],
+            %{system_time: System.system_time()},
+            %{
+              projection: ctx.projection,
+              position: event.position,
+              stream_id: event.stream_id,
+              event_type: event.type,
+              error_kind: error_kind(error)
+            }
+          )
+        end)
 
         messages
 
@@ -225,4 +260,23 @@ defmodule Scriba.Projection.Pipeline do
         Enum.map(messages, &Message.failed(&1, reason))
     end
   end
+
+  # success_shape?/1 — false for handler returns that route to dead-letter:
+  # `{:error, _}` (explicit failure return per §4.2) and the engine-internal
+  # `{:exception, _, _}` tag produced by handle_message's try/rescue. Every
+  # other shape flows to the Target's normal apply_batch path. Garbage
+  # handler returns (not in §4.2's six shapes) are not dead-lettered — they
+  # surface as a loud failure in the Target (FunctionClauseError in the
+  # Ecto target). That's the right place for "user wrote a broken handler"
+  # diagnostics; dead-lettering would swallow it.
+  defp success_shape?({:error, _}), do: false
+  defp success_shape?({:exception, _, _}), do: false
+  defp success_shape?(_), do: true
+
+  # error_kind/1 — matches DeadLetter.normalize_error/1's kind output so
+  # telemetry metadata and dead-letter rows agree on the kind label.
+  defp error_kind({:error, _}), do: "error"
+  defp error_kind({:exception, exception, _}) when is_exception(exception),
+    do: exception.__struct__ |> Atom.to_string()
+  defp error_kind(_), do: "unknown"
 end

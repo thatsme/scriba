@@ -292,9 +292,11 @@ defmodule Scriba.Projection.PipelineTest do
         batch_timeout: 50
       ]
 
-      # Broadway logs the message failure at :error level (the span re-raises,
-      # Broadway's processor catches and routes the message to its default
-      # handle_failed/2 with logging). Capture to keep test output clean.
+      # : the Pipeline's try/rescue around :telemetry.span/3
+      # catches the re-raise BEFORE Broadway sees the message as failed.
+      # No Broadway-level log is produced — but kept under CaptureLog
+      # defensively in case future Broadway versions log handle_message
+      # exits differently.
       ExUnit.CaptureLog.capture_log(fn ->
         start_supervised!({ProjSup, opts})
 
@@ -321,6 +323,167 @@ defmodule Scriba.Projection.PipelineTest do
     end
   end
 
+  describe "dead-letter routing" do
+    @tag :integration
+    test "regression: {:error, _} no longer poisons the batch — successes commit, cursor advances past failures, dead-letter recorded" do
+      # The structural fix this test pins: prior to , a single
+      # {:error, _} handler return inserted an Ecto.Multi.run step that
+      # returned {:error, _}, failing the whole transaction. No reads
+      # committed; no cursors advanced. The fix partitions failures out of
+      # the Multi and routes them to dead-letter atomically with the cursor
+      # advance. This test asserts the post-fix invariants for a mixed batch.
+
+      # Attach a dead-letter telemetry listener so we can confirm the §9.3
+      # event fires once per failed event with the documented metadata.
+      ref = make_ref()
+      handler_id = {:dead_letter_telemetry, ref}
+
+      :telemetry.attach(
+        handler_id,
+        [:scriba, :projection, :dead_letter],
+        &__MODULE__.forward_telemetry/4,
+        %{test_pid: self(), ref: ref}
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      agent = start_supervised!({TestTarget, []})
+
+      # 3 events on the SAME stream — middle one fails. Cursor must
+      # advance past all three; first and third must commit; middle must
+      # land in the dead-letter list.
+      events = [
+        %Scriba.Event{
+          id: "good-1",
+          stream_id: "stream-a",
+          type: "good",
+          data: %{n: 1},
+          position: 1,
+          occurred_at: DateTime.utc_now()
+        },
+        %Scriba.Event{
+          id: "bad-1",
+          stream_id: "stream-a",
+          type: "bad",
+          data: %{n: 2},
+          position: 2,
+          occurred_at: DateTime.utc_now()
+        },
+        %Scriba.Event{
+          id: "good-2",
+          stream_id: "stream-a",
+          type: "good",
+          data: %{n: 3},
+          position: 3,
+          occurred_at: DateTime.utc_now()
+        }
+      ]
+
+      name = "pipeline-dl-regression-#{:erlang.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        version: 1,
+        source: {Scriba.Test.Source, events: events},
+        target: {TestTarget, agent: agent},
+        parallelism: 1,
+        handler: __MODULE__.SelectiveErrorHandler,
+        batch_size: 10,
+        batch_timeout: 50
+      ]
+
+      start_supervised!({ProjSup, opts})
+
+      # Wait for both good events to commit. If the poison-batch bug
+      # regressed, this would time out — none of the events would commit.
+      eventually(fn -> assert length(TestTarget.commits(agent)) == 2 end, 2_000)
+
+      # (a) Good events committed.
+      commits = TestTarget.commits(agent)
+      committed_ids = Enum.map(commits, fn {id, _sid, _pos} -> id end)
+      assert "good-1" in committed_ids
+      assert "good-2" in committed_ids
+      refute "bad-1" in committed_ids
+
+      # (b) Cursor advanced past ALL three events — including the dead-
+      # lettered one. Per §9.2, dead-lettering advances the cursor so the
+      # projection doesn't get stuck.
+      assert Scriba.Position.stream_positions(name, 1) == %{"stream-a" => 3}
+
+      # (c) Dead-letter row exists with the right shape.
+      dead_letters = TestTarget.dead_letters(agent)
+      assert length(dead_letters) == 1
+      [dl] = dead_letters
+      assert dl.event.id == "bad-1"
+      assert dl.error == {:error, :nope}
+
+      # (d) Telemetry: one [:scriba, :projection, :dead_letter] event with
+      # the §9.3 metadata shape.
+      assert_receive {^ref, [:scriba, :projection, :dead_letter], measurements, metadata}, 500
+      assert is_integer(measurements.system_time)
+      assert metadata.projection == %{name: name, version: 1}
+      assert metadata.position == 2
+      assert metadata.stream_id == "stream-a"
+      assert metadata.event_type == "bad"
+      assert metadata.error_kind == "error"
+
+      # No second dead_letter event — only the one bad event in this run.
+      refute_receive {^ref, [:scriba, :projection, :dead_letter], _, _}, 50
+    end
+
+    @tag :integration
+    test "handler raise dead-letters with error_kind matching the exception struct name" do
+      ref = make_ref()
+      handler_id = {:raise_dl_telemetry, ref}
+
+      :telemetry.attach(
+        handler_id,
+        [:scriba, :projection, :dead_letter],
+        &__MODULE__.forward_telemetry/4,
+        %{test_pid: self(), ref: ref}
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      agent = start_supervised!({TestTarget, []})
+      events = Test.Events.list(1)
+      name = "pipeline-dl-raise-#{:erlang.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        version: 1,
+        source: {Scriba.Test.Source, events: events},
+        target: {TestTarget, agent: agent},
+        parallelism: 1,
+        handler: __MODULE__.RaisingHandler,
+        batch_size: 5,
+        batch_timeout: 50
+      ]
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        start_supervised!({ProjSup, opts})
+
+        assert_receive {^ref, [:scriba, :projection, :dead_letter], _measurements, metadata},
+                       2_000
+
+        # : exception kind label is the exception module name
+        # (matches DeadLetter.normalize_error/1's `exception.__struct__`).
+        assert metadata.error_kind == "Elixir.RuntimeError"
+        assert metadata.event_type == "test_event"
+        assert metadata.projection == %{name: name, version: 1}
+      end)
+
+      # Dead-letter recorded in the Test target's in-memory list with the
+      # internal :exception tag (3-tuple shape — exception struct + stacktrace).
+      [dl] = TestTarget.dead_letters(agent)
+      assert {:exception, %RuntimeError{message: "boom"}, stacktrace} = dl.error
+      assert is_list(stacktrace)
+
+      # Cursor advanced past the dead-lettered event.
+      assert Scriba.Position.stream_positions(name, 1) == %{"stream-0" => 1}
+    end
+  end
+
   @doc false
   def forward_telemetry(event, measurements, metadata, %{test_pid: pid, ref: ref}) do
     send(pid, {ref, event, measurements, metadata})
@@ -329,6 +492,16 @@ defmodule Scriba.Projection.PipelineTest do
   defmodule RaisingHandler do
     @moduledoc false
     def handle(_data, _meta), do: raise("boom")
+  end
+
+  defmodule SelectiveErrorHandler do
+    @moduledoc false
+    # Returns {:error, :nope} for events whose data has type "bad" (per the
+    # event :type field, passed through to data.n by Test.Events shape).
+    # Everything else returns a success-shape result so the Test target
+    # records the commit.
+    def handle(_data, %{type: "bad"}), do: {:error, :nope}
+    def handle(_data, _meta), do: {:test_record, :ok}
   end
 
   defp drain_telemetry(ref, timeout) do

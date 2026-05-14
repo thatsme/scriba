@@ -2,10 +2,16 @@ defmodule Scriba.Target.Test do
   @moduledoc """
   In-memory `Scriba.Target` for property tests and user-facing test helpers.
 
-  Backed by an `Agent` that holds the commit log and per-stream cursors.
-  Records every committed event as `{event_id, stream_id, position}` in the
-  order it was applied. Events whose handler returned `:skip` are not
-  recorded but still advance the stream's cursor.
+  Backed by an `Agent` that holds the commit log, per-stream cursors, and
+  the in-memory dead-letter list. Records every committed event as
+  `{event_id, stream_id, position}` in the order it was applied. Events
+  whose handler returned `:skip` are not recorded.
+
+  Dead-letter routing: the Pipeline hands the Target a
+  list of `{event, error}` tuples for events whose handler returned
+  `{:error, _}` or raised. The Test target records them in its in-memory
+  `:dead_letters` list (per 's mandate that property
+  tests can assert dead-letter routing without a Repo).
 
   ## Usage
 
@@ -16,6 +22,9 @@ defmodule Scriba.Target.Test do
 
       Scriba.Target.Test.commits(agent)
       # => [{"evt-1", "stream-0", 1}, {"evt-2", "stream-1", 2}, ...]
+
+      Scriba.Target.Test.dead_letters(agent)
+      # => [%{event: %Scriba.Event{...}, error: {:error, :boom}}, ...]
 
       Scriba.Target.Test.stream_positions(agent)
       # => %{"stream-0" => 4, "stream-1" => 5}
@@ -29,6 +38,7 @@ defmodule Scriba.Target.Test do
   use Agent
 
   @type agent :: pid() | atom() | {:via, module(), term()}
+  @type dead_letter :: %{event: Scriba.Event.t(), error: term()}
 
   @doc """
   Starts an in-memory commit log.
@@ -37,7 +47,10 @@ defmodule Scriba.Target.Test do
   """
   @spec start_link(keyword()) :: Agent.on_start()
   def start_link(opts \\ []) do
-    Agent.start_link(fn -> %{commits: [], stream_positions: %{}} end, opts)
+    Agent.start_link(
+      fn -> %{commits: [], stream_positions: %{}, dead_letters: []} end,
+      opts
+    )
   end
 
   @doc """
@@ -48,6 +61,19 @@ defmodule Scriba.Target.Test do
   def commits(agent) do
     agent
     |> Agent.get(& &1.commits)
+    |> Enum.reverse()
+  end
+
+  @doc """
+  Returns dead-letter entries in the order they were routed. Each entry is
+  a `%{event: %Scriba.Event{}, error: term()}` map — the same `error`
+  shape the Pipeline passed (an `{:error, reason}` tuple, or the engine-
+  internal `{:exception, exception, stacktrace}` triple).
+  """
+  @spec dead_letters(agent()) :: [dead_letter()]
+  def dead_letters(agent) do
+    agent
+    |> Agent.get(& &1.dead_letters)
     |> Enum.reverse()
   end
 
@@ -67,10 +93,12 @@ defmodule Scriba.Target.Test do
     end
   end
 
-  @doc "Clears the commit log and resets per-stream cursors."
+  @doc "Clears the commit log, dead-letter list, and per-stream cursors."
   @spec reset(agent()) :: :ok
   def reset(agent) do
-    Agent.update(agent, fn _ -> %{commits: [], stream_positions: %{}} end)
+    Agent.update(agent, fn _ ->
+      %{commits: [], stream_positions: %{}, dead_letters: []}
+    end)
   end
 
   @impl Scriba.Target
@@ -80,18 +108,28 @@ defmodule Scriba.Target.Test do
   end
 
   @impl Scriba.Target
-  def apply_batch(events, handler_results, _projection, stream_advances, %{agent: agent} = state) do
+  def apply_batch(
+        events,
+        handler_results,
+        _projection,
+        stream_advances,
+        dead_letters,
+        %{agent: agent} = state
+      ) do
     entries =
       events
       |> Enum.zip(handler_results)
       |> Enum.reject(fn {_event, result} -> result == :skip end)
       |> Enum.map(fn {event, _result} -> {event.id, event.stream_id, event.position} end)
 
+    dl_entries = Enum.map(dead_letters, fn {event, error} -> %{event: event, error: error} end)
+
     Agent.update(agent, fn data ->
       %{
         data
         | commits: Enum.reverse(entries) ++ data.commits,
-          stream_positions: Map.merge(data.stream_positions, stream_advances)
+          stream_positions: Map.merge(data.stream_positions, stream_advances),
+          dead_letters: Enum.reverse(dl_entries) ++ data.dead_letters
       }
     end)
 
