@@ -1,0 +1,8 @@
+/_build/
+/deps/
+/cover/
+erl_crash.dump
+*.ez
+
+# Local secrets — real DB credentials. See .env.local.example.
+.env.local
