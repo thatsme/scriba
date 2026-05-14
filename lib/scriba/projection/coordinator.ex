@@ -18,6 +18,12 @@ defmodule Scriba.Projection.Coordinator do
     :repo
   ]
 
+  # Used only for the one-shot pipeline-pid lookup re-arm (see :state_timeout
+  # handler below). Do NOT reach for :state_timeout when adding periodic
+  # timers (e.g. v0.2 lag/throughput emission) — :state_timeout is reset by
+  # every event in the state and silently stops firing under load. Use
+  # Process.send_after(self(), :tick, interval) self-messages instead.
+  # See SCRIBA_ARCHITECTURE.md §7.5 for the rationale.
   @poll_interval 50
 
   ## Public API

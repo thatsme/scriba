@@ -94,6 +94,11 @@ defmodule Scriba.Projection.Pipeline do
         # return :skip so the target doesn't double-apply, and so
         # handle_batch/4's stream_advances filter (below) keeps the cursor
         # where it is rather than regressing it.
+        #
+        # Skipped events are NOT wrapped in :telemetry.span — they didn't
+        # invoke the user handler, so there is no handler latency to emit.
+        # If dedup visibility becomes operationally interesting, add a
+        # separate [:scriba, :projection, :event, :skipped] event.
         :skip
       else
         meta = %{
@@ -105,7 +110,31 @@ defmodule Scriba.Projection.Pipeline do
           occurred_at: event.occurred_at
         }
 
-        ctx.handler.handle(event.data, meta)
+        # :telemetry.span/3 emits start/stop on success and start/exception
+        # on raise (then re-raises — Broadway still sees the failure and
+        # marks the message). (retry) and 3 (dead-letter)
+        # will wrap OUTSIDE this span to intercept before Broadway's default
+        # failure path.
+        #
+        # Pass the same metadata map for both start and stop so both events
+        # carry projection / event_type / stream_id / position. On exception,
+        # span merges {kind, reason, stacktrace} INTO the start metadata —
+        # the exception event's metadata = start_metadata + those three keys.
+        span_metadata = %{
+          projection: ctx.projection,
+          event_type: event.type,
+          stream_id: event.stream_id,
+          position: event.position
+        }
+
+        :telemetry.span(
+          [:scriba, :projection, :event],
+          span_metadata,
+          fn ->
+            result = ctx.handler.handle(event.data, meta)
+            {result, span_metadata}
+          end
+        )
       end
 
     Message.put_data(msg, %{event: event, handler_result: handler_result})
@@ -153,6 +182,13 @@ defmodule Scriba.Projection.Pipeline do
         {sid, evts |> Enum.map(& &1.position) |> Enum.max()}
       end)
 
+    # Measure target.apply_batch duration manually rather than via
+    # :telemetry.span — we only want a :stop event on the success branch
+    # (the Multi committed). Batch-failure observability would be a
+    # separate [:scriba, :projection, :batch, :exception] event if/when
+    # operationally needed; not in scope for v0.1.
+    start_time = System.monotonic_time()
+
     case ctx.target_module.apply_batch(
            events,
            handler_results,
@@ -172,6 +208,16 @@ defmodule Scriba.Projection.Pipeline do
         Enum.each(stream_advances, fn {sid, pos} ->
           Scriba.Position.cache_put(ctx.projection.name, ctx.projection.version, sid, pos)
         end)
+
+        # batch_size = events Broadway saw in this batch, including those
+        # whose handler returned :skip. Skipped events still consumed
+        # pipeline capacity, so the operationally useful "what did this
+        # batch process" count includes them.
+        :telemetry.execute(
+          [:scriba, :projection, :batch, :stop],
+          %{duration: System.monotonic_time() - start_time, batch_size: length(messages)},
+          %{projection: ctx.projection}
+        )
 
         messages
 
