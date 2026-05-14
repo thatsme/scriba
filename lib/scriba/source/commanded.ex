@@ -181,10 +181,21 @@ defmodule Scriba.Source.Commanded do
     end
   end
 
-  defp to_message(commanded_event, state) do
+  # Exposed (rather than defp) so the unit test can verify the field
+  # mapping without standing up a full Broadway pipeline. The earlier
+  # `stream_uuid` → `stream_id` bug went undetected because nothing in
+  # the test suite exercised this function against a real RecordedEvent.
+  # `state` only needs :application and :subscription — both threaded
+  # into the Broadway message's acknowledger tuple. Tests pass any map
+  # with those two keys.
+  @doc false
+  def to_message(commanded_event, state) do
+    # Commanded 1.4's RecordedEvent uses :stream_id (NOT :stream_uuid —
+    # that was the original bug). Field name pinned by the unit test
+    # in test/scriba/source/commanded_test.exs.
     scriba_event = %Event{
       id: commanded_event.event_id,
-      stream_id: commanded_event.stream_uuid,
+      stream_id: commanded_event.stream_id,
       type: commanded_event.event_type,
       data: commanded_event.data,
       metadata: commanded_event.metadata || %{},
