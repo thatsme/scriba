@@ -15,7 +15,15 @@ defmodule Scriba.Projection.Coordinator do
     :supervisor_pid,
     :pipeline_pid,
     :pipeline_ref,
-    :repo
+    :repo,
+    # Tracks whether the `:initializing → :running` transition has fired
+    # the `[:scriba, :projection, :started]` telemetry event yet. Pipeline
+    # DOWN → re-initializing → re-running cycles MUST NOT re-emit
+    # `:started` — operators read it as "projection came up for the first
+    # time," not "Pipeline restarted." Coordinator crash resets the flag
+    # to false via init/1, which is the correct semantic (the projection
+    # was effectively restarted from the operator's perspective).
+    started: false
   ]
 
   # Used only for the one-shot pipeline-pid lookup re-arm (see :state_timeout
@@ -137,17 +145,11 @@ defmodule Scriba.Projection.Coordinator do
   ## :initializing — poll until the Pipeline (and its producer) are up
 
   def handle_event(:internal, :try_monitor, :initializing, data) do
-    case ensure_monitored(data) do
-      {:ok, new_data} -> {:next_state, :running, new_data}
-      :pending -> {:keep_state, data, [{:state_timeout, @poll_interval, :try_monitor}]}
-    end
+    transition_from_initializing(data)
   end
 
   def handle_event(:state_timeout, :try_monitor, :initializing, data) do
-    case ensure_monitored(data) do
-      {:ok, new_data} -> {:next_state, :running, new_data}
-      :pending -> {:keep_state, data, [{:state_timeout, @poll_interval, :try_monitor}]}
-    end
+    transition_from_initializing(data)
   end
 
   ## Lifecycle commands — valid combos
@@ -279,6 +281,32 @@ defmodule Scriba.Projection.Coordinator do
   end
 
   ## Helpers
+
+  defp transition_from_initializing(data) do
+    case ensure_monitored(data) do
+      {:ok, new_data} ->
+        # Emit :started exactly once per Coordinator-process lifetime
+        # (Pipeline DOWN → re-monitored does NOT re-fire). See defstruct
+        # for the rationale.
+        new_data =
+          if new_data.started do
+            new_data
+          else
+            :telemetry.execute(
+              [:scriba, :projection, :started],
+              %{system_time: System.system_time()},
+              %{projection: %{name: new_data.name, version: new_data.version}}
+            )
+
+            %{new_data | started: true}
+          end
+
+        {:next_state, :running, new_data}
+
+      :pending ->
+        {:keep_state, data, [{:state_timeout, @poll_interval, :try_monitor}]}
+    end
+  end
 
   defp ensure_monitored(%{pipeline_ref: ref} = data) when is_reference(ref) do
     {:ok, data}
