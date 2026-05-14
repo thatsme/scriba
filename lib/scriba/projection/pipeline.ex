@@ -5,6 +5,14 @@ defmodule Scriba.Projection.Pipeline do
 
   alias Broadway.Message
 
+  # Default retry policy per architecture §9.1 and :
+  # 3 attempts, exponential backoff. The backoff list provides the sleeps
+  # BETWEEN attempts (not before the first attempt, not after the last),
+  # so N attempts require ≥ N-1 backoff entries. Default backoff has 3
+  # entries — the third is unused at the default max_attempts=3 but
+  # available if a user bumps max_attempts to 4 without overriding backoff.
+  @default_retry %{max_attempts: 3, backoff: [100, 1000, 10_000]}
+
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)
     version = Keyword.fetch!(opts, :version)
@@ -15,6 +23,7 @@ defmodule Scriba.Projection.Pipeline do
     handler = Keyword.fetch!(opts, :handler)
     batch_size = Keyword.get(opts, :batch_size, 50)
     batch_timeout = Keyword.get(opts, :batch_timeout, 100)
+    retry_config = parse_retry_opts(Keyword.get(opts, :retry))
 
     {:ok, target_state} = target_module.init(target_opts)
 
@@ -55,9 +64,49 @@ defmodule Scriba.Projection.Pipeline do
         target_module: target_module,
         target_state: target_state,
         handler: handler,
-        repo: repo
+        repo: repo,
+        retry: retry_config
       }
     )
+  end
+
+  # Public for testability — exposes the same parse/validate logic
+  # start_link/1 uses, so tests can assert configuration shape without
+  # spinning up a Broadway pipeline.
+  @doc false
+  @spec parse_retry_opts(false | nil | true | keyword()) :: %{
+          max_attempts: pos_integer(),
+          backoff: [non_neg_integer()]
+        }
+  def parse_retry_opts(false), do: %{max_attempts: 1, backoff: []}
+  def parse_retry_opts(nil), do: @default_retry
+  def parse_retry_opts(true), do: @default_retry
+
+  def parse_retry_opts(opts) when is_list(opts) do
+    max_attempts = Keyword.get(opts, :max_attempts, @default_retry.max_attempts)
+    backoff = Keyword.get(opts, :backoff, @default_retry.backoff)
+
+    unless is_integer(max_attempts) and max_attempts >= 1 do
+      raise ArgumentError,
+            "retry :max_attempts must be a positive integer, got: #{inspect(max_attempts)}"
+    end
+
+    unless is_list(backoff) and Enum.all?(backoff, &(is_integer(&1) and &1 >= 0)) do
+      raise ArgumentError,
+            "retry :backoff must be a list of non-negative integers, got: #{inspect(backoff)}"
+    end
+
+    required = max_attempts - 1
+
+    unless length(backoff) >= required do
+      raise ArgumentError, """
+      Invalid retry config: backoff list must have at least max_attempts - 1 = #{required} entries.
+      Got max_attempts: #{max_attempts}, backoff: #{inspect(backoff)} (length #{length(backoff)}).
+      Backoff entries are the sleeps between successive attempts; N attempts need N-1 sleeps.
+      """
+    end
+
+    %{max_attempts: max_attempts, backoff: backoff}
   end
 
   def child_spec(opts) do
@@ -114,9 +163,10 @@ defmodule Scriba.Projection.Pipeline do
         # on raise (then re-raises). Wrapping the span in try/rescue (
         # item 2) intercepts the re-raise here — Broadway never sees it as a
         # failed message — and tags the handler_result so handle_batch/4 can
-        # route it to dead-letter. will wrap a retry loop
-        # around this try/rescue: same internal tag shape, retry sits between
-        # the catch and the batch.
+        # route it to dead-letter. wraps a retry loop around
+        # this try/rescue: each retry re-invokes the span (fresh start/stop/
+        # exception telemetry per attempt — operators can count :event :start
+        # events per event_id to detect retry activity).
         #
         # Pass the same metadata map for both start and stop so both events
         # carry projection / event_type / stream_id / position. On exception,
@@ -129,25 +179,72 @@ defmodule Scriba.Projection.Pipeline do
           position: event.position
         }
 
-        try do
-          :telemetry.span(
-            [:scriba, :projection, :event],
-            span_metadata,
-            fn ->
-              result = ctx.handler.handle(event.data, meta)
-              {result, span_metadata}
-            end
-          )
-        rescue
-          # Internal tag shape — never returned by user handlers, only
-          # produced here. Matches `Scriba.DeadLetter.normalize_error/1`'s
-          # `{:exception, exception, stacktrace}` 3-tuple clause.
-          exception ->
-            {:exception, exception, __STACKTRACE__}
+        handler_call = fn ->
+          try do
+            :telemetry.span(
+              [:scriba, :projection, :event],
+              span_metadata,
+              fn ->
+                result = ctx.handler.handle(event.data, meta)
+                {result, span_metadata}
+              end
+            )
+          rescue
+            # Internal tag shape — never returned by user handlers, only
+            # produced here. Matches `Scriba.DeadLetter.normalize_error/1`'s
+            # `{:exception, exception, stacktrace}` 3-tuple clause.
+            exception ->
+              {:exception, exception, __STACKTRACE__}
+          end
         end
+
+        run_with_retries(handler_call, ctx.retry)
       end
 
     Message.put_data(msg, %{event: event, handler_result: handler_result})
+  end
+
+  # Retry loop — invokes handler_call up to max_attempts times, sleeping
+  # the backoff schedule between attempts on a failure-shape result
+  # (`{:error, _}` or the internal `{:exception, _, _}` tag).
+  #
+  # Why Process.sleep inside handle_message: Broadway processors don't
+  # expose a primitive for "delay re-execution of this message." Sleeping
+  # in handle_message blocks ONLY this processor — Broadway's per-partition
+  # processor model means other partitions continue independently. The
+  # sleep does not block the batcher; messages from other processors
+  # continue feeding it, batch_timeout fires normally. The retried event
+  # will land in a later batch than its natural siblings — a throughput
+  # observation, not a correctness one. Per-stream ordering is preserved
+  # within the stuck processor's partition.
+  #
+  # Pipeline restart during the sleep: processor dies, message is not
+  # acked, source re-delivers on Pipeline restart, retry counter resets
+  # to 0. Clean reset semantic.
+  defp run_with_retries(handler_call, retry_config) do
+    do_attempt(handler_call, retry_config, 0)
+  end
+
+  defp do_attempt(handler_call, %{max_attempts: max} = retry_config, attempt) do
+    result = handler_call.()
+
+    cond do
+      success_shape?(result) ->
+        result
+
+      attempt + 1 < max ->
+        # Failure with retries remaining. Sleep the configured backoff,
+        # then re-invoke the handler. Each invocation fires its own
+        # :telemetry.span — start/stop/exception telemetry per attempt.
+        Process.sleep(Enum.at(retry_config.backoff, attempt))
+        do_attempt(handler_call, retry_config, attempt + 1)
+
+      true ->
+        # Exhausted. Return the final failure result unchanged — 
+        # item 2's handle_batch partitioning routes it to dead-letter
+        # with the original error_kind. No "retry_exhausted" wrapper.
+        result
+    end
   end
 
   # Cache-first lookup; falls back to Postgres if `:repo` is configured

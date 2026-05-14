@@ -289,7 +289,12 @@ defmodule Scriba.Projection.PipelineTest do
         parallelism: 1,
         handler: __MODULE__.RaisingHandler,
         batch_size: 5,
-        batch_timeout: 50
+        batch_timeout: 50,
+        # retry: false — this test pins the :event :exception telemetry
+        # shape, not retry behavior. Disabling retries keeps the test
+        # fast (no 1.1s default backoff) and prevents the span from
+        # emitting multiple :exception events for the same event.
+        retry: false
       ]
 
       # : the Pipeline's try/rescue around :telemetry.span/3
@@ -389,7 +394,11 @@ defmodule Scriba.Projection.PipelineTest do
         parallelism: 1,
         handler: __MODULE__.SelectiveErrorHandler,
         batch_size: 10,
-        batch_timeout: 50
+        batch_timeout: 50,
+        # retry: false — this test pins the dead-letter routing shape,
+        # not retry behavior. Retries are exercised by the dedicated
+        # tests in "retry policy".
+        retry: false
       ]
 
       start_supervised!({ProjSup, opts})
@@ -457,7 +466,10 @@ defmodule Scriba.Projection.PipelineTest do
         parallelism: 1,
         handler: __MODULE__.RaisingHandler,
         batch_size: 5,
-        batch_timeout: 50
+        batch_timeout: 50,
+        # retry: false — pin dead-letter routing for raises without
+        # paying for the default 1.1s retry backoff.
+        retry: false
       ]
 
       ExUnit.CaptureLog.capture_log(fn ->
@@ -484,9 +496,255 @@ defmodule Scriba.Projection.PipelineTest do
     end
   end
 
+  describe "retry policy" do
+    @tag :integration
+    test "{:error, _} twice then success — exactly one commit, no dead-letter, 3 handler invocations" do
+      stream = "retry-success-#{:erlang.unique_integer([:positive])}"
+      agent_name = start_counting_handler(stream, fails_remaining: 2)
+
+      agent = start_supervised!({TestTarget, []})
+
+      event = %Scriba.Event{
+        id: "retry-ok-1",
+        stream_id: stream,
+        type: "test",
+        data: %{},
+        position: 1,
+        occurred_at: DateTime.utc_now()
+      }
+
+      name = "pipeline-retry-success-#{:erlang.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        version: 1,
+        source: {Scriba.Test.Source, events: [event]},
+        target: {TestTarget, agent: agent},
+        parallelism: 1,
+        handler: __MODULE__.CountingRetryHandler,
+        batch_size: 5,
+        batch_timeout: 50,
+        # Tiny backoff — keeps the test under 50ms instead of 1.1s default.
+        retry: [max_attempts: 3, backoff: [10, 10]]
+      ]
+
+      start_supervised!({ProjSup, opts})
+
+      eventually(fn -> assert length(TestTarget.commits(agent)) == 1 end, 2_000)
+
+      # Handler invoked exactly 3 times (2 failed retries + 1 success).
+      assert Agent.get(agent_name, & &1.calls) == 3
+
+      # One commit, no dead-letter, cursor advanced.
+      assert TestTarget.commits(agent) == [{"retry-ok-1", stream, 1}]
+      assert TestTarget.dead_letters(agent) == []
+      assert Scriba.Position.stream_positions(name, 1) == %{stream => 1}
+    end
+
+    @tag :integration
+    test "handler raises 3 times — dead-letter with original error_kind, cursor advances, 3 invocations" do
+      ref = make_ref()
+      handler_id = {:retry_raise_telemetry, ref}
+
+      :telemetry.attach_many(
+        handler_id,
+        [
+          [:scriba, :projection, :event, :exception],
+          [:scriba, :projection, :dead_letter]
+        ],
+        &__MODULE__.forward_telemetry/4,
+        %{test_pid: self(), ref: ref}
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      agent = start_supervised!({TestTarget, []})
+      events = Test.Events.list(1)
+      name = "pipeline-retry-raise-#{:erlang.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        version: 1,
+        source: {Scriba.Test.Source, events: events},
+        target: {TestTarget, agent: agent},
+        parallelism: 1,
+        handler: __MODULE__.RaisingHandler,
+        batch_size: 5,
+        batch_timeout: 50,
+        retry: [max_attempts: 3, backoff: [10, 10]]
+      ]
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        start_supervised!({ProjSup, opts})
+
+        # One dead-letter event after all 3 attempts exhaust.
+        assert_receive {^ref, [:scriba, :projection, :dead_letter], _, dl_metadata}, 2_000
+
+        # error_kind reflects the original exception, not a "retry_exhausted"
+        # wrapper. The retry layer is transparent to the dead-letter path.
+        assert dl_metadata.error_kind == "Elixir.RuntimeError"
+      end)
+
+      # Three :exception telemetry events fired — one per retry attempt.
+      # Each attempt re-invokes :telemetry.span/3, which emits its own
+      # :start/:exception pair. Operators counting :exception per event_id
+      # can detect retry activity this way (the v0.1 visibility story for
+      # retries, no dedicated :retry event).
+      exceptions = drain_event(ref, [:scriba, :projection, :event, :exception], 100)
+      assert length(exceptions) == 3
+
+      # Exactly one dead-letter row, original exception type preserved.
+      [dl] = TestTarget.dead_letters(agent)
+      assert {:exception, %RuntimeError{message: "boom"}, stacktrace} = dl.error
+      assert is_list(stacktrace)
+
+      # Cursor advanced past the dead-lettered event.
+      assert Scriba.Position.stream_positions(name, 1) == %{"stream-0" => 1}
+    end
+
+    @tag :integration
+    test "retry: false — no retries, immediate dead-letter, handler called exactly once" do
+      stream = "retry-disabled-#{:erlang.unique_integer([:positive])}"
+      # fails_remaining is large; if retry: false truly bypasses the loop,
+      # the handler is called once and the {:error, _} routes straight to
+      # dead-letter. If retry sneaks back in, we'd see calls > 1.
+      agent_name = start_counting_handler(stream, fails_remaining: 999)
+
+      agent = start_supervised!({TestTarget, []})
+
+      event = %Scriba.Event{
+        id: "retry-off-1",
+        stream_id: stream,
+        type: "test",
+        data: %{},
+        position: 1,
+        occurred_at: DateTime.utc_now()
+      }
+
+      name = "pipeline-retry-disabled-#{:erlang.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        version: 1,
+        source: {Scriba.Test.Source, events: [event]},
+        target: {TestTarget, agent: agent},
+        parallelism: 1,
+        handler: __MODULE__.CountingRetryHandler,
+        batch_size: 5,
+        batch_timeout: 50,
+        retry: false
+      ]
+
+      start_supervised!({ProjSup, opts})
+
+      # Dead-letter routing is the success signal here — the {:error, _}
+      # gets there without any retries.
+      eventually(fn -> assert length(TestTarget.dead_letters(agent)) == 1 end, 2_000)
+
+      assert Agent.get(agent_name, & &1.calls) == 1
+      assert TestTarget.commits(agent) == []
+      assert Scriba.Position.stream_positions(name, 1) == %{stream => 1}
+    end
+  end
+
+  describe "parse_retry_opts/1 (unit)" do
+    alias Scriba.Projection.Pipeline
+
+    test "false returns max_attempts: 1, empty backoff (no retries)" do
+      assert Pipeline.parse_retry_opts(false) == %{max_attempts: 1, backoff: []}
+    end
+
+    test "nil returns the documented default (3 attempts, [100, 1000, 10_000] backoff)" do
+      assert Pipeline.parse_retry_opts(nil) == %{
+               max_attempts: 3,
+               backoff: [100, 1000, 10_000]
+             }
+    end
+
+    test "true returns the documented default" do
+      assert Pipeline.parse_retry_opts(true) == %{
+               max_attempts: 3,
+               backoff: [100, 1000, 10_000]
+             }
+    end
+
+    test "keyword list with valid max_attempts and backoff" do
+      assert Pipeline.parse_retry_opts(max_attempts: 5, backoff: [10, 20, 30, 40]) ==
+               %{max_attempts: 5, backoff: [10, 20, 30, 40]}
+    end
+
+    test "partial keyword list merges with defaults" do
+      assert Pipeline.parse_retry_opts(max_attempts: 2) == %{
+               max_attempts: 2,
+               backoff: [100, 1000, 10_000]
+             }
+    end
+
+    test "raises when backoff list is too short for max_attempts" do
+      assert_raise ArgumentError, ~r/at least max_attempts - 1 = 4 entries/, fn ->
+        Pipeline.parse_retry_opts(max_attempts: 5, backoff: [100, 1000])
+      end
+    end
+
+    test "raises when max_attempts is not a positive integer" do
+      assert_raise ArgumentError, ~r/positive integer/, fn ->
+        Pipeline.parse_retry_opts(max_attempts: 0)
+      end
+
+      assert_raise ArgumentError, ~r/positive integer/, fn ->
+        Pipeline.parse_retry_opts(max_attempts: :infinity)
+      end
+    end
+
+    test "raises when backoff contains non-integers" do
+      assert_raise ArgumentError, ~r/non-negative integers/, fn ->
+        Pipeline.parse_retry_opts(backoff: [100, "bad", 10_000])
+      end
+    end
+
+    test "raises when backoff contains negative integers" do
+      assert_raise ArgumentError, ~r/non-negative integers/, fn ->
+        Pipeline.parse_retry_opts(backoff: [100, -50, 10_000])
+      end
+    end
+  end
+
   @doc false
   def forward_telemetry(event, measurements, metadata, %{test_pid: pid, ref: ref}) do
     send(pid, {ref, event, measurements, metadata})
+  end
+
+  defp drain_event(ref, target_event, timeout) do
+    receive do
+      {^ref, ^target_event, measurements, metadata} ->
+        [{measurements, metadata} | drain_event(ref, target_event, timeout)]
+    after
+      timeout -> []
+    end
+  end
+
+  defp start_counting_handler(stream_id, opts) do
+    name = String.to_atom("scriba_test_retry_#{stream_id}")
+
+    defaults = %{
+      fails_remaining: 0,
+      on_fail: {:error, :transient},
+      on_succeed: {:test_record, :ok},
+      calls: 0
+    }
+
+    state = Map.merge(defaults, Map.new(opts))
+
+    {:ok, _pid} = Agent.start_link(fn -> state end, name: name)
+
+    on_exit(fn ->
+      case Process.whereis(name) do
+        nil -> :ok
+        pid -> Agent.stop(pid)
+      end
+    end)
+
+    name
   end
 
   defmodule RaisingHandler do
@@ -502,6 +760,34 @@ defmodule Scriba.Projection.PipelineTest do
     # records the commit.
     def handle(_data, %{type: "bad"}), do: {:error, :nope}
     def handle(_data, _meta), do: {:test_record, :ok}
+  end
+
+  defmodule CountingRetryHandler do
+    @moduledoc false
+    # Stateful handler used by 's retry tests. Reads a counter
+    # Agent registered under `:"scriba_test_retry_#{stream_id}"` whose state
+    # is `%{fails_remaining: N, on_fail: result, on_succeed: result, calls: N}`.
+    #
+    # Each call increments `calls`. While `calls <= fails_remaining`, returns
+    # `on_fail` (default `{:error, :transient}`). Once `calls > fails_remaining`,
+    # returns `on_succeed` (default `{:test_record, :ok}`).
+    #
+    # Letting the test inspect `calls` after the projection settles makes
+    # "how many times did retry actually fire" a direct assertion rather
+    # than a flaky timing one.
+    def handle(_data, %{stream_id: stream_id}) do
+      agent = String.to_atom("scriba_test_retry_#{stream_id}")
+
+      Agent.get_and_update(agent, fn state ->
+        new_state = %{state | calls: state.calls + 1}
+
+        if new_state.calls <= state.fails_remaining do
+          {state.on_fail, new_state}
+        else
+          {state.on_succeed, new_state}
+        end
+      end)
+    end
   end
 
   defp drain_telemetry(ref, timeout) do
