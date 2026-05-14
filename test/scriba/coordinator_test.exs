@@ -31,7 +31,10 @@ defmodule Scriba.Projection.CoordinatorTest do
   end
 
   describe "state transitions" do
-    test ":idle auto-transitions to :running", %{name: name, version: v} do
+    test ":initializing auto-transitions to :running once Pipeline producer is registered", %{
+      name: name,
+      version: v
+    } do
       eventually(fn -> assert Coordinator.state(name, v) == :running end)
     end
 
@@ -107,6 +110,197 @@ defmodule Scriba.Projection.CoordinatorTest do
         assert positions == Enum.sort(positions),
                "per-stream ordering violated for #{stream_id}: #{inspect(positions)}"
       end
+    end
+  end
+
+  describe "pause/resume held-demand semantics" do
+    @tag :integration
+    test "pause halts new commits; resume drains remaining events", %{
+      name: name,
+      version: v,
+      agent: agent
+    } do
+      # Wait for projection to be live.
+      eventually(fn -> assert Coordinator.state(name, v) == :running end)
+
+      # Attach :batch :stop telemetry — detecting "pipeline has quieted
+      # after pause" via telemetry-absence is more deterministic than a
+      # raw wall-clock sleep.
+      ref = make_ref()
+      attach_telemetry(ref, [[:scriba, :projection, :batch, :stop]])
+
+      # Pause. Some number K (≤ 10) may commit before our pause signal
+      # lands at the source — Broadway has already prefetched into
+      # processors.
+      assert :ok = Coordinator.pause(name, v)
+      assert Coordinator.state(name, v) == :paused
+
+      # Wait until 200ms has elapsed with no further :batch :stop telemetry.
+      # That window covers any in-flight messages still working through
+      # Broadway after the pause signal landed.
+      settle_telemetry_quiet(ref, 200)
+
+      commits_after_settle = length(TestTarget.commits(agent))
+
+      # Snapshot must be stable — proves pause is actually holding the
+      # source, not just slow.
+      Process.sleep(50)
+      assert length(TestTarget.commits(agent)) == commits_after_settle,
+             "commit count grew during pause from #{commits_after_settle} to " <>
+               "#{length(TestTarget.commits(agent))} — pause didn't hold the source"
+
+      # Resume — source drains accumulated demand, remaining events flow.
+      assert :ok = Coordinator.resume(name, v)
+      assert Coordinator.state(name, v) == :running
+
+      eventually(fn -> assert length(TestTarget.commits(agent)) == 10 end, 2_000)
+    end
+
+    @tag :integration
+    test ":paused and :resumed telemetry events fire with projection metadata", %{
+      name: name,
+      version: v
+    } do
+      eventually(fn -> assert Coordinator.state(name, v) == :running end)
+
+      ref = make_ref()
+
+      attach_telemetry(ref, [
+        [:scriba, :projection, :paused],
+        [:scriba, :projection, :resumed]
+      ])
+
+      :ok = Coordinator.pause(name, v)
+
+      assert_receive {^ref, [:scriba, :projection, :paused], pm, pmeta}, 500
+      assert is_integer(pm.system_time)
+      assert pmeta.projection == %{name: name, version: v}
+
+      :ok = Coordinator.resume(name, v)
+
+      assert_receive {^ref, [:scriba, :projection, :resumed], rm, rmeta}, 500
+      assert is_integer(rm.system_time)
+      assert rmeta.projection == %{name: name, version: v}
+    end
+
+    @tag :integration
+    test "pause then stop transitions :paused → :stopped directly", %{
+      name: name,
+      version: v
+    } do
+      eventually(fn -> assert Coordinator.state(name, v) == :running end)
+
+      :ok = Coordinator.pause(name, v)
+      assert Coordinator.state(name, v) == :paused
+
+      # The Pipeline is still alive in :paused. Stop must terminate it.
+      pipeline_pid_before =
+        case Registry.lookup(Scriba.Registry, {:pipeline, name, v}) do
+          [{pid, _}] -> pid
+          [] -> nil
+        end
+
+      assert is_pid(pipeline_pid_before)
+      assert Process.alive?(pipeline_pid_before)
+
+      :ok = Coordinator.stop(name, v)
+      assert Coordinator.state(name, v) == :stopped
+
+      # Pipeline process is terminated synchronously — Supervisor.terminate_child
+      # waits for the exit. Registry's monitor-based entry cleanup is async
+      # (handles a :DOWN message), so the entry may linger briefly. We assert
+      # the actual-process-death directly and wait briefly for Registry to
+      # catch up.
+      refute Process.alive?(pipeline_pid_before)
+      eventually(fn -> assert Registry.lookup(Scriba.Registry, {:pipeline, name, v}) == [] end)
+    end
+  end
+
+  describe "Broadway producer naming convention (smoke test)" do
+    @tag :integration
+    test "the Pipeline registers its producer under {name, version, \"Producer_0\"}", %{
+      name: name,
+      version: v
+    } do
+      # If a Broadway upgrade changes the suffix from "Producer_0" to
+      # something else, this test fails loudly — Coordinator.pause/resume
+      # depends on this exact key shape via Pipeline.get_producer_pid/2.
+      eventually(fn -> assert Coordinator.state(name, v) == :running end)
+
+      lookup = Registry.lookup(Scriba.Internals.Registry, {name, v, "Producer_0"})
+
+      assert [{pid, _}] = lookup, """
+      Pipeline did not register its Broadway producer under \
+      {name, version, "Producer_0"} in Scriba.Internals.Registry. \
+      Coordinator.pause/resume depends on this exact key shape. \
+      Check whether a Broadway upgrade changed the producer name suffix.
+
+      Lookup result was: #{inspect(lookup)}
+      """
+
+      assert is_pid(pid)
+      assert pid == Scriba.Projection.Pipeline.get_producer_pid(name, v)
+    end
+  end
+
+  describe "resume drains pending demand correctly" do
+    @tag :integration
+    test "events queued in the source pre-pause flow through after resume in correct order",
+         %{name: name, version: v, agent: agent} do
+      eventually(fn -> assert Coordinator.state(name, v) == :running end)
+
+      # All 10 events may flow before pause lands. Wait for completion,
+      # then verify ordering — which is the invariant pause/resume must
+      # not disturb. Per-stream ordering is the architectural contract
+      # (§3 rule 2); pause/resume must not produce a state where events
+      # are processed out of order on a stream.
+      :ok = Coordinator.pause(name, v)
+      :ok = Coordinator.resume(name, v)
+
+      eventually(fn -> assert length(TestTarget.commits(agent)) == 10 end, 2_000)
+
+      commits = TestTarget.commits(agent)
+      by_stream = Enum.group_by(commits, fn {_id, sid, _pos} -> sid end)
+
+      for {stream_id, stream_commits} <- by_stream do
+        positions = Enum.map(stream_commits, fn {_id, _sid, p} -> p end)
+        assert positions == Enum.sort(positions),
+               "pause/resume broke per-stream order for #{stream_id}: #{inspect(positions)}"
+      end
+    end
+  end
+
+  ## Test helpers
+
+  @doc false
+  def forward_telemetry(event, measurements, metadata, %{test_pid: pid, ref: ref}) do
+    send(pid, {ref, event, measurements, metadata})
+  end
+
+  defp attach_telemetry(ref, event_names) do
+    handler_id = {:coordinator_test, ref}
+
+    :telemetry.attach_many(
+      handler_id,
+      event_names,
+      &__MODULE__.forward_telemetry/4,
+      %{test_pid: self(), ref: ref}
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
+  # Blocks until `quiet_ms` milliseconds have elapsed without a
+  # [:scriba, :projection, :batch, :stop] event arriving. Used to detect
+  # "the Pipeline has drained in-flight work" after a pause signal —
+  # telemetry-absence is deterministic where a raw Process.sleep would
+  # not be.
+  defp settle_telemetry_quiet(ref, quiet_ms) do
+    receive do
+      {^ref, [:scriba, :projection, :batch, :stop], _, _} ->
+        settle_telemetry_quiet(ref, quiet_ms)
+    after
+      quiet_ms -> :ok
     end
   end
 

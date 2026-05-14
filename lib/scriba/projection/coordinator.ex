@@ -108,21 +108,20 @@ defmodule Scriba.Projection.Coordinator do
     # Postgres, which is the crash-recovery semantic we want.
     Scriba.Position.init_cache(data.name, data.version, repo: data.repo)
 
-    {:ok, :idle, data, [{:next_event, :internal, :auto_start}]}
+    # Start in :initializing. Coordinator polls for the Pipeline's
+    # registration via the @poll_interval state_timeout. Once the Pipeline
+    # (specifically its Broadway producer) is registered and monitored, we
+    # transition to :running. This means :running is an honest "Pipeline is
+    # live and the source is reachable" — pause/resume can rely on the
+    # producer pid being available without checking for nil.
+    {:ok, :initializing, data, [{:next_event, :internal, :try_monitor}]}
   end
 
   ## :enter handlers — required by :state_enter callback mode
 
   @impl :gen_statem
-  def handle_event(:enter, _from, :idle, _data), do: :keep_state_and_data
-
-  def handle_event(:enter, _from, :running, data) do
-    case ensure_monitored(data) do
-      {:ok, new_data} -> {:keep_state, new_data}
-      :pending -> {:keep_state, data, [{:state_timeout, @poll_interval, :monitor_pipeline}]}
-    end
-  end
-
+  def handle_event(:enter, _from, :initializing, _data), do: :keep_state_and_data
+  def handle_event(:enter, _from, :running, _data), do: :keep_state_and_data
   def handle_event(:enter, _from, :paused, _data), do: :keep_state_and_data
   def handle_event(:enter, _from, :draining, _data), do: :keep_state_and_data
 
@@ -135,39 +134,71 @@ defmodule Scriba.Projection.Coordinator do
     :keep_state_and_data
   end
 
-  ## :idle → :running
+  ## :initializing — poll until the Pipeline (and its producer) are up
 
-  def handle_event(:internal, :auto_start, :idle, data) do
-    {:next_state, :running, data}
+  def handle_event(:internal, :try_monitor, :initializing, data) do
+    case ensure_monitored(data) do
+      {:ok, new_data} -> {:next_state, :running, new_data}
+      :pending -> {:keep_state, data, [{:state_timeout, @poll_interval, :try_monitor}]}
+    end
   end
 
-  ## Pipeline-pid lookup polling while in :running
-
-  def handle_event(:state_timeout, :monitor_pipeline, :running, data) do
+  def handle_event(:state_timeout, :try_monitor, :initializing, data) do
     case ensure_monitored(data) do
-      {:ok, new_data} -> {:keep_state, new_data}
-      :pending -> {:keep_state, data, [{:state_timeout, @poll_interval, :monitor_pipeline}]}
+      {:ok, new_data} -> {:next_state, :running, new_data}
+      :pending -> {:keep_state, data, [{:state_timeout, @poll_interval, :try_monitor}]}
     end
   end
 
   ## Lifecycle commands — valid combos
+  #
+  # Pause: signal source to stop yielding, emit telemetry, transition.
+  # Resume: signal source to start yielding, emit telemetry, transition.
+  # The source signal is asynchronous send/2 — pause/2 returns :ok as soon
+  # as the signal is in the source's mailbox. In-flight events already in
+  # the Pipeline processors or batchers continue through their commit
+  # lifecycle. See Scriba.Source moduledoc "Pause semantics" for details.
 
   def handle_event({:call, from}, :pause, :running, data) do
-    new_data = demonitor_pipeline(data)
-    _ = Supervisor.terminate_child(data.supervisor_pid, Pipeline)
+    {source_module, _source_opts} = data.source_spec
 
-    {:next_state, :paused, %{new_data | pipeline_pid: nil}, [{:reply, from, :ok}]}
+    case Pipeline.get_producer_pid(data.name, data.version) do
+      nil ->
+        # Should not happen — :running means ensure_monitored succeeded —
+        # but defensive: if the producer disappeared (e.g. Pipeline died
+        # since our last monitor check), surface as :invalid_state.
+        {:keep_state_and_data, [{:reply, from, {:error, {:invalid_state, :running}}}]}
+
+      producer_pid ->
+        :ok = source_module.pause(producer_pid)
+
+        :telemetry.execute(
+          [:scriba, :projection, :paused],
+          %{system_time: System.system_time()},
+          %{projection: %{name: data.name, version: data.version}}
+        )
+
+        {:next_state, :paused, data, [{:reply, from, :ok}]}
+    end
   end
 
   def handle_event({:call, from}, :resume, :paused, data) do
-    case Supervisor.restart_child(data.supervisor_pid, Pipeline) do
-      {:ok, pid} ->
-        ref = Process.monitor(pid)
-        new_data = %{data | pipeline_pid: pid, pipeline_ref: ref}
-        {:next_state, :running, new_data, [{:reply, from, :ok}]}
+    {source_module, _source_opts} = data.source_spec
 
-      {:error, reason} ->
-        {:keep_state_and_data, [{:reply, from, {:error, reason}}]}
+    case Pipeline.get_producer_pid(data.name, data.version) do
+      nil ->
+        {:keep_state_and_data, [{:reply, from, {:error, {:invalid_state, :paused}}}]}
+
+      producer_pid ->
+        :ok = source_module.resume(producer_pid)
+
+        :telemetry.execute(
+          [:scriba, :projection, :resumed],
+          %{system_time: System.system_time()},
+          %{projection: %{name: data.name, version: data.version}}
+        )
+
+        {:next_state, :running, data, [{:reply, from, :ok}]}
     end
   end
 
@@ -179,7 +210,15 @@ defmodule Scriba.Projection.Coordinator do
   end
 
   def handle_event({:call, from}, :stop, :paused, data) do
-    {:next_state, :stopped, data, [{:reply, from, :ok}]}
+    # After , pause keeps the Pipeline alive — :paused →
+    # :stopped must terminate it. Skip the :draining state; the source
+    # is already paused so no new events are entering, and the Pipeline
+    # supervisor's shutdown will drain whatever's in-flight as it
+    # terminates Broadway.
+    new_data = demonitor_pipeline(data)
+    _ = Supervisor.terminate_child(data.supervisor_pid, Pipeline)
+
+    {:next_state, :stopped, %{new_data | pipeline_pid: nil}, [{:reply, from, :ok}]}
   end
 
   ## :draining: synchronous pipeline shutdown, then :stopped
@@ -190,6 +229,11 @@ defmodule Scriba.Projection.Coordinator do
   end
 
   ## Pipeline DOWN — observation only; rest_for_one will restart it
+  #
+  # On Pipeline death, transition back to :initializing so the state
+  # machine honestly reflects "Pipeline is being respawned." The
+  # @poll_interval state_timeout pattern in :initializing waits for the
+  # new Pipeline (and its producer) to register.
 
   def handle_event(
         :info,
@@ -197,8 +241,8 @@ defmodule Scriba.Projection.Coordinator do
         :running,
         %{pipeline_ref: ref} = data
       ) do
-    {:keep_state, %{data | pipeline_pid: nil, pipeline_ref: nil},
-     [{:state_timeout, @poll_interval, :monitor_pipeline}]}
+    {:next_state, :initializing, %{data | pipeline_pid: nil, pipeline_ref: nil},
+     [{:next_event, :internal, :try_monitor}]}
   end
 
   def handle_event(:info, {:DOWN, _ref, _, _, _}, _state, _data),
@@ -219,6 +263,16 @@ defmodule Scriba.Projection.Coordinator do
   end
 
   ## Catch-all for invalid command/state combos
+  #
+  # The seven cases this covers:
+  #   pause from :initializing | :paused | :stopped | :draining
+  #   resume from :initializing | :running | :stopped | :draining
+  #   stop from :initializing | :stopped | :draining
+  #
+  # Uniform error shape: {:error, {:invalid_state, state}}. Inner atom
+  # tells operators which state caused the rejection — different states
+  # call for different remediations (retry once initialized vs already
+  # paused vs terminal).
 
   def handle_event({:call, from}, cmd, state, _data) when cmd in [:pause, :resume, :stop] do
     {:keep_state_and_data, [{:reply, from, {:error, {:invalid_state, state}}}]}
@@ -231,13 +285,17 @@ defmodule Scriba.Projection.Coordinator do
   end
 
   defp ensure_monitored(data) do
-    case Registry.lookup(Scriba.Registry, {:pipeline, data.name, data.version}) do
-      [{pid, _}] ->
-        ref = Process.monitor(pid)
-        {:ok, %{data | pipeline_pid: pid, pipeline_ref: ref}}
-
-      [] ->
-        :pending
+    # We need BOTH the Pipeline supervisor pid AND the Broadway producer
+    # registered. The producer is what pause/resume signals go to; without
+    # it, transitioning to :running would be a lie.
+    with [{pid, _}] <- Registry.lookup(Scriba.Registry, {:pipeline, data.name, data.version}),
+         producer_pid when is_pid(producer_pid) <-
+           Pipeline.get_producer_pid(data.name, data.version) do
+      _ = producer_pid
+      ref = Process.monitor(pid)
+      {:ok, %{data | pipeline_pid: pid, pipeline_ref: ref}}
+    else
+      _ -> :pending
     end
   end
 

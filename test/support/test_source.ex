@@ -72,6 +72,20 @@ defmodule Scriba.Test.Source do
   @spec pending_count(GenServer.server()) :: non_neg_integer()
   def pending_count(source), do: GenStage.call(source, :pending_count)
 
+  ## Pause/resume
+
+  @impl Scriba.Source
+  def pause(pid) do
+    send(pid, :scriba_pause)
+    :ok
+  end
+
+  @impl Scriba.Source
+  def resume(pid) do
+    send(pid, :scriba_resume)
+    :ok
+  end
+
   ## GenStage producer callbacks
 
   @impl GenStage
@@ -85,13 +99,25 @@ defmodule Scriba.Test.Source do
 
     state = %{
       queue: queue,
-      acked_cursor: start_from
+      acked_cursor: start_from,
+      # : pause state. While `paused: true`, handle_demand
+      # accumulates demand into pending_demand and yields nothing. On
+      # resume, the source drains pending_demand from the queue.
+      paused: false,
+      pending_demand: 0
     }
 
     {:producer, state}
   end
 
   @impl GenStage
+  def handle_demand(demand, %{paused: true} = state) when demand > 0 do
+    # Source is paused — record the demand for later. GenStage will not
+    # invoke handle_demand again until we dispatch messages, so on resume
+    # we must self-dispatch to drain this accumulated demand.
+    {:noreply, [], %{state | pending_demand: state.pending_demand + demand}}
+  end
+
   def handle_demand(demand, %{queue: queue} = state) when demand > 0 do
     {to_send, remaining} = Enum.split(queue, demand)
     messages = Enum.map(to_send, &to_message(&1, self()))
@@ -112,6 +138,23 @@ defmodule Scriba.Test.Source do
   def handle_info({:advance_acked_cursor, position}, state) do
     new_acked = max(state.acked_cursor, position)
     {:noreply, [], %{state | acked_cursor: new_acked}}
+  end
+
+  def handle_info(:scriba_pause, state) do
+    {:noreply, [], %{state | paused: true}}
+  end
+
+  def handle_info(:scriba_resume, %{queue: queue, pending_demand: demand} = state) do
+    # Drain accumulated demand. If queue has fewer events than demand,
+    # we yield what we have and leave the residual demand for GenStage to
+    # re-invoke handle_demand later (which it will when more events would
+    # be added — for a finite Test queue, that's "never," and the residual
+    # demand is harmless).
+    {to_send, remaining} = Enum.split(queue, demand)
+    messages = Enum.map(to_send, &to_message(&1, self()))
+
+    {:noreply, messages,
+     %{state | paused: false, queue: remaining, pending_demand: demand - length(messages)}}
   end
 
   def handle_info(_other, state), do: {:noreply, [], state}

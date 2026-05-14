@@ -122,6 +122,34 @@ defmodule Scriba.Projection.Pipeline do
     {:via, Registry, {Scriba.Registry, {:pipeline, name, version}}}
   end
 
+  @doc """
+  Returns the pid of this projection's Broadway producer (the source's
+  GenStage process), or `nil` if not yet registered.
+
+  Single point of contact with Broadway's internal naming convention.
+  Broadway names producers with suffix `"Producer_<index>"` in
+  `Broadway.Topology.process_name/3`; with our `concurrency: 1`, the
+  one producer is `"Producer_0"`. Our `process_name/2` callback below
+  routes that into `Scriba.Internals.Registry`.
+
+  Used by the Coordinator's pause/resume path to deliver
+  `Scriba.Source.pause/1` / `resume/1` signals. Returns `nil` during
+  the short window between Pipeline supervisor start and Broadway's
+  producer registration — Coordinator's :initializing state guards
+  this race.
+
+  The `pipeline_naming_smoke_test` integration test asserts this key
+  exists after a Pipeline starts, so a future Broadway upgrade that
+  changes the naming convention surfaces loudly.
+  """
+  @spec get_producer_pid(String.t(), pos_integer()) :: pid() | nil
+  def get_producer_pid(name, version) do
+    case Registry.lookup(Scriba.Internals.Registry, {name, version, "Producer_0"}) do
+      [{pid, _}] -> pid
+      [] -> nil
+    end
+  end
+
   @impl Broadway
   def process_name({:via, Registry, {Scriba.Registry, {:pipeline, name, version}}}, suffix) do
     # Broadway-internal processes (producer, processors, batchers, terminator)

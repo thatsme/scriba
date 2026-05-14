@@ -27,6 +27,25 @@ defmodule Scriba.Source.Commanded do
   Result: Scriba (and this module) compile cleanly even when `:commanded` is
   absent. `start_link/1` raises a clear error in that case; `child_spec/1` is
   always safe.
+
+  ## Pause/resume memory caveat (v0.1)
+
+  `pause/1` sets a `paused: true` flag — `handle_demand/2` returns no
+  messages while paused, accumulating demand into `pending_demand`. The
+  Commanded subscription, however, **keeps pushing events** into the
+  source's `pending :queue` regardless of pause state (we don't
+  unsubscribe).
+
+  Memory grows during pause, bounded by how many events the upstream
+  EventStore delivers in the pause window. For operator-driven pauses
+  (seconds to minutes on low-volume projections), this is fine. For
+  long pauses on high-throughput projections, this is a documented
+  sharp edge.
+
+  The cleaner alternative — unsubscribe on pause, re-subscribe on
+  resume from the current cursor — is v0.5 hardening territory and
+  changes EventStore subscription state in non-trivial ways. Out of
+  scope for v0.1.
   """
 
   @behaviour Scriba.Source
@@ -59,6 +78,20 @@ defmodule Scriba.Source.Commanded do
     GenStage.start_link(__MODULE__, opts)
   end
 
+  ## Pause/resume
+
+  @impl Scriba.Source
+  def pause(pid) do
+    send(pid, :scriba_pause)
+    :ok
+  end
+
+  @impl Scriba.Source
+  def resume(pid) do
+    send(pid, :scriba_resume)
+    :ok
+  end
+
   ## GenStage producer callbacks
 
   @impl GenStage
@@ -80,7 +113,8 @@ defmodule Scriba.Source.Commanded do
       application: application,
       subscription: subscription,
       pending: :queue.new(),
-      demand: 0
+      demand: 0,
+      paused: false
     }
 
     {:producer, state}
@@ -95,8 +129,19 @@ defmodule Scriba.Source.Commanded do
   def handle_info({:subscribed, _sub}, state), do: {:noreply, [], state}
 
   def handle_info({:events, events}, state) do
+    # Subscription keeps pushing events into pending regardless of pause
+    # state. See moduledoc "Pause/resume memory caveat" for the v0.1
+    # tradeoff.
     new_pending = Enum.reduce(events, state.pending, &:queue.in/2)
     dispatch(%{state | pending: new_pending})
+  end
+
+  def handle_info(:scriba_pause, state) do
+    {:noreply, [], %{state | paused: true}}
+  end
+
+  def handle_info(:scriba_resume, state) do
+    dispatch(%{state | paused: false})
   end
 
   def handle_info(_other, state), do: {:noreply, [], state}
@@ -115,6 +160,7 @@ defmodule Scriba.Source.Commanded do
 
   ## Internals
 
+  defp dispatch(%{paused: true} = state), do: {:noreply, [], state}
   defp dispatch(%{demand: 0} = state), do: {:noreply, [], state}
 
   defp dispatch(state) do
