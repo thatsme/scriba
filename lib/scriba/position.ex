@@ -51,6 +51,8 @@ defmodule Scriba.Position do
   doesn't impose primary-key or timestamp conventions on the user.
   """
 
+  alias Ecto.Adapters.SQL
+
   @type name :: String.t()
   @type version :: pos_integer()
   @type stream_id :: String.t()
@@ -143,7 +145,7 @@ defmodule Scriba.Position do
 
   defp preload_from_repo(repo, name, version) do
     %{rows: rows} =
-      Ecto.Adapters.SQL.query!(
+      SQL.query!(
         repo,
         """
         SELECT stream_id, position
@@ -254,8 +256,12 @@ defmodule Scriba.Position do
   @spec cache_put(name(), version(), stream_id(), position()) :: :ok
   def cache_put(name, version, stream_id, position) do
     case :ets.whereis(@cache_table) do
-      :undefined -> :ok
-      _ -> :ets.insert(@cache_table, {{name, version, stream_id}, position}) && :ok
+      :undefined ->
+        :ok
+
+      _ ->
+        :ets.insert(@cache_table, {{name, version, stream_id}, position})
+        :ok
     end
   end
 
@@ -337,7 +343,7 @@ defmodule Scriba.Position do
   @spec read_from_repo(module(), name(), version(), stream_id()) ::
           position() | nil
   def read_from_repo(repo, name, version, stream_id) do
-    case Ecto.Adapters.SQL.query!(
+    case SQL.query!(
            repo,
            """
            SELECT position
@@ -367,7 +373,7 @@ defmodule Scriba.Position do
     Ecto.Multi.run(multi, {:scriba_position, stream_id}, fn repo, _changes ->
       now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
-      Ecto.Adapters.SQL.query(
+      SQL.query(
         repo,
         """
         INSERT INTO scriba_positions

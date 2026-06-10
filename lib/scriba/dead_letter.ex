@@ -18,6 +18,7 @@ defmodule Scriba.DeadLetter do
   Pipeline once the Ecto target is wired in.
   """
 
+  alias Ecto.Adapters.SQL
   alias Scriba.Event
 
   @type projection :: %{name: String.t(), version: pos_integer()}
@@ -62,7 +63,7 @@ defmodule Scriba.DeadLetter do
   def insert(repo, projection, %Event{} = event, error) do
     row = build_row(projection, event, error)
 
-    Ecto.Adapters.SQL.query(
+    SQL.query(
       repo,
       """
       INSERT INTO scriba_dead_letters
