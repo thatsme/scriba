@@ -41,9 +41,13 @@ mix bank.setup   # creates the database and runs migrations
 ```
 
 The setup task assumes a local Postgres on port 5432 with user
-`postgres`/`postgres` and creates a database named `bank_demo`. For
-non-standard setups, copy `.env.local.example` to `.env.local` and
-customize the `BANK_DEMO_DB_*` variables before running `mix bank.setup`.
+`postgres`/`postgres` and creates a database named `bank_demo`. For a
+non-standard or remote Postgres, copy `.env.local.example` to
+`.env.local` and set the `BANK_DEMO_DB_*` variables. The example
+**auto-loads `.env.local`** if present (via `config/runtime.exs`, the
+same pattern the main test suite uses) — you don't need to export the
+variables into your shell. A real shell environment variable still wins,
+so `BANK_DEMO_DB_HOST=… mix bank.demo` overrides the file.
 
 ## Run the demo
 
@@ -68,12 +72,19 @@ account_balances:
 
 Total events processed: 53
 Projection state:       running
-Safe position:          53
+Safe position:          42
 ```
 
 The exact numbers vary — the deposit/withdraw amounts are random.
 Negative balances are expected and intentional; the demo does not
 enforce an overdraft check.
+
+`Total events processed` (53 = 3 opens + 50 ops) is the count the
+projection handler committed. `Safe position` is the **minimum** cursor
+across the three account streams — it sits below the total because no
+single stream holds all 53 events, and it's the position a fresh replica
+could resume from without missing anything. Here that's 42, the lowest
+of the three per-account positions above.
 
 ## What each file does
 

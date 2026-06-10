@@ -65,7 +65,7 @@ defmodule Mix.Tasks.Bank.Demo do
     Mix.shell().info("Caught up in #{format_duration(wait_time_us)}.\n")
 
     print_balances()
-    print_summary()
+    print_summary(counter)
   rescue
     e in DBConnection.ConnectionError ->
       die("""
@@ -200,10 +200,16 @@ defmodule Mix.Tasks.Bank.Demo do
     Mix.shell().info("")
   end
 
-  defp print_summary do
+  # `counter` is the exact count of [:scriba, :projection, :event, :stop]
+  # telemetry events the handler processed (reaches @total_events or the demo
+  # would have died waiting). safe_position is the MIN across the per-account
+  # stream cursors, so it sits below the processed total — that gap is
+  # expected and is exactly what the counter-vs-safe_position comment above
+  # explains. Print both: they answer different questions.
+  defp print_summary(counter) do
     {:ok, info} = Scriba.info(Bank.Projections.Balances)
 
-    Mix.shell().info("Total events processed: #{info.safe_position}")
+    Mix.shell().info("Total events processed: #{:counters.get(counter, 1)}")
     Mix.shell().info("Projection state:       #{info.status}")
     Mix.shell().info("Safe position:          #{info.safe_position}")
   end
