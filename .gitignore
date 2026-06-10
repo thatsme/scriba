@@ -23,3 +23,14 @@ Thumbs.db
 # for the template). Never commit.
 .env.local
 .env.*.local
+
+# AI-facing docs live in the private claude-files repo
+.claude
+CLAUDE.md
+
+# Private AI-collaboration artifacts (claude-files mirrors)
+GIULIA.md
+*PHASE_*_RECAP*
+*REBUILD_PLAN*
+*project_context*
+.giulia/
