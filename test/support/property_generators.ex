@@ -66,8 +66,7 @@ defmodule Scriba.Test.Generators do
   timing variation. The shuffle uses StreamData-generated sort keys so
   the permutation is deterministic for a given test seed.
 
-  Per the  — `gen all` chains in count-then-content
-  order.
+  `gen all` chains in count-then-content order.
   """
   def events_gen_pd(opts \\ []) do
     min_n = Keyword.get(opts, :min, 10)

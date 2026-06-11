@@ -11,7 +11,7 @@ defmodule Scriba.Migrations do
         def down, do: Scriba.Migrations.down()
       end
 
-  Creates `scriba_positions` (per-stream cursors per the )
+  Creates `scriba_positions` (per-stream cursors)
   and `scriba_dead_letters` (§9). Both tables are owned by the user's repo —
   Scriba does not manage migrations on its own.
 

@@ -64,7 +64,7 @@ defmodule Scriba.Position do
 
   # Cap on the rows preloaded from Postgres at init_cache time. Beyond this,
   # un-preloaded streams fall back to lazy lookup via `cache_get/4` with
-  # `repo:`. Trade-off documented in 
+  # `repo:`.
   @preload_cap 10_000
 
   ## Shared cache table
@@ -210,7 +210,7 @@ defmodule Scriba.Position do
       `{:ok, position}` is returned. If the row does not exist (no commit
       for this stream yet), returns `:error`.
 
-  's source-side dedup is the primary caller of the
+  Source-side dedup is the primary caller of the
   `:repo`-backed form: dedup needs the durable cursor for a stream that
   hasn't appeared in the cache yet (e.g. a newly-discovered stream after
   Coordinator restart with a cache preloaded only up to `@preload_cap`

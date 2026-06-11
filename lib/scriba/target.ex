@@ -22,9 +22,9 @@ defmodule Scriba.Target do
   Per §9.2, dead-lettered events ALSO advance the cursor — `stream_advances`
   reflects the max across both success and dead-letter results.
 
-  In  the invariant is preserved by construction (per-stream affinity
+  The invariant is preserved by construction (per-stream affinity
   in Broadway's processor partitioning means events for one stream arrive
-  at one batcher in source order). In , source-side dedup
+  at one batcher in source order). Source-side dedup
   also enforces it across crashes by skipping events whose position is at
   or below the stream's committed cursor.
 

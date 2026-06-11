@@ -16,8 +16,8 @@ defmodule Scriba.Telemetry.Handler do
   from competing with their observability stack.
 
   The supervisor child slot exists for v0.2 dashboard work to land into —
-  the  documents this as the eventual home for default
-  logging at `:exception` level and telemetry-pump behaviour.
+  the eventual home for default logging at `:exception` level and
+  telemetry-pump behaviour.
   """
 
   use GenServer

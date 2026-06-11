@@ -5,7 +5,7 @@ defmodule Scriba.Projection.Pipeline do
 
   alias Broadway.Message
 
-  # Default retry policy per architecture §9.1 and :
+  # Default retry policy per architecture §9.1:
   # 3 attempts, exponential backoff. The backoff list provides the sleeps
   # BETWEEN attempts (not before the first attempt, not after the last),
   # so N attempts require ≥ N-1 backoff entries. Default backoff has 3
@@ -188,10 +188,10 @@ defmodule Scriba.Projection.Pipeline do
         }
 
         # :telemetry.span/3 emits :start/:stop on success and :start/:exception
-        # on raise (then re-raises). Wrapping the span in try/rescue (
-        # item 2) intercepts the re-raise here — Broadway never sees it as a
+        # on raise (then re-raises). Wrapping the span in try/rescue
+        # intercepts the re-raise here — Broadway never sees it as a
         # failed message — and tags the handler_result so handle_batch/4 can
-        # route it to dead-letter. wraps a retry loop around
+        # route it to dead-letter. A retry loop wraps around
         # this try/rescue: each retry re-invokes the span (fresh start/stop/
         # exception telemetry per attempt — operators can count :event :start
         # events per event_id to detect retry activity).
@@ -268,8 +268,8 @@ defmodule Scriba.Projection.Pipeline do
         do_attempt(handler_call, retry_config, attempt + 1)
 
       true ->
-        # Exhausted. Return the final failure result unchanged — 
-        # item 2's handle_batch partitioning routes it to dead-letter
+        # Exhausted. Return the final failure result unchanged — the
+        # handle_batch partitioning routes it to dead-letter
         # with the original error_kind. No "retry_exhausted" wrapper.
         result
     end
@@ -280,7 +280,7 @@ defmodule Scriba.Projection.Pipeline do
   # single Coordinator lifetime. On Coordinator restart the cache is wiped
   # (init_cache in init/1) and the Test source re-yields from zero, so
   # cross-restart dedup requires `:repo` to preload the cursor from
-  # Postgres. 's real-Postgres property tests will exercise that
+  # Postgres. The real-Postgres property tests will exercise that
   # path.
   defp already_committed?(%Scriba.Event{} = event, ctx) do
     case Scriba.Position.cache_get(
@@ -297,7 +297,7 @@ defmodule Scriba.Projection.Pipeline do
   @impl Broadway
   def handle_batch(_batcher, messages, _batch_info, ctx) do
     # Partition into success-shape and failure-shape results. Failure-shape
-    #: handler returned {:error, _} OR the engine caught a
+    # is when the handler returned {:error, _} OR the engine caught a
     # handler raise and tagged it {:exception, exception, stacktrace}. Those
     # go to dead-letter; the rest get their normal Multi step.
     {good_messages, bad_messages} =

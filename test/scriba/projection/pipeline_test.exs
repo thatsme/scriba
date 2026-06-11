@@ -58,7 +58,7 @@ defmodule Scriba.Projection.PipelineTest do
       # Scriba.Test.Source which re-yields all 10 events. Using direct
       # Supervisor.terminate_child / restart_child rather than
       # Coordinator.pause/resume — those wrap the same primitives but
-      # the names imply pause/resume semantics that aren't real until .
+      # the names imply pause/resume semantics that aren't real yet.
       [{sup_pid, _}] = Registry.lookup(Scriba.Registry, {:projection_supervisor, name, 1})
       :ok = Supervisor.terminate_child(sup_pid, Scriba.Projection.Pipeline)
       {:ok, _} = Supervisor.restart_child(sup_pid, Scriba.Projection.Pipeline)
@@ -297,7 +297,7 @@ defmodule Scriba.Projection.PipelineTest do
         retry: false
       ]
 
-      # : the Pipeline's try/rescue around :telemetry.span/3
+      # The Pipeline's try/rescue around :telemetry.span/3
       # catches the re-raise BEFORE Broadway sees the message as failed.
       # No Broadway-level log is produced — but kept under CaptureLog
       # defensively in case future Broadway versions log handle_message
@@ -331,7 +331,7 @@ defmodule Scriba.Projection.PipelineTest do
   describe "dead-letter routing" do
     @tag :integration
     test "regression: {:error, _} no longer poisons the batch — successes commit, cursor advances past failures, dead-letter recorded" do
-      # The structural fix this test pins: prior to , a single
+      # The structural fix this test pins: previously, a single
       # {:error, _} handler return inserted an Ecto.Multi.run step that
       # returned {:error, _}, failing the whole transaction. No reads
       # committed; no cursors advanced. The fix partitions failures out of
@@ -478,7 +478,7 @@ defmodule Scriba.Projection.PipelineTest do
         assert_receive {^ref, [:scriba, :projection, :dead_letter], _measurements, metadata},
                        2_000
 
-        # : exception kind label is the exception module name
+        # Exception kind label is the exception module name
         # (matches DeadLetter.normalize_error/1's `exception.__struct__`).
         assert metadata.error_kind == "Elixir.RuntimeError"
         assert metadata.event_type == "test_event"
@@ -764,7 +764,7 @@ defmodule Scriba.Projection.PipelineTest do
 
   defmodule CountingRetryHandler do
     @moduledoc false
-    # Stateful handler used by 's retry tests. Reads a counter
+    # Stateful handler used by the retry tests. Reads a counter
     # Agent registered under `:"scriba_test_retry_#{stream_id}"` whose state
     # is `%{fails_remaining: N, on_fail: result, on_succeed: result, calls: N}`.
     #

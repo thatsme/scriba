@@ -1,6 +1,6 @@
 defmodule Scriba.PropertyDb.SandboxHarnessTest do
   @moduledoc """
-  — Foundation for PD1/PD2/PD3.
+  Foundation for PD1/PD2/PD3.
 
   Asserts that the shared-mode `Ecto.Adapters.SQL.Sandbox` setup spans the
   entire projection process tree: Coordinator, Pipeline (Broadway top

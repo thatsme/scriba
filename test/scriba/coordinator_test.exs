@@ -216,7 +216,7 @@ defmodule Scriba.Projection.CoordinatorTest do
     end
   end
 
-  describe "Broadway producer naming convention (smoke test)" do
+  describe "Broadway producer naming convention smoke test" do
     @tag :integration
     test "the Pipeline registers its producer under {name, version, \"Producer_0\"}", %{
       name: name,

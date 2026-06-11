@@ -10,8 +10,8 @@ defmodule Scriba.Target.Test do
   Dead-letter routing: the Pipeline hands the Target a
   list of `{event, error}` tuples for events whose handler returned
   `{:error, _}` or raised. The Test target records them in its in-memory
-  `:dead_letters` list (per 's mandate that property
-  tests can assert dead-letter routing without a Repo).
+  `:dead_letters` list, letting property
+  tests assert dead-letter routing without a Repo.
 
   ## Usage
 

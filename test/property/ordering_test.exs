@@ -21,7 +21,7 @@ defmodule Scriba.Property.OrderingTest do
           assert {:ok, _} = H.wait_until_unique(agent, length(events), 5_000)
 
           # commits are 3-tuples {event_id, stream_id, position} in commit
-          # order (changed the shape). Group by stream_id
+          # order. Group by stream_id
           # field directly rather than reconstructing it from event_id.
           commits = TestTarget.commits(agent)
 

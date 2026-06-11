@@ -212,7 +212,7 @@ defmodule Scriba.Projection.Coordinator do
   end
 
   def handle_event({:call, from}, :stop, :paused, data) do
-    # After , pause keeps the Pipeline alive — :paused →
+    # Pause keeps the Pipeline alive — :paused →
     # :stopped must terminate it. Skip the :draining state; the source
     # is already paused so no new events are entering, and the Pipeline
     # supervisor's shutdown will drain whatever's in-flight as it

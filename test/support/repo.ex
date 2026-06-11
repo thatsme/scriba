@@ -1,7 +1,7 @@
 defmodule Scriba.Test.Repo do
   @moduledoc """
   Test-only `Ecto.Repo` for real-Postgres property tests
-  (`test/property_db/`, ).
+  (`test/property_db/`).
 
   Configured by `config/test.exs` from `SCRIBA_TEST_DB_*` environment
   variables. When the env is not configured, this module is still compiled

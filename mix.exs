@@ -92,8 +92,7 @@ defmodule Scriba.MixProject do
       # ExUnit's `--only` replaces (rather than merges with) the
       # `exclude: [property_db: true]` that test_helper.exs sets when env
       # is unconfigured, so property_db tests would run and fail with
-      # connection errors instead of skipping cleanly. Verified empirically
-      # during 
+      # connection errors instead of skipping cleanly. Verified empirically.
       "test.property_db": &__MODULE__.test_property_db/1,
 
       # Everything ExUnit will run with the current environment. Includes

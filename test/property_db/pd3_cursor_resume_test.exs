@@ -33,11 +33,11 @@ defmodule Scriba.PropertyDb.Pd3CursorResumeTest do
   Postgres and a real Ecto target. It does NOT independently exercise
   the Pipeline's source-side dedup: with start_from
   filtering everything, dedup is never invoked. The two layers are
-  defense in depth. 's fast-suite integration test
+  defense in depth. The fast-suite integration test
   exercises dedup directly; PD3 here verifies the source-side filter
   works end-to-end.
 
-  Iterations: 100 (per  — half PD2's count because
+  Iterations: 100 (half PD2's count because
   each iteration runs two projections in sequence).
   """
 

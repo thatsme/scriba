@@ -1,6 +1,6 @@
 defmodule Scriba.Test.ReadModel do
   @moduledoc """
-  Minimal read-model schema for property_db tests ().
+  Minimal read-model schema for property_db tests.
 
   Three columns: `event_id` (string, primary key), `stream_id`, `position`.
   Migration in `test/support/migrations/create_test_read_models.ex`,

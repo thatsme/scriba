@@ -1,7 +1,7 @@
 defmodule Scriba.Test.PropertyDbHelpers do
   @moduledoc """
   Shared helpers for `test/property_db/` — the real-Postgres property
-  tests landing in –3.x.
+  tests.
 
   Compiled into the `:test` env only (under `test/support/`).
   """

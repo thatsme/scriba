@@ -19,8 +19,8 @@ defmodule Scriba.Test.Source do
 
   ## Why a cursor
 
-  (source-side dedup) in  added a Pipeline-
-  level dedup against the projection's per-stream cursors. To exercise it
+  Source-side dedup added a Pipeline-level dedup against the
+  projection's per-stream cursors. To exercise it
   meaningfully, the source must be able to *not* replay events that the
   projection has already committed — same shape as Commanded resuming a
   named subscription from its acked position. The fixed `:start_from`
@@ -100,7 +100,7 @@ defmodule Scriba.Test.Source do
     state = %{
       queue: queue,
       acked_cursor: start_from,
-      # : pause state. While `paused: true`, handle_demand
+      # Pause state. While `paused: true`, handle_demand
       # accumulates demand into pending_demand and yields nothing. On
       # resume, the source drains pending_demand from the queue.
       paused: false,

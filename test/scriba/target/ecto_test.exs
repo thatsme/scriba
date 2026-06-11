@@ -96,7 +96,7 @@ defmodule Scriba.Target.EctoTest do
 
   describe "build_multi/5 — dead-letter routing" do
     test "{:error, _} dead-letter produces a :scriba_dead_letter step, NOT a failing transaction step" do
-      # regression: the previous build_multi/4 inserted an
+      # Regression: the previous build_multi/4 inserted an
       # Ecto.Multi.run/3 step that returned {:error, _}, poisoning the
       # whole transaction. The Pipeline now partitions {:error, _} into
       # the dead_letters argument; this assertion pins that the resulting

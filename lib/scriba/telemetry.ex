@@ -35,7 +35,7 @@ defmodule Scriba.Telemetry do
 
   Lag and throughput events (`[:scriba, :projection, :lag]`,
   `[:scriba, :projection, :throughput]`) are v0.2 per
-  `SCRIBA_ARCHITECTURE.md` §2 and `` §3.1. See
+  `SCRIBA_ARCHITECTURE.md` §2. See
   §7.5 of the architecture doc for the implementation note on periodic
   timers that the v0.2 work will need.
   """
