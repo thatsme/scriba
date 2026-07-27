@@ -44,6 +44,20 @@ defmodule Scriba.Target.Ecto do
     {:ok, %{repo: repo}}
   end
 
+  # The success-shape half of §4.2 — exactly the results apply_handler_result/3
+  # has a clause for. Kept adjacent to those clauses on purpose: adding a shape
+  # there without adding it here silently dead-letters it, and adding it here
+  # without adding it there restores the crash-loop this guard exists to
+  # prevent. `{:error, _}` and the internal `{:exception, _, _}` tag are not
+  # listed — the Pipeline classifies those as failures before asking.
+  @impl Scriba.Target
+  def valid_result?(:skip), do: true
+  def valid_result?({:insert, _struct}), do: true
+  def valid_result?({:update, _schema, _filter, [set: _changes]}), do: true
+  def valid_result?({:delete, _schema, _filter}), do: true
+  def valid_result?({:multi, %Ecto.Multi{}}), do: true
+  def valid_result?(_other), do: false
+
   @impl Scriba.Target
   def apply_batch(
         events,
@@ -53,15 +67,23 @@ defmodule Scriba.Target.Ecto do
         dead_letters,
         %{repo: repo} = state
       ) do
+    # Exception-free by contract. Both Multi assembly and the transaction can
+    # raise rather than return: `{:insert, struct}` passes a bare struct with
+    # no declared constraints, so a unique violation surfaces as a raised
+    # Ecto.ConstraintError, and Ecto.Multi.merge/2 resolves lazily inside the
+    # transaction. A raise here escapes to Broadway, which fails the whole
+    # batch — losing the reason, and with it any chance of telling a
+    # deterministic failure from a transient one. Converting to
+    # `{:error, reason, state}` keeps the reason where Scriba.Failure can
+    # classify it.
     multi = build_multi(events, handler_results, projection, stream_advances, dead_letters)
 
     case repo.transaction(multi) do
-      {:ok, _changes} ->
-        {:ok, state}
-
-      {:error, _failed_op, reason, _changes_so_far} ->
-        {:error, reason, state}
+      {:ok, _changes} -> {:ok, state}
+      {:error, _failed_op, reason, _changes_so_far} -> {:error, reason, state}
     end
+  rescue
+    exception -> {:error, exception, state}
   end
 
   ## Public for testability — assembles the Multi without running it

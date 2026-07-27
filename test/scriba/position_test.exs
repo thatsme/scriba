@@ -88,8 +88,8 @@ defmodule Scriba.PositionTest do
 
   # Named telemetry handler — :telemetry warns about anonymous-function
   # handlers (performance note). Using a module function keeps the test
-  # output clean and matches what Scriba.Telemetry.Handler will
-  # do.
+  # output clean and matches what application code attaching these events
+  # should do.
   @doc false
   def forward_telemetry(_event, measurements, metadata, %{test_pid: pid, ref: ref}) do
     send(pid, {ref, measurements, metadata})

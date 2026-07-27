@@ -2,17 +2,18 @@ defmodule Scriba.Info do
   @moduledoc """
   Snapshot of a projection's runtime state, returned by `Scriba.info/2`.
 
-  ## Partial population
+  ## Population
 
-  In v0.1, only `:name`, `:version`, and the position
-  fields (`:safe_position`, `:stream_positions`) are populated. The
-  lifecycle and adapter fields (`:status`, `:source`, `:target`) are
-  `nil` until the Coordinator's `get_status/1` call exposes them in a
-  later phase.
+  All fields are populated when `Scriba.info/2` finds a registered
+  Coordinator: `:name`, `:version` and the position fields
+  (`:safe_position`, `:stream_positions`) come from the position cache;
+  `:status`, `:source` and `:target` come from the Coordinator's status
+  call. When no Coordinator is registered, `Scriba.info/2` returns
+  `{:error, :not_found}` rather than a partially-populated struct.
 
-  Once this struct ships, the `Scriba.info/2` caller may
-  rely on the position fields. Other fields are optional context and may
-  be `nil`.
+  `:status` is one of `:initializing | :running | :paused | :draining |
+  :stopped`. `:source` and `:target` are the `{module, opts}` specs the
+  projection was started with.
 
   ## Truncation
 

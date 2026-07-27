@@ -4,6 +4,8 @@ defmodule Scriba.Projection.PipelineTest do
   # race on the call_count counter.
   use ExUnit.Case, async: false
 
+  require Logger
+
   alias Scriba.Projection.Supervisor, as: ProjSup
   alias Scriba.Target.Test, as: TestTarget
   alias Scriba.Test
@@ -494,6 +496,325 @@ defmodule Scriba.Projection.PipelineTest do
       # Cursor advanced past the dead-lettered event.
       assert Scriba.Position.stream_positions(name, 1) == %{"stream-0" => 1}
     end
+
+    # A handler returning a shape outside §4.2 used to fall through
+    # success_shape?/1's blacklist into the Target, where Multi assembly
+    # raised FunctionClauseError *outside* apply_batch/6's
+    # `case repo.transaction(...)`. Broadway failed the whole batch, and once
+    # the source correctly stopped acknowledging failed batches, that became
+    # an unbreakable crash loop: redeliver, same bad return, crash, repeat —
+    # no dead letter, no progress, on one malformed event.
+    #
+    # A malformed return is a per-event user bug and must dead-letter like
+    # any other, so the projection keeps moving.
+    @tag :integration
+    test "a handler return outside the six shapes dead-letters instead of wedging" do
+      ref = make_ref()
+      handler_id = {:malformed_dl_telemetry, ref}
+
+      :telemetry.attach(
+        handler_id,
+        [:scriba, :projection, :dead_letter],
+        &__MODULE__.forward_telemetry/4,
+        %{test_pid: self(), ref: ref}
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      agent = start_supervised!({TestTarget, []})
+      events = Test.Events.list(1)
+      name = "pipeline-dl-malformed-#{:erlang.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        version: 1,
+        source: {Scriba.Test.Source, events: events},
+        target: {__MODULE__.StrictTarget, agent: agent},
+        parallelism: 1,
+        handler: __MODULE__.MalformedReturnHandler,
+        batch_size: 5,
+        batch_timeout: 50,
+        retry: false
+      ]
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        start_supervised!({ProjSup, opts})
+
+        assert_receive {^ref, [:scriba, :projection, :dead_letter], _measurements, metadata},
+                       2_000
+
+        # Distinguishable from "handler failed" — the handler is wrong.
+        assert metadata.error_kind == "invalid_return"
+      end)
+
+      # The offending return is preserved verbatim as the diagnostic.
+      [dl] = TestTarget.dead_letters(agent)
+      assert dl.error == {:test_recrd, :ok}
+
+      # Cursor advanced — the projection is not wedged on the bad event.
+      assert Scriba.Position.stream_positions(name, 1) == %{"stream-0" => 1}
+    end
+
+    # Two events in one batch naming a Multi operation identically used to
+    # raise inside Repo.transaction/1 — lazily, so outside apply_batch/6's
+    # case. Broadway failed the batch, the source refused to ack it, it was
+    # redelivered, and the same pair collided again: a deterministic, silent,
+    # permanent loop. Now the first claim wins and later claimants are
+    # dead-lettered individually, so the batch still commits.
+    @tag :integration
+    test "duplicate Multi keys in one batch dead-letter the later event, not the batch" do
+      ref = make_ref()
+      handler_id = {:collision_dl_telemetry, ref}
+
+      :telemetry.attach(
+        handler_id,
+        [:scriba, :projection, :dead_letter],
+        &__MODULE__.forward_telemetry/4,
+        %{test_pid: self(), ref: ref}
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      agent = start_supervised!({TestTarget, []})
+      # Two events on ONE stream so they land in the same batch.
+      events = Test.Events.list(2, streams: 1)
+      name = "pipeline-dl-collision-#{:erlang.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        version: 1,
+        source: {Scriba.Test.Source, events: events},
+        target: {TestTarget, agent: agent},
+        parallelism: 1,
+        handler: __MODULE__.StaticMultiKeyHandler,
+        batch_size: 5,
+        batch_timeout: 50,
+        retry: false
+      ]
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        start_supervised!({ProjSup, opts})
+
+        assert_receive {^ref, [:scriba, :projection, :dead_letter], _measurements, metadata},
+                       2_000
+
+        assert metadata.error_kind == "multi_key_collision"
+      end)
+
+      # Exactly one dead letter — the FIRST event kept its claim and committed.
+      assert [dl] = TestTarget.dead_letters(agent)
+      assert {:multi_key_collision, [:example_projection]} = dl.error
+      assert length(TestTarget.commits(agent)) == 1
+
+      # Cursor advanced past both — the projection is not wedged.
+      assert Scriba.Position.stream_positions(name, 1) == %{"stream-0" => 2}
+    end
+  end
+
+  describe "per-event fallback on commit failure" do
+    # The regression this closes: killing the producer on commit failure (so
+    # the subscription rewinds and replays) turned every DETERMINISTIC commit
+    # failure into an infinite loop — redeliver, fail identically, crash,
+    # repeat. A unique violation on one event took its whole batch with it,
+    # forever.
+    #
+    # The escape is to re-apply the batch one transaction per event and let
+    # Scriba.Failure classify each failure by SQLSTATE.
+
+    defp pg_error(code, name) do
+      %Postgrex.Error{postgres: %{pg_code: code, code: name, severity: "ERROR", message: "x"}}
+    end
+
+    @tag :integration
+    test "an integrity failure dead-letters one event and lets the rest commit" do
+      ref = make_ref()
+      handler_id = {:fallback_dl, ref}
+
+      :telemetry.attach(
+        handler_id,
+        [:scriba, :projection, :dead_letter],
+        &__MODULE__.forward_telemetry/4,
+        %{test_pid: self(), ref: ref}
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      agent = start_supervised!({Scriba.Target.Test, []})
+      events = Test.Events.list(3, streams: 1)
+      name = "pipeline-fallback-integrity-#{:erlang.unique_integer([:positive])}"
+
+      # Fails whenever event at position 2 is in the batch — including when it
+      # is alone in the per-event pass. Deterministic and event-specific,
+      # which is precisely what :integrity means.
+      fail_when = fn evts ->
+        if Enum.any?(evts, &(&1.position == 2)),
+          do: pg_error("23505", :unique_violation)
+      end
+
+      opts = [
+        name: name,
+        version: 1,
+        source: {Scriba.Test.Source, events: events},
+        target: {__MODULE__.FailingTarget, agent: agent, fail_when: fail_when},
+        parallelism: 1,
+        handler: Scriba.Test.Projection,
+        batch_size: 5,
+        batch_timeout: 50,
+        retry: false
+      ]
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        start_supervised!({ProjSup, opts})
+
+        assert_receive {^ref, [:scriba, :projection, :dead_letter], _m, metadata}, 2_000
+        assert metadata.position == 2
+        assert metadata.error_kind == "commit:23505 (unique_violation)"
+      end)
+
+      # Events 1 and 3 committed; only the poison event was dead-lettered.
+      committed = Scriba.Target.Test.commits(agent) |> Enum.map(&elem(&1, 2))
+      assert 1 in committed
+      assert 3 in committed
+      refute 2 in committed
+
+      # Cursor advanced past all three — the projection is not wedged.
+      assert Scriba.Position.stream_positions(name, 1) == %{"stream-0" => 3}
+    end
+
+    @tag :integration
+    test "a transient failure replays the batch whole and commits nothing" do
+      agent = start_supervised!({Scriba.Target.Test, []})
+      events = Test.Events.list(3, streams: 1)
+      name = "pipeline-fallback-transient-#{:erlang.unique_integer([:positive])}"
+
+      # Deadlock: nothing about any event is wrong. Dead-lettering here would
+      # be data loss, so the batch must replay untouched.
+      fail_when = fn _evts -> pg_error("40P01", :deadlock_detected) end
+
+      opts = [
+        name: name,
+        version: 1,
+        source: {Scriba.Test.Source, events: events},
+        target: {__MODULE__.FailingTarget, agent: agent, fail_when: fail_when},
+        parallelism: 1,
+        handler: Scriba.Test.Projection,
+        batch_size: 5,
+        batch_timeout: 50,
+        retry: false
+      ]
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        start_supervised!({ProjSup, opts})
+        Process.sleep(300)
+      end)
+
+      # Nothing committed, nothing dead-lettered, cursor unmoved. The events
+      # are still owed, which is what replay depends on.
+      assert Scriba.Target.Test.commits(agent) == []
+      assert Scriba.Target.Test.dead_letters(agent) == []
+      assert Scriba.Position.stream_positions(name, 1) == %{}
+    end
+
+    @tag :integration
+    test "every event failing on integrity grounds halts instead of draining the stream" do
+      # SQLSTATE says a failure is deterministic. It does not say how many
+      # events share the defect. A NOT NULL added to a column the handler
+      # never populates makes EVERY insert fail 23502 — each individually
+      # dead-letterable. Without a blast-radius guard the fallback would
+      # dead-letter the whole stream, advance the cursor to head, and leave
+      # info/2 reporting a caught-up projection over an empty read model.
+      ref = make_ref()
+      handler_id = {:wipeout_halt, ref}
+
+      :telemetry.attach(
+        handler_id,
+        [:scriba, :projection, :halted],
+        &__MODULE__.forward_telemetry/4,
+        %{test_pid: self(), ref: ref}
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      agent = start_supervised!({Scriba.Target.Test, []})
+      events = Test.Events.list(3, streams: 1)
+      name = "pipeline-wipeout-#{:erlang.unique_integer([:positive])}"
+
+      fail_when = fn _evts -> pg_error("23502", :not_null_violation) end
+
+      opts = [
+        name: name,
+        version: 1,
+        source: {Scriba.Test.Source, events: events},
+        target: {__MODULE__.FailingTarget, agent: agent, fail_when: fail_when},
+        parallelism: 1,
+        handler: Scriba.Test.Projection,
+        batch_size: 5,
+        batch_timeout: 50,
+        retry: false
+      ]
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        start_supervised!({ProjSup, opts})
+        assert_receive {^ref, [:scriba, :projection, :halted], _m, _metadata}, 2_000
+      end)
+
+      # Nothing drained: no dead letters, no cursor movement, no silent
+      # "caught up over an empty read model".
+      assert Scriba.Target.Test.dead_letters(agent) == []
+      assert Scriba.Position.stream_positions(name, 1) == %{}
+    end
+
+    @tag :integration
+    test "a structural failure halts loudly rather than looping or discarding" do
+      ref = make_ref()
+      handler_id = {:fallback_halt, ref}
+
+      :telemetry.attach(
+        handler_id,
+        [:scriba, :projection, :halted],
+        &__MODULE__.forward_telemetry/4,
+        %{test_pid: self(), ref: ref}
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      agent = start_supervised!({Scriba.Target.Test, []})
+      events = Test.Events.list(3, streams: 1)
+      name = "pipeline-fallback-structural-#{:erlang.unique_integer([:positive])}"
+
+      # Handler deployed ahead of its migration. Fails on every event forever;
+      # dead-lettering would destroy the batch over a fixable mistake.
+      fail_when = fn _evts -> pg_error("42703", :undefined_column) end
+
+      opts = [
+        name: name,
+        version: 1,
+        source: {Scriba.Test.Source, events: events},
+        target: {__MODULE__.FailingTarget, agent: agent, fail_when: fail_when},
+        parallelism: 1,
+        handler: Scriba.Test.Projection,
+        batch_size: 5,
+        batch_timeout: 50,
+        retry: false
+      ]
+
+      # Announced, not silent — the original sin was a stall nobody could see.
+      # Asserted on telemetry rather than log text: halt_batch/3 also logs, but
+      # it logs from a Broadway-internal batch processor, and CaptureLog filters
+      # by process ancestry. The telemetry event is the machine-readable half
+      # and the one an operator alerts on, so that is what is pinned here.
+      ExUnit.CaptureLog.capture_log(fn ->
+        start_supervised!({ProjSup, opts})
+
+        assert_receive {^ref, [:scriba, :projection, :halted], _m, metadata}, 2_000
+        assert metadata.failure == "42703 (undefined_column)"
+        assert metadata.projection == %{name: name, version: 1}
+      end)
+
+      # Nothing discarded: no dead letters, no cursor movement.
+      assert Scriba.Target.Test.dead_letters(agent) == []
+      assert Scriba.Position.stream_positions(name, 1) == %{}
+    end
   end
 
   describe "retry policy" do
@@ -750,6 +1071,85 @@ defmodule Scriba.Projection.PipelineTest do
   defmodule RaisingHandler do
     @moduledoc false
     def handle(_data, _meta), do: raise("boom")
+  end
+
+  defmodule MalformedReturnHandler do
+    @moduledoc false
+    # Not in StrictTarget's vocabulary — a plausible typo for {:test_record, _}.
+    def handle(_data, _meta), do: {:test_recrd, :ok}
+  end
+
+  defmodule StaticMultiKeyHandler do
+    @moduledoc false
+    # Every event returns a Multi naming its operation the same way — the
+    # commanded_ecto_projections habit, safe under one-transaction-per-event
+    # and a collision once Scriba merges a batch.
+    def handle(_data, _meta) do
+      {:multi, Ecto.Multi.run(Ecto.Multi.new(), :example_projection, fn _r, _c -> {:ok, 1} end)}
+    end
+  end
+
+  defmodule FailingTarget do
+    @moduledoc """
+    Wraps `Scriba.Target.Test` and fails commits according to an injected rule,
+    so the per-event fallback can be exercised without Postgres.
+
+    `:fail_when` is a 1-arity function over the batch's events returning
+    `nil` (commit) or a reason (fail with it). Because the fallback re-invokes
+    `apply_batch/6` with a single event, the same function decides both the
+    batch attempt and each per-event attempt — which is exactly the
+    distinction under test.
+    """
+    @behaviour Scriba.Target
+
+    @impl Scriba.Target
+    def init(opts) do
+      {:ok, agent_state} = Scriba.Target.Test.init(opts)
+      {:ok, Map.put(agent_state, :fail_when, Keyword.fetch!(opts, :fail_when))}
+    end
+
+    @impl Scriba.Target
+    def apply_batch(events, results, projection, advances, dead_letters, state) do
+      case state.fail_when.(events) do
+        nil ->
+          Scriba.Target.Test.apply_batch(
+            events,
+            results,
+            projection,
+            advances,
+            dead_letters,
+            state
+          )
+
+        reason ->
+          {:error, reason, state}
+      end
+    end
+  end
+
+  defmodule StrictTarget do
+    @moduledoc """
+    Scriba.Target.Test's storage with a declared result vocabulary.
+
+    Scriba.Target.Test deliberately exports no `valid_result?/1`, so it accepts
+    any non-`:skip` result — which is what a test double wants, but means it
+    cannot exercise the Pipeline's invalid-return path. This target has the
+    same storage and a fixed vocabulary, standing in for Scriba.Target.Ecto
+    (whose own path needs Postgres).
+    """
+    @behaviour Scriba.Target
+
+    @impl Scriba.Target
+    defdelegate init(opts), to: Scriba.Target.Test
+
+    @impl Scriba.Target
+    defdelegate apply_batch(events, results, projection, advances, dead_letters, state),
+      to: Scriba.Target.Test
+
+    @impl Scriba.Target
+    def valid_result?(:skip), do: true
+    def valid_result?({:test_record, _}), do: true
+    def valid_result?(_other), do: false
   end
 
   defmodule SelectiveErrorHandler do

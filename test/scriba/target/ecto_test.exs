@@ -71,6 +71,41 @@ defmodule Scriba.Target.EctoTest do
       assert :merge in ks
     end
 
+    # Regression guard for the batch-vs-per-event Multi keying.
+    #
+    # commanded_ecto_projections ran one transaction per event, so projectors
+    # conventionally used a static Multi key (`:example_projection`). Scriba
+    # merges a whole batch into ONE Multi, so any static key collides the
+    # moment two events land in the same batch. Scriba's own steps avoid this
+    # by keying on event id — this test locks that in.
+    #
+    # It only fires when a batch holds two events of the same type hitting the
+    # same projection, which a one-event-per-test suite never produces. That
+    # is exactly why it is written down: dormant in CI, lethal under replay
+    # load, where batches are full rather than singletons.
+    test "two same-type events in one batch assemble with distinct keys" do
+      events = [
+        event("e1", 1, "stream-a"),
+        event("e2", 2, "stream-a")
+      ]
+
+      results = [
+        {:insert, %ReadModel{event_id: "e1", stream_id: "stream-a", position: 1}},
+        {:insert, %ReadModel{event_id: "e2", stream_id: "stream-a", position: 2}}
+      ]
+
+      multi = EctoTarget.build_multi(events, results, projection(), advances_for(events), [])
+      ks = keys(multi)
+
+      # Assembles at all — Ecto raises on duplicate operation names.
+      assert length(ks) == length(Enum.uniq(ks))
+
+      # Both events present under their own key, one shared cursor advance.
+      assert {:scriba_event, "e1"} in ks
+      assert {:scriba_event, "e2"} in ks
+      assert Enum.count(ks, &match?({:scriba_position, "stream-a"}, &1)) == 1
+    end
+
     test "mixed batch — insert + skip + delete on same stream" do
       events = [
         event("e1", 1, "stream-a"),
@@ -90,6 +125,33 @@ defmodule Scriba.Target.EctoTest do
       assert {:scriba_event, "e1"} in ks
       refute {:scriba_event, "e2"} in ks
       assert {:scriba_event, "e3"} in ks
+      assert {:scriba_position, "stream-a"} in ks
+    end
+  end
+
+  describe "build_multi/5 — {:multi, _} across a multi-event batch" do
+    defp multi_result(key) do
+      {:multi, Ecto.Multi.run(Ecto.Multi.new(), key, fn _repo, _changes -> {:ok, key} end)}
+    end
+
+    # Each `{:multi, _}` is merged independently, so a batch of N such events
+    # produces N merge steps against one Multi. That is the structural reason
+    # a Multi key reused across two events in the same batch collides at
+    # transaction time (Ecto raises on duplicate operation names), where under
+    # commanded_ecto_projections' one-transaction-per-event model it could not.
+    #
+    # Ecto resolves merges lazily, so the collision itself surfaces only inside
+    # Repo.transaction/1 — asserted end-to-end in the real-Postgres suite. What
+    # is Scriba's to guarantee, and what is checked here, is that the batch
+    # carries one independent merge per event rather than flattening them.
+    test "each event's Multi is merged independently" do
+      events = [event("e1", 1, "stream-a"), event("e2", 2, "stream-a")]
+      results = [multi_result({:my_op, "e1"}), multi_result({:my_op, "e2"})]
+
+      multi = EctoTarget.build_multi(events, results, projection(), advances_for(events), [])
+      ks = keys(multi)
+
+      assert Enum.count(ks, &(&1 == :merge)) == 2
       assert {:scriba_position, "stream-a"} in ks
     end
   end
@@ -196,6 +258,34 @@ defmodule Scriba.Target.EctoTest do
       position_min_idx = position_keys |> Enum.map(&Enum.find_index(ks, fn k -> k == &1 end)) |> Enum.min()
 
       assert position_min_idx > handler_max_idx
+    end
+  end
+
+  describe "valid_result?/1" do
+    # Guards the crash-loop path: a result this rejects is dead-lettered by the
+    # Pipeline before it can reach build_multi/5, where an unmatched shape
+    # raises during Multi assembly — outside apply_batch/6's
+    # `case repo.transaction(...)` — failing the whole batch on every
+    # redelivery. Must stay in lockstep with apply_handler_result/3's clauses.
+    test "accepts exactly the success-shape half of §4.2" do
+      assert EctoTarget.valid_result?(:skip)
+      assert EctoTarget.valid_result?({:insert, %ReadModel{}})
+      assert EctoTarget.valid_result?({:update, ReadModel, [event_id: "e1"], set: [position: 1]})
+      assert EctoTarget.valid_result?({:delete, ReadModel, [event_id: "e1"]})
+      assert EctoTarget.valid_result?({:multi, Ecto.Multi.new()})
+    end
+
+    test "rejects near-misses and malformed shapes" do
+      # Typo'd tag.
+      refute EctoTarget.valid_result?({:updat, ReadModel, [id: 1], set: [x: 2]})
+      # :update without the [set: _] keyword.
+      refute EctoTarget.valid_result?({:update, ReadModel, [id: 1], [inc: [x: 2]]})
+      # {:multi, _} carrying something that is not an Ecto.Multi.
+      refute EctoTarget.valid_result?({:multi, %{}})
+      # Bare values a handler might return by accident.
+      refute EctoTarget.valid_result?(:ok)
+      refute EctoTarget.valid_result?(nil)
+      refute EctoTarget.valid_result?(%ReadModel{})
     end
   end
 

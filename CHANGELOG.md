@@ -112,6 +112,59 @@ filled before it stopped being actively maintained.
       re-fire).
     - `[:scriba, :projection, :cache_initialized]` — ETS preload
       from Postgres at Coordinator start.
+    - `[:scriba, :source, :batch, :failed]` — a batch failed to commit
+      and nothing in it was acknowledged. Measurements `%{count}`,
+      metadata `%{subscription, reason}`.
+    - `[:scriba, :projection, :halted]` — a structural commit failure
+      stopped the projection. Metadata `%{projection, reason, failure}`
+      where `failure` is the SQLSTATE label. **The event to page on.**
+- **Commit failures are classified by SQLSTATE, not guessed**
+  (`Scriba.Failure`). `:integrity` (classes 22/23, `Ecto.ConstraintError`,
+  invalid changesets) is deterministic and event-specific — the batch is
+  re-applied one transaction per event so the offender dead-letters with
+  `error_kind` `"commit:<SQLSTATE>"` and the rest commit. `:transient`
+  (classes 08/53, `40001`, `40P01`, `57014`, `DBConnection` errors)
+  replays. `:structural` (class 42 and anything unrecognised) halts the
+  projection and emits `[:scriba, :projection, :halted]`, because
+  replaying loops forever and dead-lettering would destroy a batch over a
+  fixable deploy-ordering mistake. In the per-event pass a stream stops at
+  its first unresolved event rather than skipping past it, preserving
+  per-stream ordering and preventing a cursor gap.
+- **Batch commit failures replay; they never partially acknowledge.**
+  When a target's transaction does not commit, nothing in the batch is
+  acknowledged — including the messages that succeeded, because event
+  store acks are prefix-acks and cannot express a gap. The source stops
+  its producer, which rewinds the subscription to its last durable
+  checkpoint; the batch is redelivered and source-side dedup filters
+  whatever did commit. See `Scriba.BatchCommitError`.
+- **Malformed handler returns dead-letter instead of wedging the
+  projection.** A return outside §4.2's six shapes is routed to
+  `scriba_dead_letters` with `error_kind` `"invalid_return"` and the
+  cursor advances. Targets declare their own vocabulary through the
+  optional `c:Scriba.Target.valid_result?/1` callback, so this does not
+  hard-code the Ecto target's shapes into the engine.
+- **Duplicate `Ecto.Multi` operation names within a batch are detected
+  before assembly.** Scriba merges a whole batch into one Multi, so two
+  events naming an operation identically would collide inside
+  `Repo.transaction/1` — deterministically, on every redelivery. The
+  first claim now wins and later claimants dead-letter individually with
+  `error_kind` `"multi_key_collision"`. Scriba's own step keys
+  (`{:scriba_event, _}`, `{:scriba_position, _}`,
+  `{:scriba_dead_letter, _}`) are reserved.
+- **Cursor monotonicity is enforced in the schema.** The
+  `scriba_positions` upsert is `GREATEST(existing, incoming)`, so a
+  cursor cannot move backwards regardless of what the Pipeline computes.
+- **Restart intensity is chosen, not defaulted.**
+  `Scriba.Projection.Supervisor` runs at 30 restarts per 60 seconds. A
+  commit failure now kills the producer on purpose, so the OTP default of
+  3-in-5 would exhaust during any real outage and propagate toward the
+  host application; 30-in-60 absorbs a multi-minute outage while still
+  bounding a genuine crash loop.
+- **Resubscribe tolerates the reap race.** After a producer dies to force
+  a replay, the event store may not yet have processed its `DOWN`, so
+  resubscribing can transiently see `:subscription_already_exists`. That
+  is now retried with backoff (~1.5s total) and, if it persists, reported
+  as a name conflict rather than as a migration problem.
 - **Dead-letter routing.** Handler `{:error, _}` returns and raised
   exceptions route to `scriba_dead_letters` after retry exhaustion,
   with the cursor advancing past the failed event (skip-and-continue
@@ -132,10 +185,10 @@ filled before it stopped being actively maintained.
   demand drains on resume. Replaces the earlier
   `terminate_child/restart_child` implementation that was
   misleadingly named.
-- **`Scriba.Telemetry.Handler`** — placeholder GenServer slot in the
-  supervision tree. v0.1 has no default attaches; users attach their
-  own in their app's `start/2`. The slot exists so v0.2's dashboard
-  work can land into a stable supervision shape.
+- Scriba attaches **no** telemetry handlers of its own. It emits events
+  and gets out of the way; users attach their own in their app's
+  `start/2`. Default handlers, if any, are a v0.2 concern and will
+  arrive with the behaviour that justifies them.
 
 #### Migrations
 
@@ -153,6 +206,19 @@ filled before it stopped being actively maintained.
 
 #### Documentation
 
+- [`MIGRATION.md`](MIGRATION.md) — migrating from
+  `commanded_ecto_projections`. `project/2,3` → `handle/2`, the
+  `Ecto.Multi` differences (one transaction per *batch*, not per event),
+  the `meta` map mapping, callbacks with no equivalent
+  (`after_update/3`, `schema_prefix/1`, `consistency: :strong`), and
+  cursor carry-over: both libraries track Commanded's global
+  `event_number`, so `last_seen_event_number` passed as `:start_from`
+  cuts over in place with no read-model rebuild. `:start_from`
+  exclusivity verified against `commanded_eventstore_adapter` +
+  `eventstore`.
+- Legacy `use Scriba.Projection` options raise with targeted guidance
+  rather than a generic unknown-option error — `:consistency` most of
+  all, since it is the only migration gap that is invisible at runtime.
 - [`SCRIBA_ARCHITECTURE.md`](SCRIBA_ARCHITECTURE.md) — the
   architectural contract. Non-negotiable invariants, supervision tree,
   Coordinator state machine, position-tracking storage shape, error
@@ -166,7 +232,8 @@ filled before it stopped being actively maintained.
 
 #### Example application
 
-- [`examples/bank/`](examples/bank) — self-contained Mix project
+- [`examples/bank/`](https://github.com/thatsme/scriba/tree/main/examples/bank)
+  — self-contained Mix project
   demonstrating the five-line API end-to-end. Real Commanded
   (`Commanded.EventStore.Adapters.InMemory` for fast iteration),
   real Ecto, real read model. Three accounts, fifty random

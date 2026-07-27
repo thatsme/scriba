@@ -3,6 +3,8 @@ defmodule Scriba.Projection.Pipeline do
 
   use Broadway
 
+  require Logger
+
   alias Broadway.Message
 
   # Default retry policy per architecture §9.1:
@@ -172,10 +174,13 @@ defmodule Scriba.Projection.Pipeline do
         # handle_batch/4's stream_advances filter (below) keeps the cursor
         # where it is rather than regressing it.
         #
-        # Skipped events are NOT wrapped in :telemetry.span — they didn't
-        # invoke the user handler, so there is no handler latency to emit.
-        # If dedup visibility becomes operationally interesting, add a
-        # separate [:scriba, :projection, :event, :skipped] event.
+        # Not wrapped in :telemetry.span — no handler ran, so there is no
+        # handler latency to report. A distinct :skipped event is emitted
+        # instead: skip is the only outcome that leaves no trace anywhere
+        # (no read-model row, no dead-letter row, no cursor anomaly), so
+        # without counting it nobody — including an operator in production —
+        # can close `N == rows + dead_letters + skipped`.
+        emit_skipped(ctx, event, :dedup)
         :skip
       else
         meta = %{
@@ -226,10 +231,35 @@ defmodule Scriba.Projection.Pipeline do
           end
         end
 
-        run_with_retries(handler_call, ctx.retry)
+        case run_with_retries(handler_call, ctx.retry) do
+          :skip ->
+            # The handler declined this event. Distinguished from :dedup by
+            # metadata, because they answer different questions: "this
+            # projection does not care about this event type" versus "this
+            # event was already applied and was redelivered".
+            emit_skipped(ctx, event, :handler)
+            :skip
+
+          result ->
+            result
+        end
       end
 
     Message.put_data(msg, %{event: event, handler_result: handler_result})
+  end
+
+  defp emit_skipped(ctx, event, reason) do
+    :telemetry.execute(
+      [:scriba, :projection, :event, :skipped],
+      %{system_time: System.system_time()},
+      %{
+        projection: ctx.projection,
+        reason: reason,
+        event_type: event.type,
+        stream_id: event.stream_id,
+        position: event.position
+      }
+    )
   end
 
   # Retry loop — invokes handler_call up to max_attempts times, sleeping
@@ -300,12 +330,24 @@ defmodule Scriba.Projection.Pipeline do
     # is when the handler returned {:error, _} OR the engine caught a
     # handler raise and tagged it {:exception, exception, stacktrace}. Those
     # go to dead-letter; the rest get their normal Multi step.
-    {good_messages, bad_messages} =
-      Enum.split_with(messages, fn msg -> success_shape?(msg.data.handler_result) end)
+    {bad_messages, candidate_messages} =
+      Enum.split_with(messages, fn msg ->
+        dead_letter?(msg.data.handler_result, ctx.target_module)
+      end)
+
+    # Second pass: {:multi, _} operation names must be unique across the whole
+    # batch, which is a property of the batch rather than of any one result, so
+    # dead_letter?/2 cannot see it.
+    {good_messages, collided_messages} = partition_multi_collisions(candidate_messages)
 
     good_events = Enum.map(good_messages, & &1.data.event)
     good_results = Enum.map(good_messages, & &1.data.handler_result)
-    dead_letters = Enum.map(bad_messages, fn msg -> {msg.data.event, msg.data.handler_result} end)
+
+    dead_letters =
+      Enum.map(bad_messages, fn msg -> {msg.data.event, msg.data.handler_result} end) ++
+        Enum.map(collided_messages, fn {msg, keys} ->
+          {msg.data.event, {:multi_key_collision, keys}}
+        end)
 
     # stream_advances includes events whose handler returned non-:skip —
     # both success-shape AND dead-lettered results. Per architecture §9.2:
@@ -351,6 +393,10 @@ defmodule Scriba.Projection.Pipeline do
           Scriba.Position.cache_put(ctx.projection.name, ctx.projection.version, sid, pos)
         end)
 
+        # A clean commit clears both the transient backoff escalation and the
+        # integrity-wipeout streak.
+        Scriba.Circuit.reset(ctx.projection.name, ctx.projection.version)
+
         # batch_size = events Broadway saw in this batch, including those
         # whose handler returned :skip and those that dead-lettered.
         # Skipped/failed events still consumed pipeline capacity, so the
@@ -382,26 +428,385 @@ defmodule Scriba.Projection.Pipeline do
         messages
 
       {:error, reason, _state} ->
-        Enum.map(messages, &Message.failed(&1, reason))
+        handle_commit_failure(reason, messages, good_messages, dead_letters, ctx, start_time)
     end
   end
 
-  # success_shape?/1 — false for handler returns that route to dead-letter:
-  # `{:error, _}` (explicit failure return per §4.2) and the engine-internal
-  # `{:exception, _, _}` tag produced by handle_message's try/rescue. Every
-  # other shape flows to the Target's normal apply_batch path. Garbage
-  # handler returns (not in §4.2's six shapes) are not dead-lettered — they
-  # surface as a loud failure in the Target (FunctionClauseError in the
-  # Ecto target). That's the right place for "user wrote a broken handler"
-  # diagnostics; dead-lettering would swallow it.
-  defp success_shape?({:error, _}), do: false
-  defp success_shape?({:exception, _, _}), do: false
-  defp success_shape?(_), do: true
+  # A batch did not commit. Which response terminates depends on WHY, and
+  # Scriba.Failure reads that from SQLSTATE rather than guessing.
+  #
+  # Transient failures replay the batch whole — cheap, and re-applying
+  # event-by-event against a database under pressure just multiplies the load
+  # that caused the failure.
+  #
+  # Integrity and structural failures are deterministic: replaying reproduces
+  # them exactly, forever. Those go to the per-event pass, which isolates the
+  # offending event so the rest of the batch can make progress.
+  defp handle_commit_failure(reason, messages, good_messages, dead_letters, ctx, start_time) do
+    case Scriba.Failure.classify(reason) do
+      :transient ->
+        # Carry an escalating delay to the producer so it waits before dying.
+        # Nothing else throttles this path: without it the producer crashes as
+        # fast as batches form and exhausts the supervisor's restart budget in
+        # seconds, no matter how large that budget is.
+        delay = Scriba.Circuit.record_transient(ctx.projection.name, ctx.projection.version)
+        Enum.map(messages, &Message.failed(&1, {:scriba_replay, reason, delay}))
+
+      _deterministic ->
+        fallback_per_event(reason, messages, good_messages, dead_letters, ctx, start_time)
+    end
+  end
+
+  # Re-applies the batch one transaction per event, in per-stream position
+  # order, so a single bad event can be dead-lettered instead of poisoning
+  # every event that shares its batch.
+  #
+  # Two rules make this safe, and both are load-bearing:
+  #
+  #   1. **A stream stops at its first unresolved event.** Not "cap the
+  #      cursor" — stop applying. If event 5 fails transiently and 6 commits,
+  #      the cursor cannot advance past 5, so replay redelivers 6 as well and
+  #      double-applies it. Stopping also preserves per-stream ordering, which
+  #      applying 6 before 5 would violate outright.
+  #
+  #   2. **If anything is left unresolved, nothing is acknowledged.** Acks are
+  #      prefix-acks, and batches interleave streams: acknowledging a resolved
+  #      event in stream A would implicitly acknowledge an earlier unresolved
+  #      event in stream B and lose it. So a partial pass still fails the whole
+  #      batch and replays — but the work it committed is durable, and
+  #      source-side dedup filters it on the way back.
+  #
+  # The win is not partial acknowledgement. It is that an integrity failure
+  # ends as a dead letter and forward progress, instead of an infinite loop.
+  defp fallback_per_event(batch_reason, messages, good_messages, dead_letters, ctx, start_time) do
+    units =
+      Enum.map(good_messages, fn msg -> {msg.data.event, {:apply, msg.data.handler_result}} end) ++
+        Enum.map(dead_letters, fn {event, error} -> {event, {:dead_letter, error}} end)
+
+    acc0 = %{resolved: [], unresolved: 0, halt: nil, attempted: 0, committed: 0, integrity: 0}
+
+    outcome =
+      units
+      |> Enum.group_by(fn {event, _unit} -> event.stream_id end)
+      |> Enum.reduce(acc0, fn {_sid, stream_units}, acc ->
+        stream_units
+        |> Enum.sort_by(fn {event, _unit} -> event.position end)
+        |> apply_stream_units(ctx, acc)
+      end)
+
+    cond do
+      outcome.halt != nil ->
+        halt_batch(outcome.halt, messages, ctx)
+
+      # Blast radius. SQLSTATE says a failure is deterministic; it cannot say
+      # how many events share the defect. Every attempted write failing on
+      # integrity grounds is not one poison row — it is a schema the handler
+      # no longer matches, and dead-lettering it event by event would drain
+      # the stream into scriba_dead_letters and report a caught-up projection
+      # over an empty read model.
+      wipeout?(outcome) and
+          Scriba.Circuit.record_wipeout(
+            ctx.projection.name,
+            ctx.projection.version,
+            outcome.attempted
+          ) == :halt ->
+        halt_batch({:integrity_wipeout, outcome.attempted}, messages, ctx)
+
+      outcome.unresolved > 0 ->
+        # Committed work stands; the batch replays and dedup filters it.
+        delay = Scriba.Circuit.record_transient(ctx.projection.name, ctx.projection.version)
+        Enum.map(messages, &Message.failed(&1, {:scriba_replay, batch_reason, delay}))
+
+      true ->
+        # Everything resolved — committed or dead-lettered. The poison event
+        # is out of the way and the projection moves on.
+        if outcome.committed > 0, do: Scriba.Circuit.reset(ctx.projection.name, ctx.projection.version)
+        emit_batch_stop(ctx, start_time, length(messages))
+        Enum.each(outcome.resolved, &emit_dead_letter(&1, ctx))
+        messages
+    end
+  end
+
+  defp wipeout?(%{attempted: attempted, committed: 0, integrity: integrity})
+       when attempted > 0 and attempted == integrity,
+       do: true
+
+  defp wipeout?(_outcome), do: false
+
+  defp apply_stream_units(_units, _ctx, %{halt: halt} = acc) when halt != nil, do: acc
+
+  defp apply_stream_units(units, ctx, acc) do
+    Enum.reduce_while(units, acc, fn {event, unit}, acc ->
+      attempted? = match?({:apply, result} when result != :skip, unit)
+      acc = if attempted?, do: %{acc | attempted: acc.attempted + 1}, else: acc
+
+      case apply_unit(event, unit, ctx) do
+        :skipped ->
+          {:cont, acc}
+
+        {:committed, _} ->
+          {:cont, %{acc | committed: acc.committed + 1}}
+
+        {:integrity_dead_letter, dead_letter} ->
+          {:cont,
+           %{
+             acc
+             | integrity: acc.integrity + 1,
+               resolved: acc.resolved ++ List.wrap(dead_letter)
+           }}
+
+        {:resolved, dead_letter} ->
+          {:cont, %{acc | resolved: acc.resolved ++ List.wrap(dead_letter)}}
+
+        :unresolved ->
+          # Stop this stream here — see rule 1 above. Remaining units on this
+          # stream stay unapplied and replay in order.
+          {:halt, %{acc | unresolved: acc.unresolved + 1}}
+
+        {:halt, reason} ->
+          {:halt, %{acc | halt: reason}}
+      end
+    end)
+  end
+
+  defp apply_unit(_event, {:apply, :skip}, _ctx), do: :skipped
+
+  defp apply_unit(event, {:apply, result}, ctx) do
+    case commit_one(ctx, [event], [result], event, []) do
+      {:ok, _state} ->
+        cache_put_one(ctx, event)
+        {:committed, nil}
+
+      {:error, reason, _state} ->
+        resolve_commit_failure(event, reason, ctx)
+    end
+  end
+
+  defp apply_unit(event, {:dead_letter, error}, ctx) do
+    # A first-pass dead letter. Its row rolled back with the batch, so it has
+    # to be written again here — otherwise every handler failure and multi-key
+    # collision in the batch vanishes silently, which is the same discard bug
+    # in a new place.
+    dead_letter_one(event, error, ctx)
+  end
+
+  defp resolve_commit_failure(event, reason, ctx) do
+    case Scriba.Failure.classify(reason) do
+      # Deterministic and specific to this event: record it and move on.
+      # Counted separately, because "all of them" means something different —
+      # see Scriba.Circuit.record_wipeout/3.
+      :integrity -> integrity_dead_letter(event, reason, ctx)
+      :transient -> :unresolved
+      :structural -> {:halt, reason}
+    end
+  end
+
+  defp integrity_dead_letter(event, reason, ctx) do
+    case dead_letter_one(event, {:commit_error, reason}, ctx) do
+      {:resolved, dead_letter} -> {:integrity_dead_letter, dead_letter}
+      other -> other
+    end
+  end
+
+  defp dead_letter_one(event, error, ctx) do
+    case commit_one(ctx, [], [], event, [{event, error}]) do
+      {:ok, _state} ->
+        cache_put_one(ctx, event)
+        {:resolved, {event, error}}
+
+      # Cannot even record the failure — the schema or connection is beyond
+      # what this pass can resolve.
+      {:error, reason, _state} ->
+        {:halt, reason}
+    end
+  end
+
+  defp commit_one(ctx, events, results, event, dead_letters) do
+    ctx.target_module.apply_batch(
+      events,
+      results,
+      ctx.projection,
+      %{event.stream_id => event.position},
+      dead_letters,
+      ctx.target_state
+    )
+  end
+
+  defp cache_put_one(ctx, event) do
+    Scriba.Position.cache_put(
+      ctx.projection.name,
+      ctx.projection.version,
+      event.stream_id,
+      event.position
+    )
+  end
+
+  # Structural failure: the schema or permissions do not match the code.
+  # Dead-lettering would destroy a projection's worth of events over a
+  # fixable deploy-ordering mistake; replaying loops forever. Halt — but
+  # announce it, because a silent stall is the failure this library had.
+  defp halt_batch(reason, messages, ctx) do
+    :telemetry.execute(
+      [:scriba, :projection, :halted],
+      %{system_time: System.system_time()},
+      %{projection: ctx.projection, reason: reason, failure: Scriba.Failure.label(reason)}
+    )
+
+    Logger.error("""
+    Scriba projection #{ctx.projection.name} v#{ctx.projection.version} halted.
+
+    A batch failed with a structural error, which neither replaying nor
+    dead-lettering can resolve: #{Scriba.Failure.label(reason)}
+
+    #{inspect(reason)}
+
+    This usually means handler code was deployed ahead of its migration, or the
+    projection lacks a privilege it needs. The projection is not acknowledging
+    events and will make no progress until it is fixed and restarted.
+    """)
+
+    Enum.map(messages, &Message.failed(&1, {:scriba_halt, reason}))
+  end
+
+  defp emit_batch_stop(ctx, start_time, batch_size) do
+    :telemetry.execute(
+      [:scriba, :projection, :batch, :stop],
+      %{duration: System.monotonic_time() - start_time, batch_size: batch_size},
+      %{projection: ctx.projection}
+    )
+  end
+
+  defp emit_dead_letter({event, error}, ctx) do
+    :telemetry.execute(
+      [:scriba, :projection, :dead_letter],
+      %{system_time: System.system_time()},
+      %{
+        projection: ctx.projection,
+        position: event.position,
+        stream_id: event.stream_id,
+        event_type: event.type,
+        error_kind: error_kind(error)
+      }
+    )
+  end
+
+  # failure_shape?/1 — the two results that are unambiguously failures
+  # regardless of target: the explicit `{:error, _}` return from §4.2 and the
+  # engine-internal `{:exception, _, _}` tag produced by handle_message's
+  # try/rescue. These are what the retry layer retries.
+  defp failure_shape?({:error, _}), do: true
+  defp failure_shape?({:exception, _, _}), do: true
+  defp failure_shape?(_), do: false
+
+  defp success_shape?(result), do: not failure_shape?(result)
+
+  # dead_letter?/2 — what handle_batch/4 partitions on. Broader than
+  # failure_shape?/1: a result the target cannot apply is also a dead letter,
+  # even though it is neither an error nor an exception.
+  #
+  # Asking the target rather than whitelisting §4.2 here is deliberate. The
+  # six shapes are Scriba.Target.Ecto's vocabulary, not the engine's —
+  # Scriba.Target.Test accepts any non-:skip result, and v0.4 targets will
+  # define their own. A whitelist in the Pipeline would foreclose that.
+  #
+  # Why this check exists at all: without it a malformed return reaches
+  # apply_batch/6 and raises during Multi assembly, *outside* that function's
+  # `case repo.transaction(...)`. Broadway fails the whole batch and the
+  # source correctly refuses to acknowledge it — but the cause is one
+  # deterministic bad return, so every redelivery reproduces it exactly. The
+  # projection crash-loops forever on a single event, with no dead letter and
+  # no progress. Rejecting it here makes it a per-event dead letter with the
+  # cursor advancing past it, which is what a user bug in one handler clause
+  # deserves.
+  defp dead_letter?(result, target_module) do
+    failure_shape?(result) or not target_accepts?(target_module, result)
+  end
+
+  # Ecto.Multi raises on duplicate operation names, and Scriba merges every
+  # event's {:multi, _} into ONE batch Multi — so two events naming an
+  # operation the same way collide. Under commanded_ecto_projections' one
+  # transaction per event that was impossible, and its docs used a static
+  # atom key, so migrated projectors are the likely source.
+  #
+  # Left undetected this is the worst remaining failure mode: merges resolve
+  # lazily, so the raise happens inside Repo.transaction/1, outside
+  # apply_batch/6's case. Broadway fails the batch, the source refuses to ack
+  # it (correctly), it is redelivered, and the same two events collide again
+  # — deterministically, forever, with no dead letter and no progress.
+  #
+  # Detected here instead, the first claim on a name wins and later claimants
+  # are dead-lettered individually. That keeps the batch moving and names the
+  # offending event and key, which a transaction-time raise cannot do (it
+  # knows the key, not which event produced it).
+  #
+  # Namespacing user keys was the alternative and was rejected: rewriting
+  # operation names would break any Ecto.Multi.run/3 callback that reads a
+  # prior step out of `changes` by its declared name.
+  defp partition_multi_collisions(messages) do
+    {kept, collided, _claimed} =
+      Enum.reduce(messages, {[], [], MapSet.new()}, fn msg, {kept, collided, claimed} ->
+        names = multi_op_names(msg.data.handler_result)
+
+        case Enum.filter(names, &(MapSet.member?(claimed, &1) or reserved_key?(&1))) do
+          [] ->
+            {[msg | kept], collided, Enum.into(names, claimed)}
+
+          dupes ->
+            {kept, [{msg, dupes} | collided], claimed}
+        end
+      end)
+
+    {Enum.reverse(kept), Enum.reverse(collided)}
+  end
+
+  # Public API only — `to_list/1` rather than the struct's `:names` field, to
+  # avoid depending on Ecto internals.
+  #
+  # The `:merge` filter is required, not cosmetic: Ecto.Multi.merge/2 appends
+  # `{:merge, _}` straight to :operations without registering a name, so
+  # to_list/1 reports every merge under the pseudo-name `:merge`. Without the
+  # reject, two events that each merge internally would look like a collision.
+  # The cost is that an operation a user genuinely named `:merge` is not
+  # checked — it then behaves as it does today.
+  defp multi_op_names({:multi, %Ecto.Multi{} = user_multi}) do
+    user_multi
+    |> Ecto.Multi.to_list()
+    |> Enum.map(&elem(&1, 0))
+    |> Enum.reject(&(&1 == :merge))
+  end
+
+  defp multi_op_names(_other), do: []
+
+  # Scriba's own step keys. A user multi claiming one of these collides with
+  # the engine rather than with a peer event.
+  defp reserved_key?({:scriba_event, _}), do: true
+  defp reserved_key?({:scriba_position, _}), do: true
+  defp reserved_key?({:scriba_dead_letter, _}), do: true
+  defp reserved_key?(_other), do: false
+
+  defp target_accepts?(target_module, result) do
+    if function_exported?(target_module, :valid_result?, 1) do
+      target_module.valid_result?(result)
+    else
+      true
+    end
+  end
 
   # error_kind/1 — matches DeadLetter.normalize_error/1's kind output so
   # telemetry metadata and dead-letter rows agree on the kind label.
   defp error_kind({:error, _}), do: "error"
   defp error_kind({:exception, exception, _}) when is_exception(exception),
     do: exception.__struct__ |> Atom.to_string()
-  defp error_kind(_), do: "unknown"
+
+  defp error_kind({:multi_key_collision, _keys}), do: "multi_key_collision"
+
+  # An integrity violation isolated by the per-event fallback. Labelled with
+  # the SQLSTATE so the dead-letter table says "23505 (unique_violation)"
+  # rather than something an operator has to go and decode.
+  defp error_kind({:commit_error, reason}), do: "commit:" <> Scriba.Failure.label(reason)
+
+  # Reached when a handler returned something outside §4.2's six shapes.
+  # Named rather than lumped into "unknown" so the dead-letter table
+  # distinguishes "my handler failed" from "my handler is wrong".
+  defp error_kind(_), do: "invalid_return"
 end

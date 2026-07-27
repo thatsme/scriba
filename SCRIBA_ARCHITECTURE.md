@@ -207,8 +207,8 @@ both. The dashboard groups by name and shows versions as siblings.
 ```
 Scriba.Application
 └── Scriba.Supervisor (one_for_one)
-    ├── Scriba.Registry (Registry, keys: :unique)
-    ├── Scriba.Telemetry.Handler (default-handler slot; v0.1 no-op, v0.2 fills in)
+    ├── Scriba.Registry (Registry, keys: :unique — public addresses)
+    ├── Scriba.Internals.Registry (Registry, keys: :unique — Broadway internals)
     └── Scriba.Projections.Supervisor (DynamicSupervisor)
         └── per projection (added via Scriba.start_projection/1):
             └── Scriba.Projection.Supervisor (rest_for_one)

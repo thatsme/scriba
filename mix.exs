@@ -43,14 +43,23 @@ defmodule Scriba.MixProject do
 
   defp deps do
     [
+      # Required. Broadway is the pipeline runtime; Ecto/Postgrex back the
+      # position cursor and dead-letter tables (Scriba.Position,
+      # Scriba.DeadLetter, Scriba.Migrations), not just Scriba.Target.Ecto.
+      # Marking ecto_sql/postgrex `optional: true` makes Scriba fail to
+      # compile for any consumer that omits them — verified, not assumed.
       {:broadway, "~> 1.1"},
       {:ecto_sql, "~> 3.11"},
       {:postgrex, "~> 0.17"},
       {:telemetry, "~> 1.2"},
       {:jason, "~> 1.4"},
 
-      # dev/test only
+      # Optional: only needed by Scriba.Source.Commanded. Every reference to
+      # Commanded in lib/ is dynamic (apply/3 + atoms built from string
+      # literals), so Scriba compiles cleanly without it.
       {:commanded, "~> 1.4", optional: true},
+
+      # dev/test only
       {:stream_data, "~> 1.0", only: [:dev, :test]},
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
@@ -65,16 +74,34 @@ defmodule Scriba.MixProject do
   defp package do
     [
       licenses: ["Apache-2.0"],
-      links: %{"GitHub" => @source_url},
-      files: ~w(lib mix.exs README.md CHANGELOG.md LICENSE .formatter.exs)
+      links: %{
+        "GitHub" => @source_url,
+        "Changelog" => "#{@source_url}/blob/v#{@version}/CHANGELOG.md",
+        "Migration guide" => "#{@source_url}/blob/v#{@version}/MIGRATION.md"
+      },
+      files:
+        ~w(lib mix.exs README.md MIGRATION.md SCRIBA_ARCHITECTURE.md CHANGELOG.md LICENSE .formatter.exs)
     ]
   end
 
   defp docs do
     [
       main: "readme",
-      extras: ["README.md", "CHANGELOG.md"],
-      source_ref: "v#{@version}"
+      # Every .md referenced by a relative link in README.md must be listed
+      # here — ex_doc only rewrites relative links that resolve to a known
+      # extra. Anything not listed (e.g. examples/, which is excluded from
+      # the package tarball) must be linked with an absolute GitHub URL.
+      extras: [
+        "README.md",
+        "MIGRATION.md",
+        "SCRIBA_ARCHITECTURE.md",
+        "CHANGELOG.md"
+      ],
+      groups_for_extras: [
+        Guides: ["MIGRATION.md", "SCRIBA_ARCHITECTURE.md"]
+      ],
+      source_ref: "v#{@version}",
+      source_url: @source_url
     ]
   end
 

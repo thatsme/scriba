@@ -3,19 +3,24 @@ defmodule Scriba.DeadLetter do
   Helpers for the `scriba_dead_letters` table — failed events recorded for
   later inspection or replay.
 
-  An event arrives here in three ways (§9):
+  An event arrives here in two ways (§9), both after retry exhaustion:
 
     1. The handler returned `{:error, reason}`.
-    2. The handler raised — the engine catches and converts to `{:error, exception}`.
-    3. The target's atomic commit (e.g. `Repo.transaction/1`) failed.
+    2. The handler raised — the engine catches it and tags it
+       `{:exception, exception, stacktrace}`.
 
-  All three end up routed to a row in `scriba_dead_letters` with a serialized
+  Both end up routed to a row in `scriba_dead_letters` with a serialized
   copy of the event and an error description. Per §9.2, the projection's
   position **advances past the dead-lettered event** — the projection does not
   block. Replaying dead-letters is a v0.2 concern.
 
-  This module exposes raw helpers; routing logic (when to insert) lives in the
-  Pipeline once the Ecto target is wired in.
+  A failure of the target's atomic commit (e.g. `Repo.transaction/1`) is
+  **not** a dead-letter path: the whole batch is marked failed and its events
+  are redelivered. See `Scriba.Target`.
+
+  This module exposes raw helpers; the routing decision (when to insert) lives
+  in the Pipeline, which partitions failure-shape handler results out of the
+  batch and passes them to the target as `dead_letters`.
   """
 
   alias Ecto.Adapters.SQL
@@ -113,8 +118,43 @@ defmodule Scriba.DeadLetter do
     }
   end
 
+  # An integrity violation (constraint, invalid data) that the per-event
+  # fallback isolated to this event. The batch failed, the fallback re-applied
+  # it alone, and it failed alone — so the event's data is bad against the
+  # current schema and no amount of replaying will change that.
+  defp normalize_error({:commit_error, reason}) do
+    %{
+      kind: "commit:" <> Scriba.Failure.label(reason),
+      message: Exception.format_banner(:error, reason),
+      stacktrace: nil
+    }
+  end
+
+  defp normalize_error({:multi_key_collision, keys}) do
+    %{
+      kind: "multi_key_collision",
+      message: """
+      Ecto.Multi operation name(s) #{inspect(keys)} were already claimed by an \
+      earlier event in the same batch, or are reserved by Scriba.
+
+      Scriba merges every event's {:multi, _} into one batch transaction, so \
+      operation names must be unique across the batch — not just within one \
+      event's Multi. commanded_ecto_projections ran one transaction per event, \
+      where a static name was safe; that is the usual source of this.
+
+      Key the operation by something event-unique, e.g. {:my_op, meta.id}.\
+      """,
+      stacktrace: nil
+    }
+  end
+
+  # A handler return outside §4.2's six shapes. The Pipeline's target-backed
+  # validity check routes these here rather than letting them raise inside the
+  # Target, where the failure would be a batch-level crash-loop instead of a
+  # per-event dead letter. The inspected value is the diagnostic — it is what
+  # the handler actually returned.
   defp normalize_error(other) do
-    %{kind: "unknown", message: inspect(other), stacktrace: nil}
+    %{kind: "invalid_return", message: inspect(other), stacktrace: nil}
   end
 
   defp serialize_event_data(data) when is_map(data) and not is_struct(data), do: data

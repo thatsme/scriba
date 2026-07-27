@@ -158,6 +158,10 @@ defmodule Scriba do
   distinct streams, `:stream_positions` is `:truncated` rather than a
   giant map; `:safe_position` is always populated regardless.
 
+  `:safe_position` is the minimum across *cached* streams — an introspection
+  figure, not a replay point. See `Scriba.Position.safe_position/2` for why
+  it reads high and what it is not safe to build on.
+
   The `:status` field is one of `:initializing | :running | :paused |
   :draining | :stopped`. `:initializing` is the brief window between
   Coordinator start and Broadway producer registration; transitions to

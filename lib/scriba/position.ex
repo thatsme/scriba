@@ -284,12 +284,35 @@ defmodule Scriba.Position do
   end
 
   @doc """
-  Returns the **safe replay point**: the minimum position across all
-  streams in the cache for this projection. A new replica resuming from
-  this position is guaranteed not to miss any event in any stream.
+  Returns the minimum committed position across the streams this projection
+  currently has **in cache**. Introspection only — surfaced through
+  `Scriba.info/2` as a rough "how far behind is the laggard" number.
 
   Returns 0 when the projection has no cached streams (cache was just
   initialized, or the table doesn't exist).
+
+  ## This is not a replay point
+
+  An earlier version of this docstring called it a "safe replay point" and
+  claimed a replica resuming here could not miss an event. That is false in
+  two independent ways, both of which push the result **too high** — the
+  direction that skips events:
+
+    * **The cache is a capped subset.** `init_cache/3` preloads at most
+      #{@preload_cap} rows, ordered by `stream_id`. A minimum taken over a
+      subset is greater than or equal to the minimum over the whole set.
+
+    * **Untouched streams are invisible.** Only streams this projection has
+      actually written to have rows at all. A projection that handles a
+      narrow slice of event types — the shape the `:all` subscription plus a
+      `:skip` catch-all produces — has no row for most streams in the store,
+      and they contribute nothing to the minimum.
+
+  It is only equal to a true replay point when every stream in the event
+  store has a committed row and there are fewer than #{@preload_cap} of them.
+  Do not build resume-from-here on top of this. When v0.3 needs a real replay
+  point it should be an uncapped `MIN(position)` aggregate against Postgres,
+  which the `(projection_name, projection_version)` index already supports.
   """
   @spec safe_position(name(), version()) :: position()
   def safe_position(name, version) do
@@ -361,11 +384,30 @@ defmodule Scriba.Position do
 
   @doc """
   Appends a per-stream position upsert to an `Ecto.Multi`. Use this from
-  inside an `apply_batch/5` implementation building the atomic-commit Multi
-  alongside its handler operations.
+  inside an `c:Scriba.Target.apply_batch/6` implementation building the
+  atomic-commit Multi alongside its handler operations.
 
   The Multi step is keyed by `{:scriba_position, stream_id}` so a batch
   touching N streams produces N independent steps.
+
+  ## Monotonicity is enforced here, not upstream
+
+  The upsert is `GREATEST(existing, incoming)`, so a cursor can never move
+  backwards no matter what the caller passes.
+
+  The Pipeline also filters `:skip` results out of `stream_advances` so a
+  redelivered below-cursor batch does not regress the cursor. That filter is
+  still correct and still wanted — but it is one `Enum.reject/2` in another
+  module, and a cursor moving backwards is this library's worst failure mode:
+  it silently re-applies committed effects. The invariant belongs in the
+  storage layer where no upstream change can violate it.
+
+  Trade-off, deliberately taken: `GREATEST` also masks a genuine Pipeline bug
+  that computes a regressing advance, converting loud corruption into a silent
+  no-op. That is the right trade for a v0.1 whose stated first principle is
+  correctness over throughput. If detection is later wanted, add
+  `WHERE EXCLUDED.position > scriba_positions.position` and raise on zero rows
+  affected — but do not go back to an unconditional `SET`.
   """
   @spec multi(Ecto.Multi.t(), name(), version(), stream_id(), position()) ::
           Ecto.Multi.t()
@@ -380,7 +422,8 @@ defmodule Scriba.Position do
           (projection_name, projection_version, stream_id, position, updated_at)
         VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT (projection_name, projection_version, stream_id)
-        DO UPDATE SET position = EXCLUDED.position, updated_at = EXCLUDED.updated_at
+        DO UPDATE SET position = GREATEST(scriba_positions.position, EXCLUDED.position),
+                      updated_at = EXCLUDED.updated_at
         """,
         [name, version, stream_id, new_position, now]
       )

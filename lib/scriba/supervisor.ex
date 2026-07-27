@@ -15,6 +15,10 @@ defmodule Scriba.Supervisor do
     # per-projection.
     Scriba.Position.create_shared_table()
 
+    # Per-projection failure state that must outlive the source's producer,
+    # which dies deliberately on commit failure. See `Scriba.Circuit`.
+    Scriba.Circuit.create_table()
+
     children = [
       # Public addresses: coordinators, pipelines, per-projection supervisors.
       Scriba.Registry,
@@ -26,10 +30,6 @@ defmodule Scriba.Supervisor do
         {Registry, keys: :unique, name: Scriba.Internals.Registry},
         id: Scriba.Internals.Registry
       ),
-      # Placeholder slot for default telemetry handlers. v0.1: no attaches —
-      # users wire their own. The slot exists so v0.2 dashboard work can
-      # land into a stable supervision shape. See `Scriba.Telemetry.Handler`.
-      Scriba.Telemetry.Handler,
       Scriba.Projections.Supervisor
     ]
 
