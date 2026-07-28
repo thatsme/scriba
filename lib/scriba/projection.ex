@@ -64,6 +64,25 @@ defmodule Scriba.Projection do
   Raising is also valid and treated like `{:error, exception}` (with the
   exception struct and stacktrace preserved for the dead-letter row).
   Retries apply to both shapes unless `retry: false`.
+
+  ## No catch-all is generated — decided, not overlooked
+
+  `Commanded.Event.Handler` generates `def handle(_event, _metadata), do: :ok`,
+  so events a projector did not match were silently ignored. Scriba generates
+  nothing: an unmatched event raises `FunctionClauseError`, dead-letters, and
+  advances the cursor.
+
+  On an `:all` subscription that means a migrated projector without a final
+  `def handle(_event, _meta), do: :skip` will dead-letter every unrelated
+  event in the system. That is loud and recoverable — the dead-letter table is
+  the first thing `MIGRATION.md` tells you to watch, and `error_kind` names
+  the cause — where the alternative fails silently and looks like a working
+  projection over an incomplete read model.
+
+  Loud is the v0.1 choice. It is also the one that stays open: an opt-in
+  `on_unmatched: :skip` can be added in any 0.1.x without breaking anyone,
+  whereas changing the *default* to skip would silently convert recorded
+  failures into nothing.
   """
 
   @doc """

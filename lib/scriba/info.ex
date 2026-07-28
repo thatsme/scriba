@@ -15,6 +15,15 @@ defmodule Scriba.Info do
   :stopped`. `:source` and `:target` are the `{module, opts}` specs the
   projection was started with.
 
+  ## `:safe_position` is introspection, not a replay point
+
+  It is the minimum across the streams currently in the position cache — a
+  rough "how far behind is the laggard" figure. It reads **too high** in two
+  ways: the cache preloads at most 10,000 streams, and streams this
+  projection has never written to contribute nothing at all. Do not resume a
+  replica from it. A real replay point is v0.3 work and needs an uncapped
+  `MIN(position)` aggregate against Postgres.
+
   ## Truncation
 
   When a projection has more than 1000 distinct streams, `:stream_positions`

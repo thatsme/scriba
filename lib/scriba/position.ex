@@ -29,7 +29,7 @@ defmodule Scriba.Position do
   No `PositionStore` GenServer mediates the cache. Workers (the Pipeline)
   write directly to the shared table via `cache_put/4`. Readers
   (`Scriba.info/2`, telemetry) read directly via `cache_get/3` /
-  `stream_positions/2` / `safe_position/2`.
+  `stream_positions/2` and the internal safe-position helper.
 
   ## Lifecycle
 
@@ -283,37 +283,48 @@ defmodule Scriba.Position do
     end
   end
 
-  @doc """
-  Returns the minimum committed position across the streams this projection
-  currently has **in cache**. Introspection only — surfaced through
-  `Scriba.info/2` as a rough "how far behind is the laggard" number.
-
-  Returns 0 when the projection has no cached streams (cache was just
-  initialized, or the table doesn't exist).
-
-  ## This is not a replay point
-
-  An earlier version of this docstring called it a "safe replay point" and
-  claimed a replica resuming here could not miss an event. That is false in
-  two independent ways, both of which push the result **too high** — the
-  direction that skips events:
-
-    * **The cache is a capped subset.** `init_cache/3` preloads at most
-      #{@preload_cap} rows, ordered by `stream_id`. A minimum taken over a
-      subset is greater than or equal to the minimum over the whole set.
-
-    * **Untouched streams are invisible.** Only streams this projection has
-      actually written to have rows at all. A projection that handles a
-      narrow slice of event types — the shape the `:all` subscription plus a
-      `:skip` catch-all produces — has no row for most streams in the store,
-      and they contribute nothing to the minimum.
-
-  It is only equal to a true replay point when every stream in the event
-  store has a committed row and there are fewer than #{@preload_cap} of them.
-  Do not build resume-from-here on top of this. When v0.3 needs a real replay
-  point it should be an uncapped `MIN(position)` aggregate against Postgres,
-  which the `(projection_name, projection_version)` index already supports.
-  """
+  # Deliberately NOT part of the v0.1 public API — see the reasoning below.
+  #
+  # The direction of the asymmetry decides this: publishing it now and
+  # removing it later is a breaking change, whereas keeping it internal now
+  # and promoting it later is purely additive. Since the function cannot
+  # currently keep the promise its name makes, internal is the only choice
+  # that stays open.
+  #
+  # `Scriba.info/2` still surfaces the number, documented there as
+  # cache-derived introspection rather than a replay point.
+  # Returns the minimum committed position across the streams this projection
+  # currently has IN CACHE. Returns 0 when there are none.
+  #
+  # ## Why this is not public
+  #
+  # An earlier docstring called this a "safe replay point" and claimed a
+  # replica resuming here could not miss an event. That is false in two
+  # independent ways, both of which push the result TOO HIGH — the direction
+  # that skips events:
+  #
+  #   * The cache is a capped subset. init_cache/3 preloads at most
+  #     @preload_cap rows ordered by stream_id, and a minimum over a subset is
+  #     >= the minimum over the whole set.
+  #
+  #   * Untouched streams are invisible. Only streams this projection has
+  #     written to have rows at all. For the shape the moduledoc recommends —
+  #     an :all subscription plus a :skip catch-all — that is most of the
+  #     store.
+  #
+  # It equals a true replay point only when every stream in the event store
+  # has a committed row and there are fewer than @preload_cap of them.
+  #
+  # Publishing it at 0.1.0 would put it in HexDocs for someone to build the
+  # v0.3 replica-resume path on, and removing it afterwards would be a
+  # breaking change. Keeping it internal now and promoting it later is purely
+  # additive. Given it cannot currently keep the promise its name makes, only
+  # one of those directions stays open.
+  #
+  # When v0.3 needs a real replay point it should be an uncapped
+  # MIN(position) aggregate against Postgres, which the
+  # (projection_name, projection_version) index already supports.
+  @doc false
   @spec safe_position(name(), version()) :: position()
   def safe_position(name, version) do
     case stream_positions(name, version) do

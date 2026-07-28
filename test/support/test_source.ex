@@ -140,6 +140,20 @@ defmodule Scriba.Test.Source do
     {:noreply, [], %{state | acked_cursor: new_acked}}
   end
 
+  # Failed messages return to the head of the queue, in position order.
+  #
+  # This is the double's stand-in for what the real source does on a failed
+  # batch: refuse to acknowledge, let the producer die, and let the event
+  # store rewind the subscription so the batch is redelivered. Without it the
+  # events were simply dropped — the same defect this library was fixing in
+  # Scriba.Source.Commanded.ack/3, sitting in the instrument used to verify
+  # the fix. An instrument that silently loses events on failure cannot
+  # falsify "everything landed".
+  def handle_info({:requeue, events}, state) do
+    queue = Enum.sort_by(events ++ state.queue, & &1.position)
+    {:noreply, [], %{state | queue: queue}}
+  end
+
   def handle_info(:scriba_pause, state) do
     {:noreply, [], %{state | paused: true}}
   end
@@ -162,7 +176,7 @@ defmodule Scriba.Test.Source do
   ## Acknowledger callback
 
   @impl Broadway.Acknowledger
-  def ack(source_pid, successful, _failed) do
+  def ack(source_pid, successful, failed) do
     # Per-message data carries the event position; lift the max from the
     # successful set and ask the source to advance. Async send rather than
     # synchronous call so ack/3 (called from Broadway processor processes)
@@ -181,9 +195,22 @@ defmodule Scriba.Test.Source do
           |> Enum.max()
 
         send(source_pid, {:advance_acked_cursor, max_pos})
-        :ok
     end
+
+    # Failed messages go back on the queue rather than into the void. See
+    # handle_info({:requeue, _}, _) for why this matters.
+    case failed do
+      [] -> :ok
+      msgs -> send(source_pid, {:requeue, Enum.map(msgs, &extract_event/1)})
+    end
+
+    :ok
   end
+
+  # Messages reach ack/3 in two shapes: raw from the producer if they failed
+  # before handle_message/3 completed, or wrapped by the Pipeline afterwards.
+  defp extract_event(%Broadway.Message{data: %{event: %Scriba.Event{} = event}}), do: event
+  defp extract_event(%Broadway.Message{data: %Scriba.Event{} = event}), do: event
 
   ## Internals
 
