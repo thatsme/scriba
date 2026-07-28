@@ -129,6 +129,121 @@ defmodule Scriba.Source.CommandedTest do
     end
   end
 
+  describe "ack/3 — batch commit failure (no silent loss)" do
+    # Regression coverage for a correctness hole: ack/3 previously discarded
+    # its `failed` argument entirely. Pipeline.handle_batch/4 fails ALL
+    # messages in a batch when the target's transaction does not commit, so
+    # every one of them landed in that ignored list — no ack, no dead letter,
+    # no telemetry, no log. The subscription then stalled waiting on an ack
+    # that would never come, recoverable only by a restart nobody knew to do.
+    #
+    # Two properties are pinned here:
+    #   1. Nothing is acknowledged when any message failed — including the
+    #      successes, because Commanded acks are prefix-acks and cannot
+    #      express a gap.
+    #   2. The producer is signalled so it can die and force redelivery.
+
+    defp failed_message(ack_ref, reason) do
+      %Broadway.Message{
+        data: :irrelevant,
+        acknowledger: {ScribaCommanded, ack_ref, :recorded_event},
+        status: {:failed, reason}
+      }
+    end
+
+    defp ok_message(ack_ref) do
+      %Broadway.Message{
+        data: :irrelevant,
+        acknowledger: {ScribaCommanded, ack_ref, :recorded_event},
+        status: :ok
+      }
+    end
+
+    test "signals the producer instead of silently dropping failed messages" do
+      ack_ref = %{application: :app, subscription: :sub, producer: self()}
+
+      :ok = ScribaCommanded.ack(ack_ref, [], [failed_message(ack_ref, :db_down)])
+
+      # The fourth element is the delay the Pipeline computed via
+      # Scriba.Circuit. Zero here because this reason carries none — a bare
+      # reason is what a non-Pipeline failure path produces.
+      assert_receive {:scriba_batch_failed, 1, :db_down, 0}
+    end
+
+    test "does not acknowledge successes that share a batch with a failure" do
+      # If this regresses, ack_event/3 is called — which, being a prefix-ack,
+      # would acknowledge the FAILED event too and lose it permanently. The
+      # ack path would raise here because :app is not a real application.
+      ack_ref = %{application: :app, subscription: :sub, producer: self()}
+
+      messages = [ok_message(ack_ref), failed_message(ack_ref, :rollback)]
+
+      assert :ok = ScribaCommanded.ack(ack_ref, [hd(messages)], [List.last(messages)])
+      assert_receive {:scriba_batch_failed, 1, :rollback, 0}
+    end
+
+    test "a replay reason carries its backoff delay to the producer" do
+      # The producer cannot remember anything across its own deliberate death,
+      # so the delay travels in the failure reason. Without it the producer
+      # crashes as fast as batches form and burns the supervisor's restart
+      # budget in seconds — see Scriba.Circuit.
+      ack_ref = %{application: :app, subscription: :sub, producer: self()}
+      reason = {:scriba_replay, :deadlock, 5_000}
+
+      :ok = ScribaCommanded.ack(ack_ref, [], [failed_message(ack_ref, reason)])
+
+      assert_receive {:scriba_batch_failed, 1, ^reason, 5_000}
+    end
+
+    test "a halt reason does not signal the producer at all" do
+      # Structural failures must not restart-loop: no restart can change a
+      # missing column. The projection stays stopped and stays loud.
+      ack_ref = %{application: :app, subscription: :sub, producer: self()}
+
+      :ok =
+        ScribaCommanded.ack(ack_ref, [], [
+          failed_message(ack_ref, {:scriba_halt, :undefined_column})
+        ])
+
+      refute_receive {:scriba_batch_failed, _, _, _}, 100
+    end
+
+    test "emits telemetry so a stalled projection is observable" do
+      ack_ref = %{application: :app, subscription: :sub, producer: self()}
+      ref = make_ref()
+      handler_id = {:batch_failed, ref}
+
+      :telemetry.attach(
+        handler_id,
+        [:scriba, :source, :batch, :failed],
+        &__MODULE__.forward_telemetry/4,
+        %{test_pid: self(), ref: ref}
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      :ok =
+        ScribaCommanded.ack(ack_ref, [], [
+          failed_message(ack_ref, :db_down),
+          failed_message(ack_ref, :db_down)
+        ])
+
+      assert_receive {^ref, %{count: 2}, %{reason: :db_down}}
+    end
+
+    test "a message with no producer does not crash ack/3" do
+      # to_message/2 called outside a running producer yields producer: nil.
+      ack_ref = %{application: :app, subscription: :sub, producer: nil}
+
+      assert :ok = ScribaCommanded.ack(ack_ref, [], [failed_message(ack_ref, :whatever)])
+    end
+  end
+
+  @doc false
+  def forward_telemetry(_event, measurements, metadata, %{test_pid: pid, ref: ref}) do
+    send(pid, {ref, measurements, metadata})
+  end
+
   describe "subscription path via InMemory adapter (integration)" do
     @describetag :integration
 

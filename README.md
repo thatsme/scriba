@@ -29,6 +29,12 @@ end
 
 That's the API. The rest is operational scaffolding you get for free.
 
+**Already running `commanded_ecto_projections`?** Read
+[`MIGRATION.md`](MIGRATION.md). Short version: your existing cursor
+carries over — both libraries track Commanded's global `event_number`,
+so you hand your `last_seen_event_number` to Scriba as `:start_from` and
+cut over in place. No read-model rebuild, no maintenance window.
+
 ---
 
 ## Status
@@ -77,26 +83,52 @@ Scriba is an opinionated rewrite of that role with three principles:
    The handler return contract is six tagged tuples, not a DSL. Lag is
    a telemetry-consumer concern, not an engine feature.
 
+Migrating an existing projector is a mechanical rewrite —
+`project %Event{}, fn multi -> ... end` becomes `def handle(%Event{}, meta)`
+returning a tagged tuple. [`MIGRATION.md`](MIGRATION.md) covers the
+rewrite, the `Ecto.Multi` differences, the callbacks with no equivalent
+(`after_update/3`, `schema_prefix/1`, `consistency: :strong`), and cursor
+carry-over.
+
 ---
 
 ## Installation
 
-Add to your `mix.exs`. The `:scriba` Hex package becomes available
-**after the v0.1.0 Hex publication** — until then, depend on the repo
-directly with `{:scriba, github: "thatsme/scriba"}`:
-
 ```elixir
 defp deps do
   [
-    {:scriba, "~> 0.1.0"}, # available after Hex publication
-    # Optional: only needed if using Scriba.Source.Commanded
-    {:commanded, "~> 1.4"},
-    # Optional: only needed if using Scriba.Target.Ecto
-    {:ecto_sql, "~> 3.11"},
-    {:postgrex, "~> 0.17"}
+    {:scriba, "~> 0.1"},
+
+    # Optional — needed only if you use Scriba.Source.Commanded,
+    # which is the only source shipped in v0.1.
+    {:commanded, "~> 1.4"}
   ]
 end
 ```
+
+`:commanded` is Scriba's one optional dependency: nothing in the engine
+references it statically, so Scriba compiles without it, and
+`Scriba.Source.Commanded.start_link/1` raises with instructions if you
+configure the Commanded source without adding it.
+
+Everything else arrives transitively and is **not** optional —
+`:ecto_sql` and `:postgrex` back the position cursor and dead-letter
+tables (`Scriba.Position`, `Scriba.DeadLetter`, `Scriba.Migrations`), not
+merely `Scriba.Target.Ecto`; `:broadway` is the pipeline runtime;
+`:telemetry` and `:jason` are used throughout. You do not list them
+yourself, but they will be in your dependency tree.
+
+### Scriba is a Broadway topology
+
+Worth knowing before you read the failure-modes section below, which is
+written in Broadway's vocabulary: each projection is a
+[Broadway](https://hexdocs.pm/broadway) pipeline. The source is a Broadway
+producer, `:parallelism` sets the processor concurrency, `:batch_size` /
+`:batch_timeout` configure the batcher, and event acknowledgement runs
+through a Broadway acknowledger that Scriba implements against your event
+store. You never write Broadway code — but when this README says "the
+batch is marked failed", that is `Broadway.Message.failed/2`, and Broadway
+is where the retry-on-redelivery behaviour comes from.
 
 Add a migration to your repo for Scriba's tables:
 
@@ -127,7 +159,7 @@ children = [
 ]
 ```
 
-See [`examples/bank/lib/bank/projections/starter.ex`](examples/bank/lib/bank/projections/starter.ex)
+See [`examples/bank/lib/bank/projections/starter.ex`](https://github.com/thatsme/scriba/blob/main/examples/bank/lib/bank/projections/starter.ex)
 for the working pattern.
 
 ---
@@ -222,16 +254,19 @@ re-delivers below that cursor.
 
 ### Telemetry
 
-Nine events fire — from the Pipeline, the Coordinator, and position-cache
-init. The full surface table is in `Scriba.Telemetry`'s moduledoc and in
-architecture §6.3. Highlights:
+Twelve events fire — from the Pipeline, the Coordinator, position-cache init,
+and the source. The full surface table is in `Scriba.Telemetry`'s moduledoc
+and in architecture §6.3. Highlights:
 
 ```
 [:scriba, :projection, :event, :start | :stop | :exception]
+[:scriba, :projection, :event, :skipped]
 [:scriba, :projection, :batch, :stop]
 [:scriba, :projection, :dead_letter]
 [:scriba, :projection, :started | :paused | :resumed]
 [:scriba, :projection, :cache_initialized]
+[:scriba, :projection, :halted]
+[:scriba, :source, :batch, :failed]
 ```
 
 `:event :stop` fires once per successful handler invocation —
@@ -240,10 +275,21 @@ position-arithmetic across streams. `:dead_letter` fires once per
 dead-lettered event with `{name, version, position, stream_id,
 event_type, error_kind}` metadata for alerting.
 
-`Scriba.Telemetry.Handler` is a placeholder GenServer slot in
-Scriba's supervision tree — v0.1 has no default attaches. You write
-your own with `:telemetry.attach_many/4` in your application's
-`start/2`.
+`[:scriba, :source, :batch, :failed]` means a batch did not commit, nothing
+in it was acknowledged, and the source is restarting to replay from its last
+durable checkpoint. Isolated occurrences are normal under transient database
+trouble; a sustained stream of them means no progress.
+
+`[:scriba, :projection, :halted]` is the page. The projection hit a
+structural failure — a column that doesn't exist, a missing privilege — and
+stopped on purpose, because replaying it would loop forever and
+dead-lettering it would destroy a batch over a fixable deploy-ordering
+mistake. Nothing is lost; nothing proceeds either. The metadata carries the
+SQLSTATE.
+
+Scriba attaches no handlers of its own — it emits and gets out of the
+way, so it never competes with your observability stack. You write your
+own with `:telemetry.attach_many/4` in your application's `start/2`.
 
 ### Dead-letter routing
 
@@ -314,17 +360,55 @@ equal to the exception module name (e.g. `"Elixir.ArgumentError"`).
 
 ### Multi transaction fails
 
-A database-level failure of the `Ecto.Multi` commit (constraint
-violation, dropped connection) marks the whole batch as failed via
-Broadway. The source's acknowledger does not advance, so the events
-are re-delivered the next time the projection's Pipeline runs (which
-in production usually means: when the database is back).
+What happens depends on *why*, and Scriba reads that from the SQLSTATE
+rather than guessing (`Scriba.Failure`). Guessing from "did some events
+succeed?" is wrong in both directions: resource pressure fails
+non-uniformly, so a partial success looks deterministic when it isn't;
+and handler code deployed ahead of its migration fails uniformly, so it
+looks transient when it very much isn't.
+
+**Transient** (connection loss, deadlock, serialization failure, resource
+exhaustion, cancelled query). Nothing in the batch is acknowledged —
+including the events that succeeded, because event-store acks are
+prefix-acks and cannot express a gap. The source stops its producer, the
+subscription rewinds to its last durable checkpoint, and the batch is
+redelivered. Source-side dedup filters whatever did commit.
+
+**Integrity** (unique violation, NOT NULL, foreign key, check constraint,
+numeric overflow). Deterministic and specific to one event, so replaying
+it forever is pointless. The batch is re-applied one transaction per
+event: the offending event lands in `scriba_dead_letters` with
+`error_kind` `"commit:23505 (unique_violation)"` or similar, the rest
+commit, and the projection keeps moving.
+
+**Structural** (undefined column or table, insufficient privilege, and
+anything Scriba cannot classify). Neither response is safe —
+dead-lettering would destroy a batch over a fixable deploy-ordering
+mistake, replaying would loop forever — so the projection **halts** and
+says so via `[:scriba, :projection, :halted]` and a log line naming the
+SQLSTATE. Nothing is acknowledged and no cursor moves, so nothing is
+lost. It resumes when you fix the cause and restart.
 
 **Multi failures do not retry through the per-event retry policy.**
 The retry layer wraps the handler call, not the Multi commit. If
 your DB is intermittently failing, you want it to recover at the DB
 level — not for individual events to retry-then-dead-letter against
 a sick database.
+
+Per-stream ordering survives all three: in the per-event pass a stream
+stops at its first unresolved event rather than skipping past it.
+
+> **Verification status.** The replay path — the source refusing to
+> acknowledge, killing its producer, rewinding the subscription, backing off
+> and redelivering — is covered by **unit tests only**. It has never been
+> exercised against a real event store, and conservation across a database
+> outage (`events delivered == read-model rows + dead letters + skipped`) is
+> unverified. The reason is that Scriba's test double, `Scriba.Test.Source`,
+> discards failed messages instead of redelivering them, so the suite cannot
+> replay anything. The transient/integrity/structural classification above
+> *is* verified against real Postgres, including that a `docker stop` emits
+> `57P01` and is treated as transient.
+
 
 ### Source redelivers events the projection has already committed
 
@@ -345,7 +429,8 @@ the integration-test side in `test/scriba/projection/pipeline_test.exs`.
 
 ## Example app
 
-[`examples/bank/`](examples/bank) is a self-contained Mix project
+[`examples/bank/`](https://github.com/thatsme/scriba/tree/main/examples/bank)
+is a self-contained Mix project
 that demonstrates the full path: real Commanded
 (`Commanded.EventStore.Adapters.InMemory` for fast iteration), real
 Ecto, real read model. The projection module itself is ~50 lines
@@ -361,7 +446,10 @@ mix bank.demo    # opens 3 accounts, dispatches 50 random ops, prints balances
 The demo's wait-for-completion uses a telemetry counter on
 `:event :stop` — exactly the pattern you'd reach for in your own
 test code. See
-[`examples/bank/lib/mix/tasks/bank.demo.ex`](examples/bank/lib/mix/tasks/bank.demo.ex).
+[`examples/bank/lib/mix/tasks/bank.demo.ex`](https://github.com/thatsme/scriba/blob/main/examples/bank/lib/mix/tasks/bank.demo.ex).
+
+The example app is **not** included in the Hex package tarball — these
+links go to GitHub. Clone the repo to run it.
 
 ---
 
@@ -408,11 +496,15 @@ Migrations run in `test_helper.exs` against an existing connection.
 
 ## Documentation
 
+- [`MIGRATION.md`](MIGRATION.md) — migrating from
+  `commanded_ecto_projections`: `project/2` → `handle/2`, `Ecto.Multi`
+  differences, and how to carry your existing cursor across so you
+  cut over in place instead of rebuilding read models.
 - [`SCRIBA_ARCHITECTURE.md`](SCRIBA_ARCHITECTURE.md) — the
   architectural contract. Read this before opening a PR that
   changes engine behavior.
-- [`examples/bank/README.md`](examples/bank/README.md) — example
-  app walkthrough.
+- [`examples/bank/README.md`](https://github.com/thatsme/scriba/blob/main/examples/bank/README.md)
+  — example app walkthrough.
 - `Scriba.Telemetry` moduledoc — full v0.1 telemetry event surface.
 
 ---
@@ -433,7 +525,7 @@ targets land. Custom adapter authors should pin against a specific
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](https://github.com/thatsme/scriba/blob/main/LICENSE).
 
 ---
 

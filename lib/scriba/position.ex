@@ -29,7 +29,7 @@ defmodule Scriba.Position do
   No `PositionStore` GenServer mediates the cache. Workers (the Pipeline)
   write directly to the shared table via `cache_put/4`. Readers
   (`Scriba.info/2`, telemetry) read directly via `cache_get/3` /
-  `stream_positions/2` / `safe_position/2`.
+  `stream_positions/2` and the internal safe-position helper.
 
   ## Lifecycle
 
@@ -283,14 +283,48 @@ defmodule Scriba.Position do
     end
   end
 
-  @doc """
-  Returns the **safe replay point**: the minimum position across all
-  streams in the cache for this projection. A new replica resuming from
-  this position is guaranteed not to miss any event in any stream.
-
-  Returns 0 when the projection has no cached streams (cache was just
-  initialized, or the table doesn't exist).
-  """
+  # Deliberately NOT part of the v0.1 public API — see the reasoning below.
+  #
+  # The direction of the asymmetry decides this: publishing it now and
+  # removing it later is a breaking change, whereas keeping it internal now
+  # and promoting it later is purely additive. Since the function cannot
+  # currently keep the promise its name makes, internal is the only choice
+  # that stays open.
+  #
+  # `Scriba.info/2` still surfaces the number, documented there as
+  # cache-derived introspection rather than a replay point.
+  # Returns the minimum committed position across the streams this projection
+  # currently has IN CACHE. Returns 0 when there are none.
+  #
+  # ## Why this is not public
+  #
+  # An earlier docstring called this a "safe replay point" and claimed a
+  # replica resuming here could not miss an event. That is false in two
+  # independent ways, both of which push the result TOO HIGH — the direction
+  # that skips events:
+  #
+  #   * The cache is a capped subset. init_cache/3 preloads at most
+  #     @preload_cap rows ordered by stream_id, and a minimum over a subset is
+  #     >= the minimum over the whole set.
+  #
+  #   * Untouched streams are invisible. Only streams this projection has
+  #     written to have rows at all. For the shape the moduledoc recommends —
+  #     an :all subscription plus a :skip catch-all — that is most of the
+  #     store.
+  #
+  # It equals a true replay point only when every stream in the event store
+  # has a committed row and there are fewer than @preload_cap of them.
+  #
+  # Publishing it at 0.1.0 would put it in HexDocs for someone to build the
+  # v0.3 replica-resume path on, and removing it afterwards would be a
+  # breaking change. Keeping it internal now and promoting it later is purely
+  # additive. Given it cannot currently keep the promise its name makes, only
+  # one of those directions stays open.
+  #
+  # When v0.3 needs a real replay point it should be an uncapped
+  # MIN(position) aggregate against Postgres, which the
+  # (projection_name, projection_version) index already supports.
+  @doc false
   @spec safe_position(name(), version()) :: position()
   def safe_position(name, version) do
     case stream_positions(name, version) do
@@ -361,11 +395,30 @@ defmodule Scriba.Position do
 
   @doc """
   Appends a per-stream position upsert to an `Ecto.Multi`. Use this from
-  inside an `apply_batch/5` implementation building the atomic-commit Multi
-  alongside its handler operations.
+  inside an `c:Scriba.Target.apply_batch/6` implementation building the
+  atomic-commit Multi alongside its handler operations.
 
   The Multi step is keyed by `{:scriba_position, stream_id}` so a batch
   touching N streams produces N independent steps.
+
+  ## Monotonicity is enforced here, not upstream
+
+  The upsert is `GREATEST(existing, incoming)`, so a cursor can never move
+  backwards no matter what the caller passes.
+
+  The Pipeline also filters `:skip` results out of `stream_advances` so a
+  redelivered below-cursor batch does not regress the cursor. That filter is
+  still correct and still wanted — but it is one `Enum.reject/2` in another
+  module, and a cursor moving backwards is this library's worst failure mode:
+  it silently re-applies committed effects. The invariant belongs in the
+  storage layer where no upstream change can violate it.
+
+  Trade-off, deliberately taken: `GREATEST` also masks a genuine Pipeline bug
+  that computes a regressing advance, converting loud corruption into a silent
+  no-op. That is the right trade for a v0.1 whose stated first principle is
+  correctness over throughput. If detection is later wanted, add
+  `WHERE EXCLUDED.position > scriba_positions.position` and raise on zero rows
+  affected — but do not go back to an unconditional `SET`.
   """
   @spec multi(Ecto.Multi.t(), name(), version(), stream_id(), position()) ::
           Ecto.Multi.t()
@@ -380,7 +433,8 @@ defmodule Scriba.Position do
           (projection_name, projection_version, stream_id, position, updated_at)
         VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT (projection_name, projection_version, stream_id)
-        DO UPDATE SET position = EXCLUDED.position, updated_at = EXCLUDED.updated_at
+        DO UPDATE SET position = GREATEST(scriba_positions.position, EXCLUDED.position),
+                      updated_at = EXCLUDED.updated_at
         """,
         [name, version, stream_id, new_position, now]
       )

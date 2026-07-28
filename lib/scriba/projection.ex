@@ -64,6 +64,25 @@ defmodule Scriba.Projection do
   Raising is also valid and treated like `{:error, exception}` (with the
   exception struct and stacktrace preserved for the dead-letter row).
   Retries apply to both shapes unless `retry: false`.
+
+  ## No catch-all is generated — decided, not overlooked
+
+  `Commanded.Event.Handler` generates `def handle(_event, _metadata), do: :ok`,
+  so events a projector did not match were silently ignored. Scriba generates
+  nothing: an unmatched event raises `FunctionClauseError`, dead-letters, and
+  advances the cursor.
+
+  On an `:all` subscription that means a migrated projector without a final
+  `def handle(_event, _meta), do: :skip` will dead-letter every unrelated
+  event in the system. That is loud and recoverable — the dead-letter table is
+  the first thing `MIGRATION.md` tells you to watch, and `error_kind` names
+  the cause — where the alternative fails silently and looks like a working
+  projection over an incomplete read model.
+
+  Loud is the v0.1 choice. It is also the one that stays open: an opt-in
+  `on_unmatched: :skip` can be added in any 0.1.x without breaking anyone,
+  whereas changing the *default* to skip would silently convert recorded
+  failures into nothing.
   """
 
   @doc """
@@ -111,6 +130,13 @@ defmodule Scriba.Projection do
     :retry
   ]
 
+  # Options a migrator copies verbatim out of a commanded_ecto_projections
+  # projector. Each raises with what to do instead. `:consistency` is the
+  # one that matters most: it is the only option here whose absence is
+  # invisible at runtime — the projection works, `dispatch/2` just stops
+  # waiting for it, and the bug surfaces later as stale reads.
+  @legacy_opts [:consistency, :application, :repo, :schema_prefix]
+
   defp build_config(opts, caller_env) do
     unless Keyword.keyword?(opts) do
       raise ArgumentError, """
@@ -124,6 +150,16 @@ defmodule Scriba.Projection do
     # are resolved. Walk the opts tree and convert alias ASTs to atoms
     # via Macro.expand/2 with the caller's env.
     opts = Macro.prewalk(opts, &resolve_alias(&1, caller_env))
+
+    # Options carried over from commanded_ecto_projections get a targeted
+    # diagnostic BEFORE the generic unknown-key error. The generic message
+    # ("Unknown option(s) [:consistency]") is actively harmful here: a
+    # migrator reads it, deletes the line, and moves on — having silently
+    # dropped a guarantee they still believe they have. Checked first so the
+    # specific message wins.
+    Enum.each(opts, fn {key, value} ->
+      if key in @legacy_opts, do: raise(ArgumentError, legacy_opt_message(key, value))
+    end)
 
     # Surface unknown keys early — typos in option names would otherwise
     # silently fall through to "default applied" behavior.
@@ -169,6 +205,49 @@ defmodule Scriba.Projection do
       )
 
     {config, caller_env}
+  end
+
+  defp legacy_opt_message(:consistency, value) do
+    """
+    Scriba does not support consistency: #{inspect(value)}.
+
+    Scriba subscribes to the event store directly and does not register with
+    Commanded's subscriptions registry, so `dispatch(cmd, consistency: :strong)`
+    will NOT wait for this projection. Deleting this line does not restore the
+    guarantee — the guarantee is gone either way. This error exists so you find
+    that out now rather than from a stale read in production.
+
+    If a dispatch site depends on this projection being up to date before it
+    returns, that read-after-write path needs rethinking before you migrate it.
+    See MIGRATION.md, "Callbacks with no direct equivalent".
+    """
+  end
+
+  defp legacy_opt_message(:application, value) do
+    """
+    :application is not a Scriba.Projection option — it belongs to the source:
+
+        source: {Scriba.Source.Commanded, application: #{inspect(value)}}
+    """
+  end
+
+  defp legacy_opt_message(:repo, value) do
+    """
+    :repo is not a Scriba.Projection option — it belongs to the target:
+
+        target: {Scriba.Target.Ecto, repo: #{inspect(value)}}
+    """
+  end
+
+  defp legacy_opt_message(:schema_prefix, _value) do
+    """
+    Scriba does not support :schema_prefix in v0.1.
+
+    `scriba_positions` and `scriba_dead_letters` live in the repo's default
+    prefix. You can still pass `prefix:` on your own operations via a
+    `{:multi, %Ecto.Multi{}}` handler return, but prefix-per-tenant
+    projections are not supported end-to-end yet.
+    """
   end
 
   defp validate_name!(opts, caller_env) do

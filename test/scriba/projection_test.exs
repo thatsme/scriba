@@ -154,6 +154,79 @@ defmodule Scriba.ProjectionTest do
       end
     end
 
+    # Options carried over from a commanded_ecto_projections projector get a
+    # targeted error instead of the generic "Unknown option" one. :consistency
+    # matters most: it is the only migration gap that is invisible at runtime.
+    # The projection works, `dispatch/2` simply stops waiting for it, and the
+    # failure surfaces later as a stale read. A generic "unknown option" error
+    # invites the reader to delete the line and move on still believing they
+    # have the guarantee, so the message has to say the guarantee is gone.
+    test "consistency: :strong raises explaining the guarantee is gone" do
+      assert_raise ArgumentError, ~r/will NOT wait for this projection/, fn ->
+        Code.eval_quoted(
+          quote do
+            defmodule StrongConsistency do
+              use Scriba.Projection,
+                name: "strong-consistency",
+                source: {Scriba.Test.Source, events: []},
+                target: {Scriba.Target.Test, agent: :placeholder},
+                parallelism: 1,
+                consistency: :strong
+            end
+          end
+        )
+      end
+    end
+
+    test ":application and :repo point at the source/target tuples" do
+      assert_raise ArgumentError, ~r/belongs to the source/, fn ->
+        Code.eval_quoted(
+          quote do
+            defmodule LegacyApplication do
+              use Scriba.Projection,
+                name: "legacy-application",
+                source: {Scriba.Test.Source, events: []},
+                target: {Scriba.Target.Test, agent: :placeholder},
+                parallelism: 1,
+                application: MyApp.CommandedApp
+            end
+          end
+        )
+      end
+
+      assert_raise ArgumentError, ~r/belongs to the target/, fn ->
+        Code.eval_quoted(
+          quote do
+            defmodule LegacyRepo do
+              use Scriba.Projection,
+                name: "legacy-repo",
+                source: {Scriba.Test.Source, events: []},
+                target: {Scriba.Target.Test, agent: :placeholder},
+                parallelism: 1,
+                repo: MyApp.Repo
+            end
+          end
+        )
+      end
+    end
+
+    test ":schema_prefix raises rather than being silently ignored" do
+      assert_raise ArgumentError, ~r/does not support :schema_prefix/, fn ->
+        Code.eval_quoted(
+          quote do
+            defmodule LegacySchemaPrefix do
+              use Scriba.Projection,
+                name: "legacy-schema-prefix",
+                source: {Scriba.Test.Source, events: []},
+                target: {Scriba.Target.Test, agent: :placeholder},
+                parallelism: 1,
+                schema_prefix: "tenant_1"
+            end
+          end
+        )
+      end
+    end
+
     test ~s(:name matching "_v\\d+" pattern emits a compile-time warning) do
       # IO.warn at compile time goes to stderr. Capture and assert it
       # mentions both the pattern and the doc-aligned shape.
