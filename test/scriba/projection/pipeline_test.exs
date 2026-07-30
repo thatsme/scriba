@@ -811,6 +811,15 @@ defmodule Scriba.Projection.PipelineTest do
         assert metadata.projection == %{name: name, version: 1}
       end)
 
+      # Queryable, not just edge-triggered. Telemetry fires once, at the
+      # instant of the halt; an operator who was not subscribed then would
+      # otherwise see :running for a projection that will never move again.
+      eventually(fn ->
+        {:ok, info} = Scriba.info(name, 1)
+        assert info.status == :halted
+        assert %Postgrex.Error{postgres: %{pg_code: "42703"}} = info.halt_reason
+      end, 2_000)
+
       # Nothing discarded: no dead letters, no cursor movement.
       assert Scriba.Target.Test.dead_letters(agent) == []
       assert Scriba.Position.stream_positions(name, 1) == %{}

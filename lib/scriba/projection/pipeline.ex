@@ -6,6 +6,7 @@ defmodule Scriba.Projection.Pipeline do
   require Logger
 
   alias Broadway.Message
+  alias Scriba.Projection.Coordinator
 
   # Default retry policy per architecture §9.1:
   # 3 attempts, exponential backoff. The backoff list provides the sleeps
@@ -646,6 +647,12 @@ defmodule Scriba.Projection.Pipeline do
   # fixable deploy-ordering mistake; replaying loops forever. Halt — but
   # announce it, because a silent stall is the failure this library had.
   defp halt_batch(reason, messages, ctx) do
+    # Make it queryable, not just observable at the instant it happens.
+    # Telemetry and the log below are edge-triggered: an operator who was not
+    # subscribed when this fired would otherwise see `Scriba.info/2` report
+    # `:running` for a projection that will never move again.
+    Coordinator.halt(ctx.projection.name, ctx.projection.version, reason)
+
     :telemetry.execute(
       [:scriba, :projection, :halted],
       %{system_time: System.system_time()},
