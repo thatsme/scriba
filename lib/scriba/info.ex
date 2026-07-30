@@ -12,8 +12,21 @@ defmodule Scriba.Info do
   `{:error, :not_found}` rather than a partially-populated struct.
 
   `:status` is one of `:initializing | :running | :paused | :draining |
-  :stopped`. `:source` and `:target` are the `{module, opts}` specs the
-  projection was started with.
+  :halted | :stopped`. `:source` and `:target` are the `{module, opts}` specs
+  the projection was started with.
+
+  ## `:halted` is the one to alert on
+
+  A halted projection hit a commit failure that neither replaying nor
+  dead-lettering can resolve — a missing column, a missing privilege. It has
+  stopped acknowledging events and will not move again until the cause is
+  fixed and the projection restarted. Nothing is lost: no event is
+  acknowledged and no cursor advances.
+
+  `:halt_reason` carries the underlying error (typically a `Postgrex.Error`
+  whose SQLSTATE names the cause) and is `nil` in every other state. Polling
+  `status` is enough to detect it — you do not have to have been subscribed to
+  `[:scriba, :projection, :halted]` at the instant it fired.
 
   ## `:safe_position` is introspection, not a replay point
 
@@ -41,7 +54,8 @@ defmodule Scriba.Info do
     :source,
     :target,
     :safe_position,
-    :stream_positions
+    :stream_positions,
+    :halt_reason
   ]
 
   @type t :: %__MODULE__{
@@ -51,6 +65,7 @@ defmodule Scriba.Info do
           source: tuple() | nil,
           target: tuple() | nil,
           safe_position: non_neg_integer(),
-          stream_positions: %{String.t() => non_neg_integer()} | :truncated | nil
+          stream_positions: %{String.t() => non_neg_integer()} | :truncated | nil,
+          halt_reason: term() | nil
         }
 end

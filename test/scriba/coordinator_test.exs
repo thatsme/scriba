@@ -113,6 +113,65 @@ defmodule Scriba.Projection.CoordinatorTest do
     end
   end
 
+  describe "halt/3 — structural failure is a queryable state" do
+    # Halt used to be edge-triggered only: telemetry plus a log line at the
+    # instant it happened, and nothing afterwards. Scriba.info/2 reported
+    # :running for a projection that would never move again, so an operator
+    # who was not subscribed at that moment had a stopped projection and no
+    # way to see it. That is the same silent-stall shape the halt path exists
+    # to replace, one level up.
+
+    test "moves the projection to :halted and records the cause", %{name: name, version: v} do
+      eventually(fn -> assert Coordinator.state(name, v) == :running end)
+
+      reason = %Postgrex.Error{postgres: %{pg_code: "42703", code: :undefined_column}}
+      :ok = Coordinator.halt(name, v, reason)
+
+      eventually(fn -> assert Coordinator.state(name, v) == :halted end)
+
+      {:ok, info} = Scriba.info(name, v)
+      assert info.status == :halted
+      assert info.halt_reason == reason
+    end
+
+    test "keeps the FIRST reason when reported repeatedly", %{name: name, version: v} do
+      # A source that redelivers re-presents the same batch, so the Pipeline
+      # can report more than once. The original cause is the useful one.
+      eventually(fn -> assert Coordinator.state(name, v) == :running end)
+
+      :ok = Coordinator.halt(name, v, :first)
+      eventually(fn -> assert Coordinator.state(name, v) == :halted end)
+      :ok = Coordinator.halt(name, v, :second)
+
+      eventually(fn ->
+        {:ok, info} = Scriba.info(name, v)
+        assert info.halt_reason == :first
+      end)
+    end
+
+    test "pause and resume are rejected; stop is the way out", %{name: name, version: v} do
+      eventually(fn -> assert Coordinator.state(name, v) == :running end)
+      :ok = Coordinator.halt(name, v, :boom)
+      eventually(fn -> assert Coordinator.state(name, v) == :halted end)
+
+      assert {:error, {:invalid_state, :halted}} = Scriba.pause(name, v)
+      assert {:error, {:invalid_state, :halted}} = Scriba.resume(name, v)
+
+      # Halting stops acknowledging; it does not tear the Pipeline down. Stop
+      # is the operator's exit once the underlying cause is fixed.
+      assert :ok = Scriba.stop(name, v)
+      eventually(fn -> assert Coordinator.state(name, v) == :stopped end)
+    end
+
+    test "halt_reason is nil in every other state", %{name: name, version: v} do
+      eventually(fn -> assert Coordinator.state(name, v) == :running end)
+
+      {:ok, info} = Scriba.info(name, v)
+      assert info.status == :running
+      assert info.halt_reason == nil
+    end
+  end
+
   describe "pause/resume held-demand semantics" do
     @tag :integration
     test "pause halts new commits; resume drains remaining events", %{

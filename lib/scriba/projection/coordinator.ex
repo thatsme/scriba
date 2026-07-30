@@ -23,7 +23,11 @@ defmodule Scriba.Projection.Coordinator do
     # time," not "Pipeline restarted." Coordinator crash resets the flag
     # to false via init/1, which is the correct semantic (the projection
     # was effectively restarted from the operator's perspective).
-    started: false
+    started: false,
+    # Set when the Pipeline reports a structural commit failure. Kept in data
+    # rather than inferred, so `Scriba.info/2` can name the cause and not just
+    # the state.
+    halt_reason: nil
   ]
 
   # Used only for the one-shot pipeline-pid lookup re-arm (see :state_timeout
@@ -53,6 +57,21 @@ defmodule Scriba.Projection.Coordinator do
 
   def via_tuple(name, version) do
     {:via, Registry, {Scriba.Registry, {:coordinator, name, version}}}
+  end
+
+  @doc """
+  Reports a structural commit failure, moving the projection to `:halted`.
+
+  Called by the Pipeline. Asynchronous on purpose: the Pipeline is inside
+  `handle_batch/4` on a Broadway batch-processor process, and a synchronous
+  call would let a slow or wedged Coordinator block the batcher.
+
+  Halting is terminal. Recovery is fixing the schema or permission and
+  restarting the projection, which is a deliberate human step — see
+  `Scriba.Failure` for why neither replaying nor dead-lettering is safe here.
+  """
+  def halt(name, version, reason) do
+    :gen_statem.cast(via_tuple(name, version), {:halt, reason})
   end
 
   def pause(name, version), do: :gen_statem.call(via_tuple(name, version), :pause)
@@ -132,6 +151,7 @@ defmodule Scriba.Projection.Coordinator do
   def handle_event(:enter, _from, :running, _data), do: :keep_state_and_data
   def handle_event(:enter, _from, :paused, _data), do: :keep_state_and_data
   def handle_event(:enter, _from, :draining, _data), do: :keep_state_and_data
+  def handle_event(:enter, _from, :halted, _data), do: :keep_state_and_data
 
   def handle_event(:enter, _from, :stopped, data) do
     # Permanent stop — clean up this projection's rows in the shared cache.
@@ -150,6 +170,26 @@ defmodule Scriba.Projection.Coordinator do
 
   def handle_event(:state_timeout, :try_monitor, :initializing, data) do
     transition_from_initializing(data)
+  end
+
+  ## Halt — structural commit failure reported by the Pipeline
+  #
+  # Before this existed, a halted projection was loud exactly once (telemetry
+  # plus a log line at the instant it happened) and invisible from then on:
+  # `Scriba.info/2` read `:running` for a projection that would never move
+  # again. Anyone not subscribed to telemetry at that moment had a stopped
+  # projection and no way to see it — the same silent-stall shape the halt
+  # path exists to replace, one level up.
+
+  def handle_event(:cast, {:halt, _reason}, :halted, _data) do
+    # Already halted. The Pipeline can report repeatedly — a source that
+    # redelivers will re-present the same batch — and the first reason is the
+    # one worth keeping.
+    :keep_state_and_data
+  end
+
+  def handle_event(:cast, {:halt, reason}, _state, data) do
+    {:next_state, :halted, %{data | halt_reason: reason}}
   end
 
   ## Lifecycle commands — valid combos
@@ -211,6 +251,17 @@ defmodule Scriba.Projection.Coordinator do
      [{:next_event, :internal, {:complete_drain, from}}]}
   end
 
+  def handle_event({:call, from}, :stop, :halted, data) do
+    # A halted projection still has a live Pipeline — halting stops
+    # acknowledging, it does not tear anything down — so stopping it is the
+    # same shutdown the :paused path performs. This is the operator's exit
+    # from :halted once the underlying schema or permission is fixed.
+    new_data = demonitor_pipeline(data)
+    _ = Supervisor.terminate_child(data.supervisor_pid, Pipeline)
+
+    {:next_state, :stopped, %{new_data | pipeline_pid: nil}, [{:reply, from, :ok}]}
+  end
+
   def handle_event({:call, from}, :stop, :paused, data) do
     # Pause keeps the Pipeline alive — :paused →
     # :stopped must terminate it. Skip the :draining state; the source
@@ -258,7 +309,8 @@ defmodule Scriba.Projection.Coordinator do
       name: data.name,
       version: data.version,
       source: data.source_spec,
-      target: data.target_spec
+      target: data.target_spec,
+      halt_reason: data.halt_reason
     }
 
     {:keep_state_and_data, [{:reply, from, status}]}

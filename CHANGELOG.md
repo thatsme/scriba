@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A halted projection is now queryable, not just observable at the instant
+  it halts.** `Scriba.info/2` reported `:running` for a projection that had
+  hit a structural commit failure and would never move again — the halt was
+  announced once via `[:scriba, :projection, :halted]` and a log line, and was
+  invisible from then on. An operator who was not subscribed to telemetry at
+  that moment had a stopped projection and no way to see it, which is the same
+  silent-stall shape the halt path exists to replace.
+
+  The Pipeline now reports structural failures to the Coordinator, which
+  carries a terminal `:halted` state. `Scriba.info/2` exposes it as `:status`
+  along with a new `:halt_reason` field naming the cause (typically a
+  `Postgrex.Error` whose SQLSTATE identifies it). Polling `status` is enough
+  to detect a stopped projection.
+
+  `pause/1` and `resume/1` are rejected from `:halted`; `stop/1` is the way
+  out once the underlying schema or permission is fixed. Additive — no
+  existing field or return value changed.
+
 ## [0.1.0] - 2026-06-10
 
 Initial release. Projection engine for Elixir event-sourced systems

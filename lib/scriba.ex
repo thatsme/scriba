@@ -163,9 +163,14 @@ defmodule Scriba do
   it reads high and what it is not safe to build on.
 
   The `:status` field is one of `:initializing | :running | :paused |
-  :draining | :stopped`. `:initializing` is the brief window between
+  :draining | :halted | :stopped`. `:initializing` is the brief window between
   Coordinator start and Broadway producer registration; transitions to
   `:running` automatically.
+
+  `:halted` means a structural commit failure stopped the projection — it is
+  making no progress and needs a human. `:halt_reason` names the cause. This
+  is the field to poll if you want to detect a stopped projection without
+  subscribing to telemetry.
   """
   @spec info(module() | String.t()) :: {:ok, Info.t()} | {:error, :not_found}
   def info(module_or_name)
@@ -321,7 +326,8 @@ defmodule Scriba do
       source: Map.get(status, :source),
       target: Map.get(status, :target),
       safe_position: safe,
-      stream_positions: stream_positions
+      stream_positions: stream_positions,
+      halt_reason: Map.get(status, :halt_reason)
     }
   end
 end
