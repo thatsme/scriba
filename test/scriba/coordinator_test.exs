@@ -186,7 +186,7 @@ defmodule Scriba.Projection.CoordinatorTest do
       # after pause" via telemetry-absence is more deterministic than a
       # raw wall-clock sleep.
       ref = make_ref()
-      attach_telemetry(ref, [[:scriba, :projection, :batch, :stop]])
+      attach_telemetry(ref, [[:scriba, :projection, :batch, :stop]], %{name: name, version: v})
 
       # Pause. Some number K (≤ 10) may commit before our pause signal
       # lands at the source — Broadway has already prefetched into
@@ -224,10 +224,14 @@ defmodule Scriba.Projection.CoordinatorTest do
 
       ref = make_ref()
 
-      attach_telemetry(ref, [
-        [:scriba, :projection, :paused],
-        [:scriba, :projection, :resumed]
-      ])
+      attach_telemetry(
+        ref,
+        [
+          [:scriba, :projection, :paused],
+          [:scriba, :projection, :resumed]
+        ],
+        %{name: name, version: v}
+      )
 
       :ok = Coordinator.pause(name, v)
 
@@ -331,19 +335,41 @@ defmodule Scriba.Projection.CoordinatorTest do
 
   ## Test helpers
 
+  # :telemetry handlers are node-global, not scoped to the attaching process
+  # or test. Every projection alive on the node emits into this handler,
+  # including those of other async tests running concurrently. Forwarding
+  # unconditionally therefore delivered foreign events to the test's mailbox.
+  #
+  # That was not theoretical: settle_telemetry_quiet/2 waits for a window with
+  # no :batch :stop, and the async ordering property keeps its own projections
+  # committing for ~70s. The window never opened and the pause/resume test
+  # timed out at 60s — reproducible with just those two files, no database
+  # involved. The :paused/:resumed test had the same latent bug in a milder
+  # form: assert_receive would match another projection's event and then fail
+  # the metadata assertion against it.
+  #
+  # Matching `projection` in both the metadata and the handler config makes
+  # the filter the head's job — a non-matching event falls through to the
+  # catch-all clause below and is dropped.
   @doc false
-  def forward_telemetry(event, measurements, metadata, %{test_pid: pid, ref: ref}) do
+  def forward_telemetry(event, measurements, %{projection: projection} = metadata, %{
+        test_pid: pid,
+        ref: ref,
+        projection: projection
+      }) do
     send(pid, {ref, event, measurements, metadata})
   end
 
-  defp attach_telemetry(ref, event_names) do
+  def forward_telemetry(_event, _measurements, _metadata, _config), do: :ok
+
+  defp attach_telemetry(ref, event_names, projection) do
     handler_id = {:coordinator_test, ref}
 
     :telemetry.attach_many(
       handler_id,
       event_names,
       &__MODULE__.forward_telemetry/4,
-      %{test_pid: self(), ref: ref}
+      %{test_pid: self(), ref: ref, projection: projection}
     )
 
     on_exit(fn -> :telemetry.detach(handler_id) end)
