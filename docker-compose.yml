@@ -1,0 +1,41 @@
+# Development Postgres for Scriba.
+#
+# Backs two things that are otherwise skipped:
+#   * test/property_db/ — the real-Postgres property suite, gated behind
+#     SCRIBA_TEST_DB_* (see config/test.exs). Database: scriba_test.
+#   * examples/bank — the demo's read model. Database: bank_demo.
+#
+# Published on 5433, not 5432, so it never collides with a Postgres already
+# installed on the host. The .env.local files point at 5433 to match.
+#
+#   docker compose up -d          # start
+#   docker compose down           # stop, keep data
+#   docker compose down -v        # stop, wipe data (forces a clean re-init)
+
+name: scriba-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: scriba-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      # scriba_test is created by the entrypoint; bank_demo comes from
+      # docker/init-db.sql.
+      POSTGRES_DB: scriba_test
+    ports:
+      - "5433:5432"
+    volumes:
+      - scriba_pgdata:/var/lib/postgresql/data
+      # Only runs on first init of an empty data volume. Changing it later
+      # requires `docker compose down -v`.
+      - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d scriba_test"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  scriba_pgdata:
