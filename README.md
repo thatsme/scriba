@@ -474,7 +474,7 @@ live Postgres. Set all five of:
 | Variable | Example |
 |---|---|
 | `SCRIBA_TEST_DB_HOST` | `localhost` |
-| `SCRIBA_TEST_DB_PORT` | `5432` |
+| `SCRIBA_TEST_DB_PORT` | `5433` |
 | `SCRIBA_TEST_DB_NAME` | `scriba_test` |
 | `SCRIBA_TEST_DB_USER` | `postgres` |
 | `SCRIBA_TEST_DB_PASS` | `postgres` |
@@ -491,6 +491,8 @@ degrade.
 
 The database must already exist; `mix test` does not create it.
 Migrations run in `test_helper.exs` against an existing connection.
+`docker compose up -d` starts a Postgres 16 on port 5433 with
+`scriba_test` already created, matching the example values above.
 
 ---
 
