@@ -481,6 +481,46 @@ links go to GitHub. Clone the repo to run it.
 
 ---
 
+## Testing your projections
+
+`Scriba.Testing` runs a projection's `handle/2` clauses and commits the
+results through its configured target, without starting a pipeline — so a
+test asserts on read-model rows rather than on handler return values.
+
+```elixir
+test "a deposit increases the balance" do
+  Scriba.Testing.project(MyApp.Projections.Balances, [
+    %AccountOpened{account_id: "acc-1"},
+    %Deposited{account_id: "acc-1", amount_cents: 500}
+  ])
+
+  assert Repo.get(Balance, "acc-1").balance_cents == 500
+end
+```
+
+`project/3` returns a `Scriba.Testing.Result` with what committed, what the
+handler skipped, what it failed on, and what it returned that the target
+cannot apply. Events run in one transaction, in order, and per-stream cursors
+advance exactly as they would in production:
+
+```elixir
+Scriba.Testing.project(MyProjection, [
+  {%Deposited{}, stream_id: "acc-1"},
+  {%Deposited{}, stream_id: "acc-2"}
+])
+```
+
+`Scriba.Testing.handle/3` calls a single clause with no database at all, for
+asserting the shape a handler returns — including `:skip` for event types the
+projection ignores.
+
+It exercises the handler and the commit, not the pipeline around them: no
+retries, no dead-letter routing, no dedup, no telemetry. Handler failures come
+back to the caller instead of being routed, so a test can assert on them
+directly.
+
+---
+
 ## Running Scriba's own tests
 
 | Command | What runs | Requires |

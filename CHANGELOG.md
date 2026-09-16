@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`Scriba.Testing` — run a projection's handlers in a test without a
+  pipeline.** `project/3` applies events through the projection's configured
+  target and commits them, so a test asserts on read-model rows; `handle/3`
+  calls one clause with no database, for asserting the shape a handler
+  returns. Events run in one transaction, in order, with per-stream cursors
+  advancing as they do in production, and the result reports what committed,
+  skipped, failed, or came back in a shape the target cannot apply.
+
+  It deliberately stops at the handler and the commit: no retries, no
+  dead-letter routing, no dedup, no telemetry. Those decisions live in the
+  pipeline, and a second implementation of them here would be the copy that
+  drifts.
+
 ### Changed
 
 - The release gate (architecture §14) now requires the CHANGELOG entry to

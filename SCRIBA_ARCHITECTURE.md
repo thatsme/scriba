@@ -187,6 +187,11 @@ telemetry consumers.
 currently registered in `Scriba.Registry`, including those in
 `:stopped` state.
 
+`Scriba.Testing` is public but not part of the frozen surface above: it is
+test-time only, additive, and free to grow. It runs handlers and commits
+through the configured target without a pipeline, and deliberately does not
+reimplement the pipeline's retry, dead-letter or dedup decisions.
+
 There is no `rebuild`, `swap!` or `reset` function. Rebuilding is not a
 library operation in v0.1: a new `version` running side-by-side (§5) is
 the mechanism, and cutting over is the application's choice of which
@@ -774,6 +779,7 @@ scriba/
 │   │   ├── info.ex               # %Scriba.Info{} — what Scriba.info/2 returns
 │   │   ├── partitioner.ex        # consistent hash logic
 │   │   ├── telemetry.ex          # event-catalog moduledoc; no runtime code
+│   │   ├── testing.ex            # Scriba.Testing — user-facing test helpers
 │   │   ├── migrations.ex         # up/0, down/0 for users to call
 │   │   └── errors.ex             # Scriba.BatchCommitError
 └── test/
