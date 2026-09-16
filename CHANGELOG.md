@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Dead-letter inspection**: `Scriba.dead_letters/2` lists rows with
+  filters, paging and ordering; `Scriba.dead_letter_stats/2` summarises how
+  many, of what kind, over what span. `Scriba.DeadLetter.list/3`, `count/3`
+  and `stats/3` are the underlying API.
+
+  They read the table rather than a running process, and the module form
+  takes the repo from the projection's own config, so a halted or stopped
+  projection can be inspected — which is when anyone actually looks.
+
+  The `by_error_kind` distribution is the diagnosis: one kind on one stream
+  is a poison event, one kind across every stream is a schema problem that
+  dead-lettering is papering over.
+
+  No replay function. `:event_data` is stored serialized — `__struct__`
+  becomes a string — so a row records what failed rather than a value that
+  can be re-dispatched; replay has to read the event from the source by
+  position, and needs an ordering policy this does not yet have.
+
 - README documents running `broadway_dashboard` against a projection. It
   works as-is: a projection is a Broadway topology, and the dashboard both
   discovers it through `Broadway.all_running/0` and accepts Scriba's

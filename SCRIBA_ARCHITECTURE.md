@@ -659,6 +659,21 @@ unchanged. No "retry_exhausted" wrapper — `error_kind` reflects the
 actual failure cause. The retry layer is transparent to dead-letter
 routing (§9 case 1 and case 2 paths).
 
+### 9.2a Reading the table
+
+`Scriba.dead_letters/2` and `Scriba.dead_letter_stats/2` query
+`scriba_dead_letters` directly rather than asking a process, because dead
+letters outlive the projection that produced them and are most often read
+after it has halted or stopped.
+
+Replay is deliberately absent. `event_data` is serialized for storage —
+`DeadLetter.build_row/3` turns `__struct__` into a string — so a row is a
+record of what failed, not a value that can be re-dispatched. A replay would
+have to read the event from the source by position, which needs a Source
+callback that does not exist, and an ordering policy: re-applying event 5
+after its stream has committed 9 breaks the per-stream ordering guarantee
+(§3 rule 2) unless the projection is rebuilt instead.
+
 ### 9.2 The crucial choice: skip and continue
 
 When an event is dead-lettered, the position **advances past it**.

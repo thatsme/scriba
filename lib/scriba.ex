@@ -192,6 +192,56 @@ defmodule Scriba do
   end
 
   @doc """
+  Lists a projection's dead letters, newest first.
+
+      Scriba.dead_letters(MyApp.Projections.Orders, limit: 10)
+      Scriba.dead_letters(MyApp.Projections.Orders, stream_id: "order-42", order: :asc)
+
+  Takes a projection module, or a name and version with an explicit
+  `repo:`. The module form reads the repo from the projection's own target
+  config, so it works whether or not the projection is running — which is
+  the point: a halted or stopped projection is exactly when someone looks.
+
+  See `Scriba.DeadLetter.list/3` for the options and the shape of a row.
+  """
+  @spec dead_letters(module() | String.t(), keyword()) :: [map()]
+  def dead_letters(module_or_name, opts \\ [])
+
+  def dead_letters(module, opts) when is_atom(module) and module not in [nil, true, false] do
+    {projection, repo} = dead_letter_target!(module, opts)
+    Scriba.DeadLetter.list(repo, projection, opts)
+  end
+
+  def dead_letters(name, opts) when is_binary(name) do
+    {projection, repo} = dead_letter_target!(name, opts)
+    Scriba.DeadLetter.list(repo, projection, opts)
+  end
+
+  @doc """
+  How many dead letters, of what kind, over what span.
+
+      %{total: 143,
+        by_error_kind: %{"commit:23505 (unique_violation)" => 140},
+        oldest: ~U[...], newest: ~U[...]}
+
+  Accepts the same filters as `dead_letters/2`. The distribution is the
+  diagnosis: one kind on one stream is a poison event, one kind across every
+  stream is a schema problem that dead-lettering is papering over.
+  """
+  @spec dead_letter_stats(module() | String.t(), keyword()) :: map()
+  def dead_letter_stats(module_or_name, opts \\ [])
+
+  def dead_letter_stats(module, opts) when is_atom(module) and module not in [nil, true, false] do
+    {projection, repo} = dead_letter_target!(module, opts)
+    Scriba.DeadLetter.stats(repo, projection, opts)
+  end
+
+  def dead_letter_stats(name, opts) when is_binary(name) do
+    {projection, repo} = dead_letter_target!(name, opts)
+    Scriba.DeadLetter.stats(repo, projection, opts)
+  end
+
+  @doc """
   Pauses a running projection — the source stops yielding new events.
   In-flight events already in Pipeline processors or batchers continue
   through their commit lifecycle.
@@ -291,6 +341,51 @@ defmodule Scriba do
     do: Coordinator.stop(name, version)
 
   ## Internals
+
+  # A module knows its own repo; a name does not, so the caller supplies one.
+  # Reading config rather than asking the Coordinator is deliberate: dead
+  # letters outlive the process that produced them, and the projection is
+  # often stopped by the time anyone reads them.
+  defp dead_letter_target!(module, opts) when is_atom(module) do
+    config = load_config!(module)
+
+    projection = %{
+      name: Keyword.get(opts, :name, config.name),
+      version: Keyword.get(opts, :version, config.version)
+    }
+
+    repo = Keyword.get(opts, :repo) || Scriba.Position.resolve_repo([], config.target)
+
+    unless repo do
+      raise ArgumentError, """
+      Cannot read dead letters for #{inspect(module)}: no repo.
+
+      #{inspect(module)}'s target does not carry one, so pass it:
+
+          Scriba.dead_letters(#{inspect(module)}, repo: MyApp.Repo)
+      """
+    end
+
+    {projection, repo}
+  end
+
+  defp dead_letter_target!(name, opts) when is_binary(name) do
+    repo = Keyword.get(opts, :repo)
+
+    unless repo do
+      raise ArgumentError, """
+      Cannot read dead letters for #{inspect(name)}: no repo.
+
+      The name form does not know which repo holds them, so pass one:
+
+          Scriba.dead_letters(#{inspect(name)}, repo: MyApp.Repo)
+
+      Or pass the projection module, which knows its own.
+      """
+    end
+
+    {%{name: name, version: Keyword.get(opts, :version, 1)}, repo}
+  end
 
   defp load_config!(module) do
     unless Code.ensure_loaded?(module) do

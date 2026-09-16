@@ -545,6 +545,38 @@ of it. See `Scriba.Watermark` for why that direction is the safe one.
 
 ---
 
+## Reading the dead-letter table
+
+Dead letters outlive the projection that produced them, so these read from
+the table rather than from a running process — which is the point, since a
+halted or stopped projection is when you go looking.
+
+```elixir
+Scriba.dead_letter_stats(MyApp.Projections.Orders)
+#=> %{total: 143,
+#     by_error_kind: %{"commit:23505 (unique_violation)" => 140,
+#                      "Elixir.ArgumentError" => 3},
+#     oldest: ~U[2026-09-16 09:12:03Z], newest: ~U[2026-09-16 11:40:55Z]}
+
+Scriba.dead_letters(MyApp.Projections.Orders, limit: 10)
+Scriba.dead_letters(MyApp.Projections.Orders, stream_id: "order-42", order: :asc)
+```
+
+The distribution is the diagnosis. One kind on one stream is a poison event.
+One kind spread across every stream is a schema or handler problem that
+dead-lettering is papering over — and if a whole batch fails that way at
+once, `Scriba.Circuit` halts the projection rather than draining the stream
+into the table.
+
+A row carries `:position`, `:stream_id`, `:event_type`, `:error_kind`,
+`:error_message`, `:occurred_at` and the serialized `:event_data`. There is
+no replay function: `:event_data` records what failed rather than a value
+that can be re-dispatched, so replaying means reading the event from the
+source by `:position`. Filters, paging and ordering are in
+`Scriba.DeadLetter.list/3`.
+
+---
+
 ## Testing your projections
 
 `Scriba.Testing` runs a projection's `handle/2` clauses and commits the

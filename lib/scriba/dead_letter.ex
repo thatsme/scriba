@@ -37,12 +37,134 @@ defmodule Scriba.DeadLetter do
   alias Ecto.Adapters.SQL
   alias Scriba.Event
 
+  import Ecto.Query
+
   @type projection :: %{name: String.t(), version: pos_integer()}
   @type error :: %{
           kind: String.t(),
           message: String.t() | nil,
           stacktrace: String.t() | nil
         }
+
+  @doc """
+  Lists dead letters for a projection, newest first.
+
+  Returns maps with `:id`, `:position`, `:stream_id`, `:event_type`,
+  `:error_kind`, `:error_message`, `:occurred_at` and `:event_data`.
+
+  ## Options
+
+    * `:limit` (default `50`) — how many rows.
+    * `:offset` (default `0`) — for paging.
+    * `:stream_id` — only this stream.
+    * `:error_kind` — only this kind, e.g. `"commit:23505 (unique_violation)"`
+      or `"Elixir.ArgumentError"`. Matches exactly.
+    * `:since` — only rows at or after this `DateTime`.
+    * `:order` — `:desc` (default, newest first) or `:asc` (oldest first,
+      which is the order you would replay in).
+
+  `:event_data` comes back as the map that was stored, not the original
+  struct: `build_row/3` serializes `__struct__` to a string, so a row
+  records what failed rather than a value you can re-dispatch. Replay reads
+  the event from the source by `:position`.
+  """
+  @spec list(module(), projection(), keyword()) :: [map()]
+  def list(repo, %{name: name, version: version}, opts \\ []) do
+    order = if Keyword.get(opts, :order, :desc) == :asc, do: :asc, else: :desc
+
+    base(name, version, opts)
+    |> order_by([d], [{^order, d.occurred_at}, {^order, d.id}])
+    |> limit(^Keyword.get(opts, :limit, 50))
+    |> offset(^Keyword.get(opts, :offset, 0))
+    |> select([d], %{
+      id: d.id,
+      position: d.position,
+      stream_id: d.stream_id,
+      event_type: d.event_type,
+      error_kind: d.error_kind,
+      error_message: d.error_message,
+      occurred_at: d.occurred_at,
+      event_data: d.event_data
+    })
+    |> repo.all()
+    |> Enum.map(fn row -> %{row | occurred_at: as_utc(row.occurred_at)} end)
+  end
+
+  @doc """
+  Counts dead letters for a projection. Takes the same filters as `list/3`.
+  """
+  @spec count(module(), projection(), keyword()) :: non_neg_integer()
+  def count(repo, %{name: name, version: version}, opts \\ []) do
+    base(name, version, opts)
+    |> select([d], count(d.id))
+    |> repo.one()
+  end
+
+  @doc """
+  A summary an operator can page on: how many, of what kind, over what span.
+
+      %{
+        total: 143,
+        by_error_kind: %{"commit:23505 (unique_violation)" => 140, "Elixir.ArgumentError" => 3},
+        oldest: ~U[...],
+        newest: ~U[...]
+      }
+
+  The shape of `by_error_kind` is the diagnosis. One kind dominating a single
+  stream is a poison event; one kind spread across every stream is a schema
+  or handler problem that dead-lettering is papering over — the case
+  `Scriba.Circuit` halts on when it catches a whole batch at once.
+  """
+  @spec stats(module(), projection(), keyword()) :: map()
+  def stats(repo, %{name: name, version: version}, opts \\ []) do
+    by_kind =
+      base(name, version, opts)
+      |> group_by([d], d.error_kind)
+      |> select([d], {d.error_kind, count(d.id)})
+      |> repo.all()
+      |> Map.new()
+
+    span =
+      base(name, version, opts)
+      |> select([d], %{oldest: min(d.occurred_at), newest: max(d.occurred_at)})
+      |> repo.one()
+
+    %{
+      total: by_kind |> Map.values() |> Enum.sum(),
+      by_error_kind: by_kind,
+      oldest: as_utc(span[:oldest]),
+      newest: as_utc(span[:newest])
+    }
+  end
+
+  # `:utc_datetime_usec` is `timestamp` without a time zone in Postgres, and
+  # a schemaless query carries no field type to cast by, so Postgrex hands
+  # back a NaiveDateTime. Every timestamp this module returns is documented
+  # as a DateTime, and callers compare them with DateTime functions, which
+  # raise on the naive one. Same conversion as `Scriba.Watermark`, for the
+  # same reason.
+  defp as_utc(nil), do: nil
+  defp as_utc(%DateTime{} = datetime), do: datetime
+  defp as_utc(%NaiveDateTime{} = naive), do: DateTime.from_naive!(naive, "Etc/UTC")
+
+  defp base(name, version, opts) do
+    query =
+      from(d in "scriba_dead_letters",
+        where: d.projection_name == ^name and d.projection_version == ^version
+      )
+
+    query
+    |> filter(:stream_id, Keyword.get(opts, :stream_id))
+    |> filter(:error_kind, Keyword.get(opts, :error_kind))
+    |> filter_since(Keyword.get(opts, :since))
+  end
+
+  defp filter(query, _field, nil), do: query
+  defp filter(query, :stream_id, value), do: where(query, [d], d.stream_id == ^value)
+  defp filter(query, :error_kind, value), do: where(query, [d], d.error_kind == ^value)
+
+  defp filter_since(query, nil), do: query
+  defp filter_since(query, %DateTime{} = since), do: where(query, [d], d.occurred_at >= ^since)
 
   @doc """
   Builds a row map for the `scriba_dead_letters` table from a failing event
