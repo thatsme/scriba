@@ -708,10 +708,19 @@ Scriba follows semver. The v0.1.0 API surface (`start_projection`,
 `Scriba.Projection`) is frozen — no breaking changes within 0.1.x. New
 optional features may land in 0.1.x patch releases.
 
-`Scriba.Target` and `Scriba.Source` behaviours are not yet frozen
-— v0.4 will widen them when non-Commanded sources and non-Ecto
-targets land. Custom adapter authors should pin against a specific
-0.1.x.
+`Scriba.Target` and `Scriba.Source` behaviours are not frozen, and will
+widen if other sources or targets are built. Custom adapter authors should
+pin against a specific 0.1.x.
+
+Only Commanded and Ecto/Postgres ship today, and nothing else is being
+prepared for speculatively — an interface with one implementation behind it
+encodes that implementation's assumptions. **If you need another source or
+target, open an issue**: it gets built with you, and the second
+implementation is what reveals the right shape. One constraint is worth
+knowing up front, because it is the guarantee rather than a detail: a target
+commits read-model rows, cursor advances and dead letters in a single
+transaction, so a store that cannot do that cannot provide effectively-once
+delivery.
 
 ---
 

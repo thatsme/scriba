@@ -56,7 +56,12 @@ goes wrong."*
   events already carry the rate, and a second number could disagree with
   them.
 - Online rebuild, shadow targets, swap (v0.3)
-- Adapters other than Commanded source + Ecto target (v0.4)
+- Adapters other than Commanded source + Ecto target. Not scheduled, and
+  deliberately not prepared for: the target is the transaction boundary
+  (§13.2), and an interface with one implementation behind it encodes that
+  implementation's assumptions — which is how the acknowledgement defect
+  fixed in 0.1.3 survived a green suite. Another adapter gets built when
+  someone needs one, with them.
 - Multi-target fan-out (v0.4)
 - Backpressure tuning knobs beyond Broadway defaults (v0.5). Note: since
   0.1.2 the source forwards `:buffer_size`, `:concurrency_limit` and

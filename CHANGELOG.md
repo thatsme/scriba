@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Documented that the target is the transaction boundary — read-model rows,
+  cursor advances and dead letters commit together or not at all — and that
+  cursor and dead-letter storage will not be split into a separate
+  behaviour. Splitting them would either leave them in the same transaction
+  anyway or turn effectively-once delivery into at-least-once with a crash
+  window.
+
+  Other sources and targets are not being prepared for speculatively. An
+  interface with one implementation behind it encodes that implementation's
+  assumptions, which is how the acknowledgement defect fixed in 0.1.3
+  survived a green test suite. The README and `Scriba.Target` now invite an
+  issue instead: another adapter gets built with whoever needs it.
+
 - **A producer that cannot get its subscription now stands by instead of
   failing.** A persistent subscription admits one subscriber, so on a
   multi-node deployment every node but one is refused. Previously the loser

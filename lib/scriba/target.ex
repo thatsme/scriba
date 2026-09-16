@@ -8,6 +8,34 @@ defmodule Scriba.Target do
   The Test target updates an in-memory `Agent`. The engine treats both
   uniformly via the `c:apply_batch/6` callback.
 
+  ## The target is the transaction boundary
+
+  A target owns three writes — the read-model rows, the per-stream cursor
+  advances, and any dead letters — and commits them together or not at all.
+  That is not an accident of the Ecto implementation; it is the guarantee.
+  Splitting cursor and dead-letter storage into a separate behaviour would
+  either leave them in the same transaction anyway, or turn effectively-once
+  delivery into at-least-once with a crash window.
+
+  So the boundary stays where it is, and the consequence is stated plainly: a
+  store that cannot commit those three things in one transaction cannot
+  provide Scriba's delivery guarantee.
+
+  ## Other targets
+
+  Only `Scriba.Target.Ecto` ships. Another one is perfectly implementable —
+  `Scriba.Position.multi/5` and `Scriba.DeadLetter.multi/4` are public so an
+  Ecto-based target reuses the cursor and dead-letter SQL rather than
+  reimplementing it — and if you need one, **open an issue**. It will be
+  built with you rather than ahead of you.
+
+  That is deliberate, not evasive. An interface with one implementation
+  behind it encodes that implementation's assumptions: `Scriba.Source`
+  looked correct until a real event store showed that acknowledgement had
+  been broken since 0.1.0, because the in-memory adapter the tests used
+  could not express the bug. A second target is what would reveal the right
+  shape here, and guessing at it first buys complexity, not readiness.
+
   `c:init/1` is called once when the projection starts and returns the state
   threaded through every subsequent `c:apply_batch/6` call. `apply_batch/6`
   returns either `{:ok, state}` on success or `{:error, reason, state}` on
