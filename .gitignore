@@ -28,6 +28,10 @@ Thumbs.db
 .claude
 CLAUDE.md
 
+# Internal working documents — design reviews, assessments, planning notes.
+# Never public: they discuss unreleased direction and unverified findings.
+/docs/internal/
+
 # Private AI-collaboration artifacts (claude-files mirrors)
 GIULIA.md
 *PHASE_*_RECAP*
