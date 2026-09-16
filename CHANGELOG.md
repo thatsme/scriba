@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `mix docs` now generates without warnings. Internal modules carry
+  `@moduledoc false`, so every deliberate mention of one — the telemetry
+  catalog naming its emitters, the architecture guide naming processes, this
+  file naming what changed — produced a "references … but it is hidden"
+  warning. `:skip_code_autolink_to` in `mix.exs` lists those names, so they
+  render as plain code instead of failing to link. A warning now means a
+  genuinely broken reference.
+
+- Throughput figures in the README and `Scriba.Source.Commanded` re-measured
+  after the 0.1.3 acknowledgement change, on 5,000 events over 100 streams:
+  9.1 events/sec at the adapter default, 6,002 with `buffer_size: 500`.
+
 ## [0.1.3] - 2026-09-16
 
 ### Fixed

@@ -100,6 +100,27 @@ defmodule Scriba.MixProject do
       groups_for_extras: [
         Guides: ["MIGRATION.md", "SCRIBA_ARCHITECTURE.md"]
       ],
+      # Internal modules carry @moduledoc false, so ExDoc cannot link to them
+      # and warns on every mention. They are named on purpose — the
+      # architecture guide, the telemetry catalog and the CHANGELOG all have
+      # to say which process emits what — so the mentions stay and the
+      # autolinking is skipped instead. Rendered as plain code, no warning.
+      #
+      # A name only belongs here while the module is hidden: promoting one to
+      # public documentation means removing its entry, or the reference
+      # silently stops linking.
+      skip_code_autolink_to: [
+        "Scriba.Registry",
+        "Scriba.Supervisor.init/1",
+        "Scriba.Projections.Supervisor",
+        "Scriba.Projection.Supervisor",
+        "Scriba.Projection.Coordinator",
+        "Scriba.Projection.Pipeline",
+        "Scriba.Projection.Pipeline.handle_batch/4",
+        "Scriba.Source.Commanded.start_link/1",
+        "Scriba.Source.Commanded.pause/1",
+        "Scriba.Source.Commanded.to_message/2"
+      ],
       source_ref: "v#{@version}",
       source_url: @source_url
     ]
