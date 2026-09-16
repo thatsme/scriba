@@ -4,8 +4,9 @@ defmodule Mix.Tasks.Scriba.Gate do
   @moduledoc """
   The release gate from `SCRIBA_ARCHITECTURE.md` §14, as a command.
 
-      mix scriba.gate          # everything
-      mix scriba.gate --fast   # skip dialyzer and the test suites
+      mix scriba.gate              # everything, before tagging
+      mix scriba.gate --fast       # skip dialyzer and the test suites
+      mix scriba.gate --published  # after publishing: check what users see
 
   It exists because the gate was a list a human read and applied selectively.
   Releases went out with a stale install snippet, a changelog that understated
@@ -24,10 +25,21 @@ defmodule Mix.Tasks.Scriba.Gate do
   @checks_fast [:version_consistency, :changelog_entry, :format, :compile, :credo, :docs]
   @checks_full @checks_fast ++ [:dialyzer, :tests, :hex_build]
 
+  # After publishing, the only documentation that matters is the copy users
+  # actually read — the one in the tarball, rendered on HexDocs. 0.2.0 was
+  # correct in git and wrong on HexDocs for four hours.
+  @checks_published [:hex_version, :published_install_snippet, :git_tag]
+
   @impl true
   def run(argv) do
-    {opts, _, _} = OptionParser.parse(argv, strict: [fast: :boolean])
-    checks = if opts[:fast], do: @checks_fast, else: @checks_full
+    {opts, _, _} = OptionParser.parse(argv, strict: [fast: :boolean, published: :boolean])
+
+    checks =
+      cond do
+        opts[:published] -> @checks_published
+        opts[:fast] -> @checks_fast
+        true -> @checks_full
+      end
 
     Mix.shell().info("\nScriba release gate — #{version()}\n")
 
@@ -51,9 +63,8 @@ defmodule Mix.Tasks.Scriba.Gate do
   # The one that would have caught the 0.2.0 install snippet: mix.exs says
   # 0.2.0 while the README told readers to depend on "~> 0.1".
   defp run_check(:version_consistency) do
-    version = version()
-    [major, minor, _patch] = String.split(version, ".")
-    expected = "~> #{major}.#{minor}"
+    [major, minor, _patch] = String.split(version(), ".")
+    expected = expected_requirement()
 
     errors =
       []
@@ -74,8 +85,12 @@ defmodule Mix.Tasks.Scriba.Gate do
       not String.contains?(changelog, "## [#{version}]") ->
         {:error, "CHANGELOG has no entry for #{version}"}
 
-      unreleased_has_content?(changelog) ->
-        {:error, "CHANGELOG [Unreleased] is not empty — fold it into #{version} or ship it"}
+      # Only while preparing a release. Once this version is tagged, content
+      # under [Unreleased] is work heading for the next one, and failing on it
+      # would mean the gate cannot be run during ordinary development — which
+      # is how a gate stops being run at all.
+      not tagged?(version) and unreleased_has_content?(changelog) ->
+        {:error, "CHANGELOG [Unreleased] is not empty — fold it into #{version} before tagging"}
 
       true ->
         :ok
@@ -88,6 +103,58 @@ defmodule Mix.Tasks.Scriba.Gate do
   defp run_check(:dialyzer), do: cmd("mix", ["dialyzer"])
   defp run_check(:tests), do: cmd("mix", ["test"])
   defp run_check(:hex_build), do: cmd("mix", ["hex.build"])
+
+  defp run_check(:hex_version) do
+    with {:ok, body} <- http_get("https://hex.pm/api/packages/scriba"),
+         [_, latest] <- Regex.run(~r/"releases":\[\{"version":"([^"]+)"/, body) do
+      if latest == version() do
+        :ok
+      else
+        {:error, "hex.pm serves #{latest}, this checkout is #{version()} — publish, or you are reading a stale checkout"}
+      end
+    else
+      _ -> {:error, "could not read the published version from hex.pm"}
+    end
+  end
+
+  # The most-copied block in the README, checked where a user meets it.
+  defp run_check(:published_install_snippet) do
+    expected = expected_requirement()
+    url = "https://hexdocs.pm/scriba/#{version()}/readme.html"
+
+    case http_get(url) do
+      {:ok, body} ->
+        # HexDocs syntax-highlights code, so the snippet arrives split across
+        # <span> tags: strip markup first, then unescape entities.
+        text =
+          body
+          |> String.replace(~r/<[^>]*>/, "")
+          |> String.replace("&quot;", "\"")
+          |> String.replace("&gt;", ">")
+          |> String.replace("&lt;", "<")
+          |> String.replace("&amp;", "&")
+
+        cond do
+          String.contains?(text, "{:scriba, \"#{expected}\"}") ->
+            :ok
+
+          true ->
+            found = Regex.run(~r/\{:scriba, "([^"]+)"\}/, text)
+            {:error, "published docs show #{inspect(found && Enum.at(found, 1))}, expected #{expected}"}
+        end
+
+      _ ->
+        {:error, "could not fetch #{url} — docs may still be building"}
+    end
+  end
+
+  defp run_check(:git_tag) do
+    case System.cmd("git", ["tag", "--list", "v#{version()}"], stderr_to_stdout: true) do
+      {"", _} -> {:error, "no v#{version()} tag"}
+      {_, 0} -> :ok
+      {output, _} -> {:error, last_line(output)}
+    end
+  end
 
   defp run_check(:docs) do
     case System.cmd("mix", ["docs"], stderr_to_stdout: true) do
@@ -183,7 +250,26 @@ defmodule Mix.Tasks.Scriba.Gate do
     |> String.slice(0, 200)
   end
 
+  defp tagged?(version) do
+    case System.cmd("git", ["tag", "--list", "v#{version}"], stderr_to_stdout: true) do
+      {output, 0} -> String.trim(output) != ""
+      _ -> false
+    end
+  end
+
   defp version, do: Mix.Project.config()[:version]
+
+  defp expected_requirement do
+    [major, minor, _patch] = String.split(version(), ".")
+    "~> #{major}.#{minor}"
+  end
+
+  defp http_get(url) do
+    case System.cmd("curl", ["-sL", url], stderr_to_stdout: true) do
+      {body, 0} when byte_size(body) > 0 -> {:ok, body}
+      _ -> :error
+    end
+  end
 
   defp report(results) do
     Enum.each(results, fn {check, result} ->

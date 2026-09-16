@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `mix scriba.gate --published` — the after-publishing half of the gate:
+  hex.pm serves this version, the tag exists, and the install snippet
+  rendered on HexDocs matches the current minor. The pre-release gate checks
+  the repository; this checks what a reader actually meets, which is where
+  0.2.0's `~> 0.1` survived.
+
 ## [0.2.1] - 2026-09-16
 
 Documentation and tooling. No library code changed.

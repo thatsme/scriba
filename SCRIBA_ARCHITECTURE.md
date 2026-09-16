@@ -1102,6 +1102,11 @@ Every release clears the same bar:
   moving it.
 - `examples/bank` runs end-to-end: a projection catching up to a
   Commanded event store with telemetry firing.
+- **After publishing**, `mix scriba.gate --published` passes: hex.pm serves
+  this version, the tag exists, and the install snippet rendered on HexDocs
+  matches the current minor. The documentation users read is the published
+  copy, not the one in git — 0.2.0 was right in the repository and wrong on
+  HexDocs, and nothing in the pre-release gate could have noticed.
 
 **The example app is not sufficient as an acceptance test.** It runs
 Commanded's InMemory adapter, and InMemory diverges from a persistent
