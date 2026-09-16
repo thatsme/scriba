@@ -16,6 +16,7 @@ defmodule Scriba.Projection.Coordinator do
     :pipeline_pid,
     :pipeline_ref,
     :repo,
+    :lag_interval,
     # Tracks whether the `:initializing → :running` transition has fired
     # the `[:scriba, :projection, :started]` telemetry event yet. Pipeline
     # DOWN → re-initializing → re-running cycles MUST NOT re-emit
@@ -37,6 +38,12 @@ defmodule Scriba.Projection.Coordinator do
   # Process.send_after(self(), :tick, interval) self-messages instead.
   # See SCRIBA_ARCHITECTURE.md §7.5 for the rationale.
   @poll_interval 50
+
+  # How often [:scriba, :projection, :lag] fires. Lag is a trend, not an
+  # instant: alerting on it means "behind for a while", so a five-second
+  # cadence carries the signal at a fraction of the query cost of a tighter
+  # one. `lag_interval: 0` turns it off.
+  @default_lag_interval 5_000
 
   ## Public API
 
@@ -125,8 +132,11 @@ defmodule Scriba.Projection.Coordinator do
       parallelism: Keyword.fetch!(opts, :parallelism),
       handler: Keyword.fetch!(opts, :handler),
       supervisor_pid: Keyword.fetch!(opts, :supervisor_pid),
-      repo: Scriba.Position.resolve_repo(opts, target_spec)
+      repo: Scriba.Position.resolve_repo(opts, target_spec),
+      lag_interval: Keyword.get(opts, :lag_interval, @default_lag_interval)
     }
+
+    schedule_lag_tick(data)
 
     # Initialize the position cache once per Coordinator-process lifetime.
     # The wipe-then-preload runs here (not on every :running enter) so that
@@ -330,6 +340,54 @@ defmodule Scriba.Projection.Coordinator do
 
   def handle_event({:call, from}, cmd, state, _data) when cmd in [:pause, :resume, :stop] do
     {:keep_state_and_data, [{:reply, from, {:error, {:invalid_state, state}}}]}
+  end
+
+  ## Lag reporting
+
+  # Self-message, not :state_timeout. A state_timeout is reset by every event
+  # in that state, so under load — exactly when lag matters — it would be
+  # pushed back indefinitely and silently stop firing. §7.5.
+  def handle_event(:info, :scriba_lag_tick, state, data) do
+    emit_lag(data, state)
+    schedule_lag_tick(data)
+
+    :keep_state_and_data
+  end
+
+  defp schedule_lag_tick(%{lag_interval: interval}) when interval in [0, nil], do: :ok
+
+  defp schedule_lag_tick(%{lag_interval: interval}) do
+    Process.send_after(self(), :scriba_lag_tick, interval)
+    :ok
+  end
+
+  # Reading the watermark is a database round-trip on a timer, so nothing
+  # here may take the Coordinator down: a repo that is briefly unreachable
+  # costs a missed data point, and the next tick is five seconds away.
+  #
+  # No event is emitted before the projection has committed anything. A lag
+  # of zero and "nothing to report yet" are different statements, and a
+  # measurement that conflates them would read as caught-up.
+  defp emit_lag(%{repo: nil}, _state), do: :ok
+
+  defp emit_lag(data, state) do
+    projection = %{name: data.name, version: data.version}
+
+    case Scriba.Watermark.get(data.repo, projection) do
+      %{position: position, occurred_at: %DateTime{} = occurred_at} ->
+        lag_ms = DateTime.utc_now() |> DateTime.diff(occurred_at, :millisecond) |> max(0)
+
+        :telemetry.execute(
+          [:scriba, :projection, :lag],
+          %{lag_ms: lag_ms, watermark: position},
+          %{projection: projection, status: state}
+        )
+
+      _ ->
+        :ok
+    end
+  rescue
+    _ -> :ok
   end
 
   ## Helpers

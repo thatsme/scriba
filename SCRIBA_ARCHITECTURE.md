@@ -44,7 +44,12 @@ goes wrong."*
 **Out of scope for v0.1** (do not build, do not stub, do not "leave room for"):
 
 - LiveView dashboard (v0.2)
-- Lag/throughput metrics beyond raw telemetry events (v0.2)
+- Lag/throughput metrics beyond raw telemetry events (v0.2). Note: lag
+  shipped after v0.1 as `[:scriba, :projection, :lag]` (§8.5), on the
+  `send_after` cadence §7.5 describes. Throughput did not and will not have
+  an event of its own — Broadway's batch telemetry and the per-event `:stop`
+  events already carry the rate, and a second number could disagree with
+  them.
 - Online rebuild, shadow targets, swap (v0.3)
 - Adapters other than Commanded source + Ecto target (v0.4)
 - Multi-target fan-out (v0.4)
@@ -268,7 +273,7 @@ so the public registry stays readable.
 
 ### 6.3 Telemetry event surface (v0.1)
 
-Twelve events fire. `Scriba.Telemetry`'s moduledoc is the catalog users
+Thirteen events fire. `Scriba.Telemetry`'s moduledoc is the catalog users
 read; this table is the same surface, and the two are kept in step. Lag
 and throughput events are explicitly out of scope (see §2) — do not add
 them here without amending that section.
@@ -286,7 +291,8 @@ them here without amending that section.
 | `[:scriba, :projection, :event, :skipped]` | `handle_message/3` (no handler ran) | `system_time` | `projection`, `reason` (`:dedup` or `:handler`), `event_type`, `stream_id`, `position` |
 | `[:scriba, :projection, :cache_initialized]` | `Scriba.Position.init_cache/3` | `wiped_count`, `preloaded_count` | `name`, `version`, `source` |
 | `[:scriba, :source, :batch, :failed]` | the source's acknowledger (a batch did not commit; nothing was acknowledged) | `count` | `subscription`, `reason` |
-| `[:scriba, :projection, :halted]` | `halt_batch/3`, from `handle_batch/4` (structural commit failure; the projection has stopped making progress) | `system_time` | `projection`, `reason`, `failure` (SQLSTATE label) |
+| `[:scriba, :projection, :lag]` | `Scriba.Projection.Coordinator`, on a `send_after` timer (`:lag_interval`, default 5s, `0` disables) | `lag_ms`, `watermark` | `projection`, `status` |
+  | `[:scriba, :projection, :halted]` | `halt_batch/3`, from `handle_batch/4` (structural commit failure; the projection has stopped making progress) | `system_time` | `projection`, `reason`, `failure` (SQLSTATE label) |
 
 Conventions:
 
@@ -407,8 +413,9 @@ job, not the Coordinator's.
 
 ### 7.5 Periodic timers — `state_timeout` is the wrong primitive
 
-This note is load-bearing for v0.2's lag/throughput work. Recording it
-here so the implementation does not re-discover it under load.
+This note is what the lag reporter is built on — `handle_event(:info,
+:scriba_lag_tick, ...)` in the Coordinator uses `Process.send_after/3` for
+exactly the reason below.
 
 `gen_statem`'s `state_timeout` action **resets on every event in that
 state**. The Coordinator already uses `state_timeout` for the

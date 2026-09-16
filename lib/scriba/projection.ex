@@ -48,6 +48,9 @@ defmodule Scriba.Projection do
     * `:batch_size` (default `50`), `:batch_timeout` (default `100` ms) and
       `:retry` (default 3 attempts with `[100, 1000, 10_000]` ms backoff;
       `retry: false` for a single attempt) — pass through to Pipeline
+    * `:lag_interval` (default `5_000` ms, `0` disables) — how often the
+      Coordinator emits `[:scriba, :projection, :lag]`. Fires on a timer
+      rather than on traffic, so an idle projection still reports.
       and the retry layer respectively. See
       `Scriba.Projection.Pipeline` and `SCRIBA_ARCHITECTURE.md` §9.1 for
       defaults.
@@ -129,7 +132,8 @@ defmodule Scriba.Projection do
     :partition_by,
     :batch_size,
     :batch_timeout,
-    :retry
+    :retry,
+    :lag_interval
   ]
 
   # Options a migrator copies verbatim out of a commanded_ecto_projections

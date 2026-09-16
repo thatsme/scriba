@@ -21,6 +21,7 @@ defmodule Scriba.Telemetry do
   | `[:scriba, :projection, :resumed]` | `Scriba.Projection.Coordinator` (on `:paused → :running` transition, after source resume signal sent) | `system_time` | `projection` |
   | `[:scriba, :projection, :cache_initialized]` | `Scriba.Position.init_cache/3` | `wiped_count`, `preloaded_count` | `name`, `version`, `source` |
   | `[:scriba, :source, :batch, :failed]` | the source's acknowledger (a batch failed to commit; nothing was acknowledged) | `count` | `subscription`, `reason` |
+  | `[:scriba, :projection, :lag]` | `Scriba.Projection.Coordinator`, on a timer (`:lag_interval`, default 5s; `0` disables) | `lag_ms`, `watermark` | `projection`, `status` |
   | `[:scriba, :projection, :halted]` | the Pipeline (structural commit failure; the projection has stopped making progress) | `system_time` | `projection`, `reason`, `failure` (SQLSTATE label) |
 
   `projection` is `%{name: String.t(), version: pos_integer()}`. `event_type`
@@ -85,12 +86,25 @@ defmodule Scriba.Telemetry do
   A rising `:handler` count on event types you expected to handle is a
   missing `handle/2` clause.
 
-  ## Out of scope for v0.1
+  ## Lag
 
-  Lag and throughput events (`[:scriba, :projection, :lag]`,
-  `[:scriba, :projection, :throughput]`) are v0.2 per
-  `SCRIBA_ARCHITECTURE.md` §2. See
-  §7.5 of the architecture doc for the implementation note on periodic
-  timers that the v0.2 work will need.
+  `[:scriba, :projection, :lag]` is the one event that fires on a timer
+  rather than on traffic, which is the point: a projection that has stopped
+  receiving events emits nothing else, and that is exactly when someone wants
+  to know how far behind it is. `lag_ms` is how long ago the event at the
+  watermark happened, so an idle but caught-up projection reports the age of
+  the last event it saw.
+
+  It stays silent until the projection has committed something. A projection
+  with no watermark reporting `lag_ms: 0` would read as caught-up when it has
+  not started.
+
+  `watermark` in the same measurement is the contiguous global position
+  (`Scriba.Watermark`), which is what makes the pair useful for rebuild
+  progress as well as alerting.
+
+  Throughput has no event of its own: Broadway already emits one per batch,
+  and counting `[:scriba, :projection, :event, :stop]` gives the per-event
+  rate without Scriba adding a second number that can disagree.
   """
 end

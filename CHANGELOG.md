@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`[:scriba, :projection, :lag]` telemetry.** The Coordinator emits it on a
+  timer — `:lag_interval`, default 5s, `0` disables — carrying `lag_ms` and
+  the `watermark` it was derived from, with the projection's `status` in the
+  metadata.
+
+  On a timer rather than on traffic, deliberately: a projection that has
+  stopped receiving events emits nothing else, which is exactly when an
+  operator wants to know how far behind it is. It stays silent until the
+  projection has committed something, because a projection with no watermark
+  reporting `lag_ms: 0` would read as caught-up when it has not started.
+
+  Throughput gets no event of its own. Broadway's batch telemetry and the
+  per-event `:stop` events already carry the rate, and a second number could
+  disagree with them.
+
 - **`scriba_watermarks`: the contiguous global position a projection has
   reached**, surfaced as `:watermark` and `:lag_ms` on `Scriba.info/2`. Every
   event at or below the watermark has been committed, skipped or

@@ -50,8 +50,10 @@ structurally rather than by a property test — see architecture §10.
 
 What's deliberately out of scope for v0.1:
 
-- Lag and throughput metrics beyond raw telemetry events (v0.2 +
-  LiveView dashboard).
+- A LiveView dashboard (the ecosystem ships these as companion packages;
+  `broadway_dashboard` already renders the Broadway side).
+- Throughput metrics of Scriba's own — Broadway's batch telemetry and the
+  per-event `:stop` events already carry the rate.
 - Online rebuild / shadow targets / atomic swap (v0.3).
 - Sources other than Commanded; targets other than Ecto/Postgres
   (v0.4).
@@ -287,8 +289,8 @@ re-delivers below that cursor.
 
 ### Telemetry
 
-Twelve events fire — from the Pipeline, the Coordinator, position-cache init,
-and the source. The full surface table is in `Scriba.Telemetry`'s moduledoc
+Thirteen events fire — from the Pipeline, the Coordinator, position-cache
+init, and the source. The full surface table is in `Scriba.Telemetry`'s moduledoc
 and in architecture §6.3. Highlights:
 
 ```
@@ -298,6 +300,7 @@ and in architecture §6.3. Highlights:
 [:scriba, :projection, :dead_letter]
 [:scriba, :projection, :started | :paused | :resumed]
 [:scriba, :projection, :cache_initialized]
+[:scriba, :projection, :lag]
 [:scriba, :projection, :halted]
 [:scriba, :source, :batch, :failed]
 ```
