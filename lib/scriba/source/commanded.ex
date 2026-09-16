@@ -229,6 +229,20 @@ defmodule Scriba.Source.Commanded do
     dispatch(%{state | pending: new_pending})
   end
 
+  # Acks routed here from ack/3, which runs in a batch processor and cannot
+  # acknowledge on its own behalf (see the comment there). Events arrive in
+  # commit order; they are acked in that order. A failure to ack is not
+  # recoverable from here and must not take the producer down — the event
+  # simply stays unacknowledged and is redelivered after a restart, which is
+  # the same outcome as a crash between commit and ack.
+  def handle_info({:scriba_ack, events}, state) do
+    Enum.each(events, fn event ->
+      apply(@event_store, :ack_event, [state.application, state.subscription, event])
+    end)
+
+    {:noreply, [], state}
+  end
+
   def handle_info(:scriba_pause, state) do
     {:noreply, [], %{state | paused: true}}
   end
@@ -244,11 +258,32 @@ defmodule Scriba.Source.Commanded do
   @impl Broadway.Acknowledger
   def ack(ack_ref, successful, [] = _failed) do
     %{application: app, subscription: sub} = ack_ref
+    producer = Map.get(ack_ref, :producer)
 
-    Enum.each(successful, fn msg ->
-      {_module, _ref, commanded_event} = msg.acknowledger
-      apply(@event_store, :ack_event, [app, sub, commanded_event])
-    end)
+    events = Enum.map(successful, fn %Broadway.Message{acknowledger: {_m, _ref, ev}} -> ev end)
+
+    # The ack MUST be issued by the process that holds the subscription, and
+    # this callback does not run there — Broadway calls it in a batch-processor
+    # process. The two Commanded adapters disagree about whether that matters:
+    #
+    #   * InMemory takes the subscription pid as an explicit argument and
+    #     ignores the caller (in_memory.ex `ack_event/3`).
+    #   * EventStore resolves the subscriber from `self()`
+    #     (`EventStore.Subscriptions.Subscription.ack/2` → `{:ack, n, self()}`)
+    #     and its FSM drops the ack entirely when that pid is not a registered
+    #     subscriber of the subscription.
+    #
+    # Acking from here therefore worked against InMemory — which is what the
+    # test suite and the bank example run — and was silently discarded against
+    # a real EventStore, stalling the subscription forever once its in-flight
+    # buffer filled. Route through the producer, which is the subscriber, so
+    # both adapters see an ack from a pid they recognise.
+    if is_pid(producer) do
+      send(producer, {:scriba_ack, events})
+    else
+      # No producer: a message built outside a running pipeline (unit tests).
+      Enum.each(events, &apply(@event_store, :ack_event, [app, sub, &1]))
+    end
 
     :ok
   end

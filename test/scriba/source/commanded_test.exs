@@ -129,6 +129,63 @@ defmodule Scriba.Source.CommandedTest do
     end
   end
 
+  describe "ack/3 — success path acknowledges from the subscriber process" do
+    # Regression coverage for a bug that made Scriba unusable against any
+    # event store that identifies the acking subscriber by `self()`.
+    #
+    # ack/3 runs in a Broadway batch-processor process, not the producer that
+    # holds the subscription. It used to call `ack_event/3` from there. The two
+    # Commanded adapters disagree about whether the calling process matters:
+    # InMemory takes the subscription as an argument and ignores the caller,
+    # while EventStore resolves the subscriber from `self()` and drops any ack
+    # from a pid it does not recognise — silently, with no error and no log.
+    #
+    # So against InMemory (the whole test suite, and the bank example) acks
+    # worked; against a real EventStore every ack was discarded, the
+    # subscription never advanced, and the projection stalled for good once the
+    # store's in-flight buffer filled. Measured: one event projected, then
+    # nothing.
+    #
+    # The property pinned here is process identity, which is testable without
+    # an event store: the batch processor must delegate to the producer rather
+    # than acknowledge on its own behalf.
+
+    test "delegates acknowledgement to the producer rather than acking inline" do
+      ack_ref = %{application: :app, subscription: :sub, producer: self()}
+
+      message = %Broadway.Message{
+        data: :irrelevant,
+        acknowledger: {ScribaCommanded, ack_ref, :recorded_event},
+        status: :ok
+      }
+
+      # Inline acking would raise here — :app is not a real application — so a
+      # regression fails loudly rather than by timing out on the receive.
+      assert :ok = ScribaCommanded.ack(ack_ref, [message], [])
+
+      assert_receive {:scriba_ack, [:recorded_event]}
+    end
+
+    test "acks every message in the batch, in delivery order" do
+      ack_ref = %{application: :app, subscription: :sub, producer: self()}
+
+      messages =
+        for n <- 1..3 do
+          %Broadway.Message{
+            data: :irrelevant,
+            acknowledger: {ScribaCommanded, ack_ref, {:event, n}},
+            status: :ok
+          }
+        end
+
+      assert :ok = ScribaCommanded.ack(ack_ref, messages, [])
+
+      # Order matters: these are prefix-acks, so acking out of order would
+      # checkpoint past an event that has not been acknowledged yet.
+      assert_receive {:scriba_ack, [{:event, 1}, {:event, 2}, {:event, 3}]}
+    end
+  end
+
   describe "ack/3 — batch commit failure (no silent loss)" do
     # Regression coverage for a correctness hole: ack/3 previously discarded
     # its `failed` argument entirely. Pipeline.handle_batch/4 fails ALL
