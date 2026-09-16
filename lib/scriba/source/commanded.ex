@@ -27,15 +27,15 @@ defmodule Scriba.Source.Commanded do
   in-flight event waits out its full `:batch_timeout` before acking and
   releasing the next one.
 
-  Measured against a real EventStore, 500 events over 50 streams:
+  Measured against a real EventStore, 5,000 events over 100 streams:
 
   | `:buffer_size` | Throughput | 10M events |
   |---|---|---|
-  | unset (adapter default, 1) | 9.0 events/sec | 12.9 days |
-  | 500 | 2,183 events/sec | 76 minutes |
+  | unset (adapter default, 1) | 9.1 events/sec | 12.7 days |
+  | 500 | 6,002 events/sec | 28 minutes |
 
-  Longer runs amortise startup and go faster still — 5,000 events at
-  `buffer_size: 500` reaches roughly 4,700/sec on the same machine.
+  Short runs read lower — 500 events reach roughly 2,200/sec, because
+  startup is a larger share of the measurement.
 
   Scriba sets no default of its own — the adapter's applies unless configured.
   Raising it trades memory and redelivered-work-after-a-crash for throughput:

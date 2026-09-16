@@ -897,10 +897,11 @@ Every release clears the same bar:
   `mix dialyzer` are clean.
 - `mix test.all` passes with `SCRIBA_TEST_DB_*` configured, so the
   real-Postgres suite (§10) actually runs rather than skipping.
-- `mix docs` generates and `mix hex.build` succeeds. `mix docs` emits
-  "references … but it is hidden" warnings by design: this document names
-  internal modules, and internals carry `@moduledoc false`. The check is
-  that the count has not grown, not that it is zero.
+- `mix docs` generates **no warnings**, and `mix hex.build` succeeds. This
+  document names internal modules deliberately, and those carry
+  `@moduledoc false`, so each mention would warn; `:skip_code_autolink_to`
+  in `mix.exs` lists them instead. A new warning therefore means a genuinely
+  broken reference, or a name that belongs on that list.
 - CHANGELOG has an entry for the version, and the version tag exists
   before publishing — the package links point at `blob/v<version>/`, so
   publishing first yields 404s from HexDocs.
