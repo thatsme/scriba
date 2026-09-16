@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Documented the assumption `:position` carries: a global, monotonic,
+  numeric ordinal over every event a projection consumes. Dedup, cursor
+  monotonicity, the watermark and `:start_from` all rest on it, and
+  Commanded's `event_number` satisfies it — which is also why the cursor
+  carries over from `commanded_ecto_projections`. A store whose position is
+  not a single increasing integer (commit/prepare pairs, a vector clock) is
+  a design question rather than an adapter detail, and is left open rather
+  than guessed at.
+
 - Documented that the target is the transaction boundary — read-model rows,
   cursor advances and dead letters commit together or not at all — and that
   cursor and dead-letter storage will not be split into a separate

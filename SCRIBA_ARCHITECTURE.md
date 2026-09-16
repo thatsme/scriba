@@ -56,6 +56,11 @@ goes wrong."*
   events already carry the rate, and a second number could disagree with
   them.
 - Online rebuild, shadow targets, swap (v0.3)
+- Sources whose position is not a global, monotonic integer. Dedup, cursor
+  monotonicity, the watermark and `:start_from` all rest on `:position`
+  ordering (`Scriba.Event`); a store with commit/prepare pairs or a vector
+  clock is a design question rather than an adapter detail, and is left
+  open rather than guessed at.
 - Adapters other than Commanded source + Ecto target. Not scheduled, and
   deliberately not prepared for: the target is the transaction boundary
   (§13.2), and an interface with one implementation behind it encodes that
