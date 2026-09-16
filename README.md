@@ -481,15 +481,15 @@ links go to GitHub. Clone the repo to run it.
 | `mix test.property_db` | Real-Postgres property tests in `test/property_db/` | `SCRIBA_TEST_DB_*` env vars |
 | `mix test.all` | Everything ExUnit will run with the current environment | — for always-runnable parts; env vars for `property_db` |
 
-`mix test.all` is the canonical full-suite command. Status reports
-should name the command: "fast suite: 99/0" rather than "99 tests, 0
-failures." Naming the command in reports avoids the ambiguity that
-bit us during the diagnostic phase.
+`mix test.all` is the canonical full-suite command. Which command
+produced a result matters: "fast suite: 99/0" and "full suite: 99/0"
+describe different coverage, and a bare "99 tests, 0 failures" does not
+say whether the real-Postgres tests ran at all.
 
 ### Real-Postgres property tests
 
-Property tests in `test/property_db/` (Phase B of the rebuild) need a
-live Postgres. Set all five of:
+Property tests in `test/property_db/` need a live Postgres. Set all five
+of:
 
 | Variable | Example |
 |---|---|
@@ -531,10 +531,10 @@ Migrations run in `test_helper.exs` against an existing connection.
 
 ## Versioning
 
-Scriba follows semver. The v0.1.0 API surface (the seven functions
-in `Scriba` plus the macro at `Scriba.Projection`) is frozen — no
-breaking changes within 0.1.x. New optional features may land in
-0.1.x patch releases.
+Scriba follows semver. The v0.1.0 API surface (`start_projection`,
+`pause`, `resume`, `stop`, `info` and `list` in `Scriba`, plus the macro at
+`Scriba.Projection`) is frozen — no breaking changes within 0.1.x. New
+optional features may land in 0.1.x patch releases.
 
 `Scriba.Target` and `Scriba.Source` behaviours are not yet frozen
 — v0.4 will widen them when non-Commanded sources and non-Ecto

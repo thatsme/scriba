@@ -89,9 +89,9 @@ source: {Scriba.Source.Commanded,
 Fewer moving parts, but **not** reversible — you have consumed the old
 subscription. And the old projector must be fully stopped first: a
 persistent subscription admits one subscriber, so Commanded returns
-`{:error, :subscription_already_exists}`, which Scriba's Commanded source
-does not match on startup — you get a `MatchError` crash loop rather than
-a clear message.
+`{:error, :subscription_already_exists}`. Scriba retries that with backoff
+— the same error is raised transiently when a producer is replaced — and
+then raises a message naming the subscription and the likely causes.
 
 ### Seeding `scriba_positions` — not needed for the path above
 

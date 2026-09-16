@@ -132,7 +132,7 @@ defmodule Scriba.Projection.PipelineTest do
     @tag :integration
     test "Scriba.Partitioner.partition/2 is on the Pipeline's runtime path" do
       # Arm BEAM call-count tracing on the partitioner. This is a structural
-      # guarantee against the dead-code finding from the diagnostic phase
+      # guarantee against a dead-code regression
       # (Pipeline used to bypass this module via inline `:erlang.phash2`).
       # If anyone ever reverts the wiring in pipeline.ex, this test fails
       # loudly instead of the partitioner module silently going dead.

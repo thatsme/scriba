@@ -40,10 +40,10 @@ defmodule Scriba.Info do
   ## Truncation
 
   When a projection has more than 1000 distinct streams, `:stream_positions`
-  becomes `:truncated` rather than a giant map. Callers needing specific
-  per-stream positions in that case should use `Scriba.info/2` with a
-  `streams: [list]` option (added later) to scope the lookup. `:safe_position`
-  is always populated regardless of truncation.
+  becomes `:truncated` rather than a giant map. There is no option to scope
+  the lookup to specific streams; callers needing per-stream positions past
+  that threshold read `scriba_positions` directly. `:safe_position` is always
+  populated regardless of truncation.
   """
 
   @enforce_keys [:name, :version, :safe_position]
