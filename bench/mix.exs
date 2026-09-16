@@ -31,6 +31,8 @@ defmodule ScribaBench.MixProject do
       # in that these are the ones production runs on.
       {:eventstore, "~> 1.4"},
       {:commanded_eventstore_adapter, "~> 1.4"},
+      # Spike only: does broadway_dashboard discover Scriba's pipelines?
+      {:broadway_dashboard, "~> 0.4", only: [:dev, :test]},
       {:ecto_sql, "~> 3.11"},
       {:postgrex, "~> 0.17"},
       {:jason, "~> 1.4"}

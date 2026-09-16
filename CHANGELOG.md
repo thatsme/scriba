@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- README documents running `broadway_dashboard` against a projection. It
+  works as-is: a projection is a Broadway topology, and the dashboard both
+  discovers it through `Broadway.all_running/0` and accepts Scriba's
+  `{:via, Registry, ...}` pipeline names. Scriba will not ship a dashboard of
+  its own.
+
 - **`[:scriba, :projection, :lag]` telemetry.** The Coordinator emits it on a
   timer — `:lag_interval`, default 5s, `0` disables — carrying `lag_ms` and
   the `watermark` it was derived from, with the projection's `status` in the

@@ -43,7 +43,12 @@ goes wrong."*
 
 **Out of scope for v0.1** (do not build, do not stub, do not "leave room for"):
 
-- LiveView dashboard (v0.2)
+- LiveView dashboard (v0.2). Note: not built, and not planned.
+  `broadway_dashboard` discovers Scriba's pipelines through
+  `Broadway.all_running/0` and accepts their `{:via, Registry, ...}` names,
+  so the page exists already; the ecosystem ships operational UIs as
+  companion packages (`oban_web`, `broadway_dashboard`) rather than inside
+  the library.
 - Lag/throughput metrics beyond raw telemetry events (v0.2). Note: lag
   shipped after v0.1 as `[:scriba, :projection, :lag]` (§8.5), on the
   `send_after` cadence §7.5 describes. Throughput did not and will not have

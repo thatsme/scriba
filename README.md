@@ -50,8 +50,8 @@ structurally rather than by a property test — see architecture §10.
 
 What's deliberately out of scope for v0.1:
 
-- A LiveView dashboard (the ecosystem ships these as companion packages;
-  `broadway_dashboard` already renders the Broadway side).
+- A LiveView dashboard. `broadway_dashboard` already renders Scriba
+  projections — see above.
 - Throughput metrics of Scriba's own — Broadway's batch telemetry and the
   per-event `:stop` events already carry the rate.
 - Online rebuild / shadow targets / atomic swap (v0.3).
@@ -490,6 +490,28 @@ test code. See
 
 The example app is **not** included in the Hex package tarball — these
 links go to GitHub. Clone the repo to run it.
+
+### Seeing a projection in LiveDashboard
+
+A projection is a Broadway topology, so
+[`broadway_dashboard`](https://hexdocs.pm/broadway_dashboard) renders one
+with no work from Scriba — it discovers pipelines through
+`Broadway.all_running/0` and handles Scriba's `{:via, Registry, ...}` names:
+
+```elixir
+# deps
+{:broadway_dashboard, "~> 0.4"}
+
+# router
+live_dashboard "/dashboard",
+  additional_pages: [broadway: BroadwayDashboard]
+```
+
+It shows the producer, processors and batchers, their concurrency, and
+successful/failed counts per stage. Scriba ships no dashboard of its own:
+the ecosystem distributes operational UIs as companion packages, and this
+one already works. `bench/test/broadway_dashboard_spike_test.exs` keeps that
+claim honest.
 
 ---
 
