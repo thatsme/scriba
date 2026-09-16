@@ -321,6 +321,30 @@ defmodule Scriba.Source.CommandedTest do
       %{app_pid: app_pid}
     end
 
+    test "subscription options are forwarded to the adapter" do
+      # What this pins is the call shape: the adapter's subscribe_to takes an
+      # options argument, and Scriba passes one. A regression to the 5-argument
+      # form fails here with a FunctionClauseError or an UndefinedFunctionError.
+      #
+      # What it cannot pin is the effect. InMemory reads :concurrency_limit and
+      # :partition_by but has no :buffer_size concept at all, so there is no
+      # observable difference to assert against. The effect is measured instead,
+      # against a real EventStore — 9.1 events/sec unset versus 2,448 at 500 —
+      # and documented in the moduledoc. A test that proves it needs an event
+      # store the suite does not have.
+      {:ok, producer} =
+        GenStage.start_link(ScribaCommanded,
+          application: App,
+          subscription_name: "opts-sub",
+          buffer_size: 10,
+          concurrency_limit: 1
+        )
+
+      on_exit(fn -> if Process.alive?(producer), do: GenStage.stop(producer) end)
+
+      assert Process.alive?(producer)
+    end
+
     test "events written via append_to_stream arrive as %Broadway.Message{} with correct shape" do
       # Subscribe via Commanded.EventStore.subscribe_to (the same facade
       # Scriba.Source.Commanded uses internally). This skips Broadway's

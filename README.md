@@ -130,6 +130,26 @@ store. You never write Broadway code — but when this README says "the
 batch is marked failed", that is `Broadway.Message.failed/2`, and Broadway
 is where the retry-on-redelivery behaviour comes from.
 
+### Catch-up throughput depends on `:buffer_size`
+
+The event store decides how many events it will send before it requires an
+acknowledgement, and its default is one. Scriba acknowledges after the batch
+commits, so with a single event in flight the batcher waits out its whole
+`:batch_timeout` before releasing the next one — which bounds catch-up far
+below anything `:parallelism` can affect. Measured against a real EventStore,
+5,000 events over 100 streams: **9.1 events/sec** at the adapter default,
+**2,448 events/sec** with `buffer_size: 500`.
+
+```elixir
+source: {Scriba.Source.Commanded,
+         application: MyApp.CommandedApp,
+         buffer_size: 500}
+```
+
+Scriba sets no default of its own. Raising the buffer trades memory and
+redelivered-work-after-a-crash for throughput — see
+`Scriba.Source.Commanded` for the full table and the tradeoff.
+
 Add a migration to your repo for Scriba's tables:
 
 ```elixir

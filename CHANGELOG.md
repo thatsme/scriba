@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.2] - 2026-09-16
 
+### Added
+
+- **`:buffer_size`, `:concurrency_limit` and `:partition_by` are forwarded to
+  the event store subscription.** `Scriba.Source.Commanded` previously
+  subscribed with no options at all, so the adapter's defaults always applied.
+  `EventStore`'s default is one in-flight event per subscriber, and that — not
+  `:parallelism` — is what bounds catch-up: Scriba acknowledges after the batch
+  commits, so a batcher holding a single event waits out its full
+  `:batch_timeout` before acking and releasing the next.
+
+  Measured against a real EventStore, 5,000 events over 100 streams: 9.1
+  events/sec at the adapter default, 2,448 events/sec with `buffer_size: 500`.
+
+  Scriba sets no default of its own — the adapter's still applies unless
+  configured, so this changes nothing for an existing projection until it opts
+  in. Raising the buffer trades memory and redelivered-work-after-a-crash for
+  throughput.
+
+      source: {Scriba.Source.Commanded,
+               application: MyApp.CommandedApp,
+               buffer_size: 500}
+
 ### Fixed
 
 - **Acknowledgement now comes from the process that holds the subscription.**

@@ -14,6 +14,34 @@ defmodule Scriba.Source.Commanded do
       durable subscription tracking.
     * `:start_from` (default `:origin`) — where to start reading: `:origin`,
       `:current`, or a specific event number.
+    * `:buffer_size`, `:concurrency_limit`, `:partition_by` — forwarded
+      verbatim to the event store adapter's subscription. Unset means the
+      adapter's own default applies. See "Subscription buffer and throughput".
+
+  ## Subscription buffer and throughput
+
+  `:buffer_size` is how many events the store will send before it requires an
+  acknowledgement. `EventStore`'s default is **1**, and that default, not
+  `:parallelism`, is what bounds a projection's catch-up rate: Scriba
+  acknowledges after the batch commits, so a batcher waiting on a single
+  in-flight event waits out its full `:batch_timeout` before acking and
+  releasing the next one.
+
+  Measured against a real EventStore, 5,000 events over 100 streams:
+
+  | `:buffer_size` | Throughput | 10M events |
+  |---|---|---|
+  | unset (adapter default, 1) | 9.1 events/sec | 12.7 days |
+  | 500 | 2,448 events/sec | 68 minutes |
+
+  Scriba sets no default of its own — the adapter's applies unless configured.
+  Raising it trades memory and redelivered-work-after-a-crash for throughput:
+  up to `:buffer_size` events are held in flight, and an unclean restart
+  replays whatever had not been acknowledged.
+
+      source: {Scriba.Source.Commanded,
+               application: MyApp.CommandedApp,
+               buffer_size: 500}
 
   ## Optional dependency (§11)
 
@@ -100,7 +128,12 @@ defmodule Scriba.Source.Commanded do
     subscription_name = Keyword.get(opts, :subscription_name, "scriba")
     start_from = Keyword.get(opts, :start_from, :origin)
 
-    subscription = subscribe!(application, subscription_name, start_from)
+    # Forwarded verbatim to the adapter. Keyword.take rather than passing opts
+    # wholesale: everything else here is Scriba's own configuration, and an
+    # adapter that validates its options would reject it.
+    subscribe_opts = Keyword.take(opts, [:buffer_size, :concurrency_limit, :partition_by])
+
+    subscription = subscribe!(application, subscription_name, start_from, subscribe_opts)
 
     state = %{
       application: application,
@@ -132,13 +165,20 @@ defmodule Scriba.Source.Commanded do
   # longer than a DOWN takes to process and far shorter than a human notices.
   @resubscribe_backoff [50, 100, 200, 400, 800]
 
-  defp subscribe!(application, subscription_name, start_from, attempts \\ @resubscribe_backoff) do
+  defp subscribe!(
+         application,
+         subscription_name,
+         start_from,
+         subscribe_opts,
+         attempts \\ @resubscribe_backoff
+       ) do
     case apply(@event_store, :subscribe_to, [
            application,
            :all,
            subscription_name,
            self(),
-           start_from
+           start_from,
+           subscribe_opts
          ]) do
       {:ok, subscription} ->
         subscription
@@ -156,7 +196,7 @@ defmodule Scriba.Source.Commanded do
       {:error, :subscription_already_exists} when attempts != [] ->
         [delay | remaining] = attempts
         Process.sleep(delay)
-        subscribe!(application, subscription_name, start_from, remaining)
+        subscribe!(application, subscription_name, start_from, subscribe_opts, remaining)
 
       {:error, :subscription_already_exists} ->
         raise """
