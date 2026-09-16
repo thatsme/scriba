@@ -137,8 +137,8 @@ acknowledgement, and its default is one. Scriba acknowledges after the batch
 commits, so with a single event in flight the batcher waits out its whole
 `:batch_timeout` before releasing the next one — which bounds catch-up far
 below anything `:parallelism` can affect. Measured against a real EventStore,
-5,000 events over 100 streams: **9.1 events/sec** at the adapter default,
-**2,448 events/sec** with `buffer_size: 500`.
+500 events over 50 streams: **9.0 events/sec** at the adapter default,
+**2,183 events/sec** with `buffer_size: 500`.
 
 ```elixir
 source: {Scriba.Source.Commanded,
