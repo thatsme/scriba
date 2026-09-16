@@ -71,7 +71,8 @@ case Application.get_env(:scriba, Scriba.Test.Repo) do
         Scriba.Test.Repo,
         [
           {1, Scriba.Test.Migrations.CreateScribaTables},
-          {2, Scriba.Test.Migrations.CreateTestReadModels}
+          {2, Scriba.Test.Migrations.CreateTestReadModels},
+          {3, Scriba.Test.Migrations.CreateScribaWatermarks}
         ],
         :up,
         all: true

@@ -163,11 +163,20 @@ defmodule MyApp.Repo.Migrations.AddScribaTables do
 end
 ```
 
-This creates two tables in your read-model database:
+This creates three tables in your read-model database:
 
 - `scriba_positions` — per-stream cursor (one row per `{projection,
   version, stream_id}`).
 - `scriba_dead_letters` — failed events for inspection / manual replay.
+- `scriba_watermarks` — the contiguous global position per projection.
+
+Upgrading from Scriba 0.1.x, whose schema had the first two, means a second
+migration that names the version you already have:
+
+```elixir
+def up,   do: Scriba.Migrations.up(from: 1)
+def down, do: Scriba.Migrations.down(to: 1)
+```
 
 Start projections during your application boot. The idiomatic pattern
 is a small `Task` in your supervision tree that calls
@@ -478,6 +487,36 @@ test code. See
 
 The example app is **not** included in the Hex package tarball — these
 links go to GitHub. Clone the repo to run it.
+
+---
+
+## How far along, and how far behind
+
+`Scriba.info/2` reports two numbers an operator can alert on:
+
+```elixir
+{:ok, info} = Scriba.info(MyApp.Projections.Orders)
+
+info.watermark   # 48_213 — every event up to here is accounted for
+info.lag_ms      # 1_240  — the event at that position happened 1.2s ago
+```
+
+The **watermark** is the contiguous global position: every event at or below
+it has been committed, skipped or dead-lettered, with no gap underneath. That
+is the number a replica could resume from, and the one that says how far a
+rebuild has got. Per-stream cursors cannot answer either question — a minimum
+across them ignores streams the projection never wrote to, and a maximum
+counts work sitting above an event still in flight.
+
+**Lag** is measured from the event's own timestamp rather than from the event
+store's head, which Commanded's adapter behaviour does not expose. An idle,
+fully caught-up projection therefore reports the age of the last event it
+saw, which is what you want when asking whether anything is still flowing.
+
+Both are written outside the commit transaction and throttled to roughly one
+write a second while events are in flight, flushing immediately once the
+projection catches up. They can lag what was applied; they cannot run ahead
+of it. See `Scriba.Watermark` for why that direction is the safe one.
 
 ---
 

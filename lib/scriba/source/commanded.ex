@@ -101,6 +101,8 @@ defmodule Scriba.Source.Commanded do
 
   use GenStage
 
+  require Logger
+
   alias Scriba.Event
 
   # Built from string literals so Elixir's compiler does not treat these as
@@ -178,7 +180,19 @@ defmodule Scriba.Source.Commanded do
       in_flight: :queue.new(),
       # Event numbers whose batch committed but which cannot be acknowledged
       # yet, because an earlier event has not committed. See ack_contiguous/2.
-      committed: MapSet.new()
+      committed: MapSet.new(),
+      # Where to persist the contiguous watermark, and who to persist it as.
+      # nil when the source runs outside a pipeline (unit tests) or against a
+      # target with no repo.
+      watermark: watermark_config(opts),
+      # Throttle state: the last position written and when. A projection
+      # committing thousands of events a second does not need thousands of
+      # watermark writes a second.
+      watermark_written: 0,
+      # nil, not 0: BEAM monotonic time has an arbitrary origin and is
+      # routinely negative, so `now - 0` is not an elapsed interval and the
+      # first write would never clear the throttle.
+      watermark_written_at: nil
     }
 
     {:producer, state}
@@ -192,6 +206,11 @@ defmodule Scriba.Source.Commanded do
   # Backoff for the reap race described below. Cumulative ~1.5s, which is far
   # longer than a DOWN takes to process and far shorter than a human notices.
   @resubscribe_backoff [50, 100, 200, 400, 800]
+
+  # How often the contiguous watermark is written. Under load the position
+  # advances with every batch; the number is for operators, who do not need
+  # it to the millisecond.
+  @watermark_interval_ms 1_000
 
   defp subscribe!(
          application,
@@ -461,6 +480,63 @@ defmodule Scriba.Source.Commanded do
     end
 
     %{state | in_flight: in_flight, committed: committed}
+    |> record_watermark(last_contiguous)
+  end
+
+  # The acknowledged position IS the watermark: ack_contiguous/1 has just
+  # established that everything below it is accounted for. Written outside
+  # the commit transaction, so it can only lag what was applied — see
+  # `Scriba.Watermark` for why that direction is the safe one.
+  defp record_watermark(state, nil), do: state
+  defp record_watermark(%{watermark: nil} = state, _event), do: state
+
+  defp record_watermark(state, event) do
+    position = event.event_number
+    now = System.monotonic_time(:millisecond)
+
+    # Throttled while events are still in flight, immediate once they are
+    # not. Without the second condition a catch-up that finishes inside the
+    # throttle window leaves the last position unwritten, and an idle
+    # projection reports a stale watermark indefinitely — precisely when an
+    # operator is most likely to be reading it.
+    caught_up? = :queue.is_empty(state.in_flight)
+
+    due? =
+      is_nil(state.watermark_written_at) or
+        now - state.watermark_written_at >= @watermark_interval_ms
+
+    if position > state.watermark_written and (due? or caught_up?) do
+      %{repo: repo, projection: projection} = state.watermark
+
+      try do
+        Scriba.Watermark.put(repo, projection, position, event.created_at)
+      rescue
+        # A watermark write is observability, not correctness. Losing one
+        # costs a stale number until the next write; taking the producer down
+        # over it would cost the projection.
+        exception ->
+          Logger.warning(
+            "Scriba could not persist the watermark for " <>
+              "#{projection.name} v#{projection.version}: #{Exception.message(exception)}"
+          )
+      end
+
+      %{state | watermark_written: position, watermark_written_at: now}
+    else
+      state
+    end
+  end
+
+  defp watermark_config(opts) do
+    case Keyword.get(opts, :scriba_watermark) do
+      config when is_list(config) ->
+        repo = Keyword.get(config, :repo)
+        projection = Keyword.get(config, :projection)
+        if repo && projection, do: %{repo: repo, projection: projection}, else: nil
+
+      _ ->
+        nil
+    end
   end
 
   defp drain_contiguous(in_flight, committed, last) do

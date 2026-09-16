@@ -178,8 +178,10 @@ with `version: 2`. Identity-overriding at runtime would silently
 create a different projection, almost always a bug.
 
 `Scriba.info/1` returns a `Scriba.Info` struct with `:name`, `:version`,
-`:status`, `:source`, `:target`, `:safe_position`, `:stream_positions` and
-`:halt_reason` (the cause when `:status` is `:halted`, `nil` otherwise).
+`:status`, `:source`, `:target`, `:safe_position`, `:stream_positions`,
+`:halt_reason` (the cause when `:status` is `:halted`, `nil` otherwise),
+`:watermark` and `:lag_ms` (§8.5; both `nil` until the projection commits
+something, and for sources that report no watermark).
 `:stream_positions` becomes `:truncated` above 1,000 streams. Lag and throughput are NOT in v0.1 — they live in
 telemetry consumers.
 
@@ -521,6 +523,33 @@ write directly to Postgres (inside their Multi) and to the ETS cache.
 Readers (info, telemetry) read from ETS first, fall back to Postgres
 on miss.
 
+### 8.5 The contiguous watermark
+
+Per-stream cursors cannot say where a *projection* is. A minimum across them
+counts only streams that have been written to; a maximum counts work sitting
+above an event still in flight. `scriba_watermarks` holds one row per
+`(name, version)` with the highest position `P` such that every event at or
+below `P` is accounted for — committed, skipped or dead-lettered — with no
+gap beneath it.
+
+The source computes it: `Scriba.Source.Commanded` already derives exactly
+this number to acknowledge safely (§13.1), so persisting it is a write, not a
+second calculation. That write happens **outside** the commit transaction and
+is throttled — roughly one per second while events are in flight, flushed
+immediately once the queue drains, so an idle projection does not sit on a
+stale number.
+
+Consequently the stored watermark can trail what was applied and can never
+run ahead of it. That asymmetry is the whole point: resuming from a stale
+watermark redelivers events that dedup absorbs, while resuming from one that
+ran ahead skips events that never committed. Only one of those is
+recoverable.
+
+The row also carries the `occurred_at` of the event at that position, which
+makes `now() - occurred_at` the projection's lag in time. Event-count lag is
+not obtainable at all: Commanded's adapter behaviour exposes no head
+position (§13.1).
+
 ---
 
 ## 9. Error handling and dead-letter
@@ -773,6 +802,7 @@ scriba/
 │   │   │   ├── ecto.ex
 │   │   │   └── test.ex           # in-memory, for property tests
 │   │   ├── position.ex           # functions over Postgres + ETS, no process
+│   │   ├── watermark.ex          # contiguous global position per projection
 │   │   ├── dead_letter.ex
 │   │   ├── failure.ex            # SQLSTATE → :transient | :integrity | :structural
 │   │   ├── circuit.ex            # per-projection failure state, outlives the producer

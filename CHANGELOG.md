@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`scriba_watermarks`: the contiguous global position a projection has
+  reached**, surfaced as `:watermark` and `:lag_ms` on `Scriba.info/2`. Every
+  event at or below the watermark has been committed, skipped or
+  dead-lettered, with no gap below it — so it is a position a replica could
+  resume from, and the number that says how far a rebuild has got. Per-stream
+  cursors answer neither question: a minimum across them ignores streams the
+  projection never wrote to, a maximum counts work above an event still in
+  flight.
+
+  `:lag_ms` is measured from the event's own `occurred_at`, not from the
+  event store's head — Commanded's adapter behaviour exposes no head
+  position, so event-count lag is not obtainable, and time-lag is what
+  operators alert on anyway.
+
+  The source already computed this number to acknowledge safely (0.1.3); this
+  persists it. Written outside the commit transaction and throttled to about
+  one write a second while events are in flight, flushed immediately once the
+  projection catches up — so it can trail what was applied but never runs
+  ahead of it, which is the only direction that is recoverable.
+
+- **Versioned migrations.** `Scriba.Migrations.up/1` takes `:from` and `:to`,
+  so a schema change ships as a numbered step: version 1 is
+  `scriba_positions` + `scriba_dead_letters`, version 2 adds
+  `scriba_watermarks`. A fresh install still calls `up()`; an existing one
+  adds a migration calling `up(from: 1)`. Scriba tracks no migration state of
+  its own — the version lives in the user's migration file, where Ecto
+  already records what ran.
+
 - **`Scriba.Testing` — run a projection's handlers in a test without a
   pipeline.** `project/3` applies events through the projection's configured
   target and commits them, so a test asserts on read-model rows; `handle/3`

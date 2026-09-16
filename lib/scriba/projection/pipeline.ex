@@ -43,6 +43,15 @@ defmodule Scriba.Projection.Pipeline do
       Scriba.Partitioner.partition(sid, parallelism)
     end
 
+    # What the source needs to persist a watermark: who it is and where to
+    # write. Only a source that computes a contiguous position uses it, and
+    # a source that does not is free to ignore it.
+    source_opts =
+      Keyword.put(source_opts, :scriba_watermark,
+        repo: repo,
+        projection: %{name: name, version: version}
+      )
+
     Broadway.start_link(__MODULE__,
       name: via_tuple(name, version),
       producer: [

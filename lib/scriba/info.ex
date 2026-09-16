@@ -39,6 +39,20 @@ defmodule Scriba.Info do
   replica from it. A real replay point is v0.3 work and needs an uncapped
   `MIN(position)` aggregate against Postgres.
 
+  ## `:watermark` and `:lag_ms` — how far along, and how far behind
+
+  `:watermark` is the contiguous global position: every event up to it has
+  been committed, skipped or dead-lettered, with no gap below. Unlike
+  `:safe_position` it is a number a replica could resume from, and unlike
+  `:stream_positions` it answers for the projection rather than per stream.
+  `:lag_ms` is how long ago the event at that position happened.
+
+  Both are `nil` until the projection has committed something, and both stay
+  `nil` for a source that does not report a watermark — `Scriba.Source.Commanded`
+  does, `Scriba.Test.Source` does not. They are read from `scriba_watermarks`,
+  written outside the commit transaction and throttled, so they trail reality
+  slightly even when everything is healthy. See `Scriba.Watermark`.
+
   ## Truncation
 
   When a projection has more than 1000 distinct streams, `:stream_positions`
@@ -57,7 +71,9 @@ defmodule Scriba.Info do
     :target,
     :safe_position,
     :stream_positions,
-    :halt_reason
+    :halt_reason,
+    :watermark,
+    :lag_ms
   ]
 
   @type t :: %__MODULE__{
@@ -68,6 +84,8 @@ defmodule Scriba.Info do
           target: tuple() | nil,
           safe_position: non_neg_integer(),
           stream_positions: %{String.t() => non_neg_integer()} | :truncated | nil,
-          halt_reason: term() | nil
+          halt_reason: term() | nil,
+          watermark: non_neg_integer() | nil,
+          lag_ms: non_neg_integer() | nil
         }
 end

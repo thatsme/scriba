@@ -321,6 +321,8 @@ defmodule Scriba do
         streams
       end
 
+    watermark = watermark_for(name, version, Map.get(status, :target))
+
     %Info{
       name: name,
       version: version,
@@ -329,7 +331,27 @@ defmodule Scriba do
       target: Map.get(status, :target),
       safe_position: safe,
       stream_positions: stream_positions,
-      halt_reason: Map.get(status, :halt_reason)
+      halt_reason: Map.get(status, :halt_reason),
+      watermark: watermark && watermark.position,
+      lag_ms: lag_ms(watermark)
     }
   end
+
+  # Reading the watermark is a database round-trip, so it is best-effort: a
+  # repo that is momentarily unreachable should not stop info/2 reporting the
+  # status, which is the field an operator is most likely to be asking for.
+  defp watermark_for(name, version, target_spec) do
+    case Scriba.Position.resolve_repo([], target_spec) do
+      nil -> nil
+      repo -> Scriba.Watermark.get(repo, %{name: name, version: version})
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp lag_ms(%{occurred_at: %DateTime{} = occurred_at}) do
+    DateTime.utc_now() |> DateTime.diff(occurred_at, :millisecond) |> max(0)
+  end
+
+  defp lag_ms(_), do: nil
 end
