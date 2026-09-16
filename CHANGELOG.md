@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`REBUILDING.md` and `Scriba.reset/2`.** Rebuilding a read model is a
+  procedure, not a function: declare the same `name` with a new `version`,
+  start it from `:origin` with its own subscription name, watch `:lag_ms`
+  fall, point reads at the new table, then retire the old version.
+  `reset/2` is the last step — it clears a version's cursors and watermark
+  (and dead letters on request) so it can start over, refuses while the
+  projection is running, and does not touch the read model, which Scriba
+  does not know the shape of.
+
+  The guide is explicit about what will bite: handler side effects replay
+  over the whole history, and dead letters are not replayed — a rebuild
+  that ends with the same error kinds fixed nothing. It also records what
+  Scriba will not do: shadow targets and an atomic swap, which are the
+  application's decision, and progress as a percentage, which the source
+  cannot supply because Commanded exposes no head position.
+
 - **Dead-letter inspection**: `Scriba.dead_letters/2` lists rows with
   filters, paging and ordering; `Scriba.dead_letter_stats/2` summarises how
   many, of what kind, over what span. `Scriba.DeadLetter.list/3`, `count/3`

@@ -204,10 +204,17 @@ test-time only, additive, and free to grow. It runs handlers and commits
 through the configured target without a pipeline, and deliberately does not
 reimplement the pipeline's retry, dead-letter or dedup decisions.
 
-There is no `rebuild`, `swap!` or `reset` function. Rebuilding is not a
-library operation in v0.1: a new `version` running side-by-side (§5) is
-the mechanism, and cutting over is the application's choice of which
-read model to query.
+There is no `rebuild` or `swap!` function, and there will not be.
+Rebuilding is a procedure over the `(name, version)` mechanism (§5),
+documented in `REBUILDING.md`: a new version runs side by side, and cutting
+over is the application's choice of which read model to query — it is the
+only party that knows when that is safe.
+
+`Scriba.reset/2` is the one piece that needed code. It clears a version's
+cursors and watermark so it can start over, refuses while the projection is
+running (clearing cursors under a live pipeline lets it commit against a
+cache that no longer matches the table), and leaves the read model alone
+because Scriba does not know which tables a handler writes.
 
 ---
 

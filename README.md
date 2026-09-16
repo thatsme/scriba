@@ -666,6 +666,10 @@ Migrations run in `test_helper.exs` against an existing connection.
   `commanded_ecto_projections`: `project/2` → `handle/2`, `Ecto.Multi`
   differences, and how to carry your existing cursor across so you
   cut over in place instead of rebuilding read models.
+- [`REBUILDING.md`](REBUILDING.md) — rebuilding a read model from history:
+  the `(name, version)` side-by-side procedure, watching progress, cutting
+  over, and the two things that bite (side effects replay; dead letters are
+  not replayed).
 - [`SCRIBA_ARCHITECTURE.md`](SCRIBA_ARCHITECTURE.md) — the
   architectural contract. Read this before opening a PR that
   changes engine behavior.

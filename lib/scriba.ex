@@ -322,7 +322,19 @@ defmodule Scriba do
   shutdown to complete before returning.
 
   Returns `:ok` on success, `{:error, {:invalid_state, state}}` if the
-  projection is `:initializing`, `:stopped`, or `:draining`.
+  projection is `:initializing`, `:stopped`, or `:draining`. A projection
+  that is still starting cannot be stopped — wait for `info/1` to report
+  `:running`.
+
+  The projection is **not removed**: its Coordinator stays registered in a
+  terminal `:stopped` state, so `info/1` keeps answering and `reset/2` can
+  still clear its cursors. Starting the same `(name, version)` again fails
+  with `{:error, :already_started}` until the supervision child is removed:
+
+      DynamicSupervisor.terminate_child(Scriba.Projections.Supervisor, pid)
+
+  Keeping the row is deliberate — a stopped projection that vanished from
+  `list/0` would be indistinguishable from one that never started.
   """
   @spec stop(module() | String.t()) :: :ok | {:error, {:invalid_state, atom()}}
   def stop(module_or_name)
@@ -339,6 +351,95 @@ defmodule Scriba do
           :ok | {:error, {:invalid_state, atom()}}
   def stop(name, version) when is_binary(name) and is_integer(version),
     do: Coordinator.stop(name, version)
+
+  @doc """
+  Clears a projection version's progress so it can start over.
+
+  Deletes its rows from `scriba_positions` and `scriba_watermarks` and drops
+  its entries from the position cache. After this the version has no memory
+  of what it applied, so starting it with `start_from: :origin` rebuilds from
+  the beginning.
+
+  **It does not touch the read model.** Scriba does not know which tables a
+  handler writes — that is the handler's business — so truncating them is
+  yours to do, in the same operation, or the rebuild will apply history on
+  top of existing rows.
+
+  Dead letters are kept by default: they record what failed on the previous
+  attempt and are usually the reason for the rebuild. `dead_letters: true`
+  deletes them too.
+
+  Accepts a projection that is stopped or was never started, and refuses
+  anything else: clearing cursors under a live pipeline lets it commit
+  against a cache that no longer matches the table. `stop/1` leaves the
+  Coordinator registered in `:stopped`, and that counts as stopped.
+
+      :ok = Scriba.stop(MyApp.Projections.OrdersV2)
+      {:ok, %{positions: 1_284, watermark: 1}} = Scriba.reset(MyApp.Projections.OrdersV2)
+
+  Returns the number of rows removed per table.
+  """
+  @spec reset(module() | String.t(), keyword()) ::
+          {:ok, map()} | {:error, {:running, atom()}} | {:error, :no_repo}
+  def reset(module_or_name, opts \\ [])
+
+  def reset(module, opts) when is_atom(module) and module not in [nil, true, false] do
+    config = load_config!(module)
+    repo = Keyword.get(opts, :repo) || Scriba.Position.resolve_repo([], config.target)
+
+    do_reset(config.name, config.version, repo, opts)
+  end
+
+  def reset(name, opts) when is_binary(name) do
+    do_reset(name, Keyword.get(opts, :version, 1), Keyword.get(opts, :repo), opts)
+  end
+
+  defp do_reset(_name, _version, nil, _opts), do: {:error, :no_repo}
+
+  defp do_reset(name, version, repo, opts) do
+    # `stop/1` leaves the Coordinator alive in a terminal `:stopped` state,
+    # still registered, so "not found" is not the only way to be stopped —
+    # and refusing to reset a stopped projection would refuse the normal
+    # case. Anything else still has a live pipeline that could commit
+    # against the cache this is about to clear.
+    case Coordinator.get_status(name, version) do
+      {:ok, %{state: :stopped}} ->
+        do_reset_rows(name, version, repo, opts)
+
+      {:ok, status} ->
+        {:error, {:running, Map.get(status, :state)}}
+
+      {:error, :not_found} ->
+        do_reset_rows(name, version, repo, opts)
+    end
+  end
+
+  defp do_reset_rows(name, version, repo, opts) do
+    positions = delete_where(repo, "scriba_positions", name, version)
+    watermark = delete_where(repo, "scriba_watermarks", name, version)
+
+    dead_letters =
+      if Keyword.get(opts, :dead_letters, false) do
+        delete_where(repo, "scriba_dead_letters", name, version)
+      else
+        0
+      end
+
+    Scriba.Position.drop_cache(name, version)
+
+    {:ok, %{positions: positions, watermark: watermark, dead_letters: dead_letters}}
+  end
+
+  defp delete_where(repo, table, name, version) do
+    %{num_rows: rows} =
+      Ecto.Adapters.SQL.query!(
+        repo,
+        "DELETE FROM #{table} WHERE projection_name = $1 AND projection_version = $2",
+        [name, version]
+      )
+
+    rows
+  end
 
   ## Internals
 

@@ -80,7 +80,7 @@ defmodule Scriba.MixProject do
         "Migration guide" => "#{@source_url}/blob/v#{@version}/MIGRATION.md"
       },
       files:
-        ~w(lib mix.exs README.md MIGRATION.md SCRIBA_ARCHITECTURE.md CHANGELOG.md LICENSE .formatter.exs)
+        ~w(lib mix.exs README.md MIGRATION.md REBUILDING.md SCRIBA_ARCHITECTURE.md CHANGELOG.md LICENSE .formatter.exs)
     ]
   end
 
@@ -94,11 +94,12 @@ defmodule Scriba.MixProject do
       extras: [
         "README.md",
         "MIGRATION.md",
+        "REBUILDING.md",
         "SCRIBA_ARCHITECTURE.md",
         "CHANGELOG.md"
       ],
       groups_for_extras: [
-        Guides: ["MIGRATION.md", "SCRIBA_ARCHITECTURE.md"]
+        Guides: ["MIGRATION.md", "REBUILDING.md", "SCRIBA_ARCHITECTURE.md"]
       ],
       # Internal modules carry @moduledoc false, so ExDoc cannot link to them
       # and warns on every mention. They are named on purpose — the
