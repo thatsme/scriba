@@ -65,7 +65,11 @@ defmodule Mix.Tasks.Bench.Throughput do
 
     source =
       {Scriba.Source.Commanded,
-       [application: ScribaBench.CommandedApp, subscription_name: subscription, start_from: :origin] ++
+       [
+         application: ScribaBench.CommandedApp,
+         subscription_name: subscription,
+         start_from: :origin
+       ] ++
          source_opts}
 
     IO.puts("""
