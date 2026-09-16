@@ -132,7 +132,7 @@ defmodule Scriba.Projection.PipelineTest do
     @tag :integration
     test "Scriba.Partitioner.partition/2 is on the Pipeline's runtime path" do
       # Arm BEAM call-count tracing on the partitioner. This is a structural
-      # guarantee against the dead-code finding from the diagnostic phase
+      # guarantee against a dead-code regression
       # (Pipeline used to bypass this module via inline `:erlang.phash2`).
       # If anyone ever reverts the wiring in pipeline.ex, this test fails
       # loudly instead of the partitioner module silently going dead.
@@ -307,8 +307,7 @@ defmodule Scriba.Projection.PipelineTest do
       ExUnit.CaptureLog.capture_log(fn ->
         start_supervised!({ProjSup, opts})
 
-        assert_receive {^ref, [:scriba, :projection, :event, :exception], measurements,
-                        metadata},
+        assert_receive {^ref, [:scriba, :projection, :event, :exception], measurements, metadata},
                        2_000
 
         # Measurements: duration + monotonic_time (span shape).
@@ -814,11 +813,14 @@ defmodule Scriba.Projection.PipelineTest do
       # Queryable, not just edge-triggered. Telemetry fires once, at the
       # instant of the halt; an operator who was not subscribed then would
       # otherwise see :running for a projection that will never move again.
-      eventually(fn ->
-        {:ok, info} = Scriba.info(name, 1)
-        assert info.status == :halted
-        assert %Postgrex.Error{postgres: %{pg_code: "42703"}} = info.halt_reason
-      end, 2_000)
+      eventually(
+        fn ->
+          {:ok, info} = Scriba.info(name, 1)
+          assert info.status == :halted
+          assert %Postgrex.Error{postgres: %{pg_code: "42703"}} = info.halt_reason
+        end,
+        2_000
+      )
 
       # Nothing discarded: no dead letters, no cursor movement.
       assert Scriba.Target.Test.dead_letters(agent) == []

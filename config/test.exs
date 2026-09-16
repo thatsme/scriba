@@ -54,7 +54,8 @@ if File.exists?(env_local_path) do
   end)
 end
 
-required = ~w(SCRIBA_TEST_DB_HOST SCRIBA_TEST_DB_PORT SCRIBA_TEST_DB_NAME SCRIBA_TEST_DB_USER SCRIBA_TEST_DB_PASS)
+required =
+  ~w(SCRIBA_TEST_DB_HOST SCRIBA_TEST_DB_PORT SCRIBA_TEST_DB_NAME SCRIBA_TEST_DB_USER SCRIBA_TEST_DB_PASS)
 
 values = Enum.map(required, fn var -> {var, System.get_env(var)} end)
 present = Enum.filter(values, fn {_, v} -> v not in [nil, ""] end)

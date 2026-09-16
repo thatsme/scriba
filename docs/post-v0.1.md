@@ -7,9 +7,9 @@ the design research isn't lost when these become priorities.
 
 ## PD1 — exactly-once under crash (chaos-engineering property test)
 
-**Status:** deferred from Phase B item 3.3.
+**Status:** deferred from v0.1.
 
-v0.1 ships PD2 + PD3 + the Phase A item 4 integration test. Together
+v0.1 ships PD2 + PD3 + the fast-suite dedup integration test. Together
 with the read-model `event_id` PK rejecting duplicates pre-commit, those
 **structurally enforce** exactly-once-under-crash by composition:
 
@@ -19,7 +19,7 @@ with the read-model `event_id` PK rejecting duplicates pre-commit, those
 | `Scriba.Target.Ecto` Multi atomicity | Read-model write + per-stream cursor upsert commit together or roll back together |
 | PD2 (real-Postgres, 200 iterations) | Cursor never lags behind a committed read-model row |
 | PD3 (real-Postgres, 100 iterations) | Source `:start_from` filter blocks events ≤ committed cursor |
-| Phase A item 4 fast-suite integration test | Pipeline-side dedup catches redelivered events whose position ≤ cache cursor |
+| Fast-suite dedup integration test (`test/scriba/projection/pipeline_test.exs`) | Pipeline-side dedup catches redelivered events whose position ≤ cache cursor |
 
 PD1 would be a regression test for that composition under crash
 injection. It exists in design but isn't load-bearing for v0.1 — the
@@ -70,8 +70,8 @@ Include all three with uniform random selection per crash point.
 
 #### Cursor persistence across Pipeline kill
 
-Phase B item 2 deliberately scoped: "cursor lives in source process;
-dies with source." Pipeline kill = source kill. New source has
+The Test source is deliberately scoped: the cursor lives in the source
+process and dies with it. Pipeline kill = source kill. New source has
 `:start_from: 0` unless we explicitly pass the cursor.
 
 For PD1 to test exactly-once meaningfully, the post-crash source must
@@ -79,7 +79,7 @@ resume from the acked cursor, not from zero — otherwise we're testing
 dedup-via-replay (the P3-theater pattern). Solution: **test-owned
 external Agent persists the cursor**. The source's start spec consults
 the Agent on init; the source's ack callback updates the Agent. Test
-infrastructure only; doesn't violate Phase B item 2's contract because
+infrastructure only; doesn't violate that scoping because
 the *source's own internal cursor* still dies on crash — we're just
 feeding it back from a test-side Agent on restart.
 
@@ -133,7 +133,7 @@ Building PD1 is hours of work:
 - 100 iterations of debugging timing-sensitive races
 
 The test exercises composition, not novel correctness — it would catch
-a regression where one of PD2 / PD3 / Phase A item 4 / the PK constraint
+a regression where one of PD2 / PD3 / the dedup test / the PK constraint
 silently degraded such that they no longer compose to exactly-once.
 That's a real risk over time, but it's a chaos-engineering risk
 (gradual drift), not a correctness risk for v0.1 ship.

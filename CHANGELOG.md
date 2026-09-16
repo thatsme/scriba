@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-16
+
+### Added
+
+- **`:buffer_size`, `:concurrency_limit` and `:partition_by` are forwarded to
+  the event store subscription.** `Scriba.Source.Commanded` previously
+  subscribed with no options at all, so the adapter's defaults always applied.
+  `EventStore`'s default is one in-flight event per subscriber, and that — not
+  `:parallelism` — is what bounds catch-up: Scriba acknowledges after the batch
+  commits, so a batcher holding a single event waits out its full
+  `:batch_timeout` before acking and releasing the next.
+
+  Measured against a real EventStore, 5,000 events over 100 streams: 9.1
+  events/sec at the adapter default, 2,448 events/sec with `buffer_size: 500`.
+
+  Scriba sets no default of its own — the adapter's still applies unless
+  configured, so this changes nothing for an existing projection until it opts
+  in. Raising the buffer trades memory and redelivered-work-after-a-crash for
+  throughput.
+
+      source: {Scriba.Source.Commanded,
+               application: MyApp.CommandedApp,
+               buffer_size: 500}
+
+### Fixed
+
+- **Acknowledgement now comes from the process that holds the subscription.**
+  Against `commanded_eventstore_adapter` — or any adapter that identifies the
+  acking subscriber by `self()` — every acknowledgement Scriba issued was
+  silently discarded. The subscription never advanced, and the projection
+  stalled permanently once the event store's in-flight buffer filled. Measured
+  against a real EventStore: one event projected, then nothing, with status
+  still `:running`, no error, no log line.
+
+  `ack/3` is a Broadway acknowledger, so it runs in a batch-processor process
+  rather than the producer that subscribed. It called `ack_event/3` from
+  there. `Commanded.EventStore.Adapters.InMemory` takes the subscription as an
+  argument and ignores the caller, so acks worked; `EventStore` resolves the
+  subscriber from `self()` and its subscription FSM drops acks from any pid it
+  does not recognise. The engine was correct only against the adapter it was
+  tested with.
+
+  The batch processor now hands its acknowledgements to the producer, which
+  issues them in delivery order. Both adapters see an ack from a pid they
+  recognise. No public API, configuration, schema or telemetry change.
+
+  Anyone running Scriba against a persistent event store should upgrade: on
+  0.1.0 and 0.1.1 the projection stops after the first batch and does not
+  report that it has.
+
 ## [0.1.1] - 2026-07-30
 
 ### Fixed

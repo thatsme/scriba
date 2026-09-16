@@ -6,7 +6,7 @@ defmodule Scriba.PropertyDb.Pd2PositionConsistencyTest do
   processes all events: every row in the read model has a corresponding
   `scriba_positions` row whose cursor is ≥ that event's position.
 
-  The Multi atomicity in `Scriba.Target.Ecto.apply_batch/5` is what
+  The Multi atomicity in `Scriba.Target.Ecto.apply_batch/6` is what
   guarantees this — if the read-model insert and the per-stream cursor
   upsert both commit, they commit together; if either fails, both roll
   back. PD2 exercises 200 random event streams against a real Postgres

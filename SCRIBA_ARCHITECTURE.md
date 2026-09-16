@@ -48,7 +48,11 @@ goes wrong."*
 - Online rebuild, shadow targets, swap (v0.3)
 - Adapters other than Commanded source + Ecto target (v0.4)
 - Multi-target fan-out (v0.4)
-- Backpressure tuning knobs beyond Broadway defaults (v0.5)
+- Backpressure tuning knobs beyond Broadway defaults (v0.5). Note: since
+  0.1.2 the source forwards `:buffer_size`, `:concurrency_limit` and
+  `:partition_by` to the event store subscription. That is pass-through to
+  the adapter, not a knob Scriba implements, and it was added because the
+  adapter default bounds catch-up at roughly 10 events/sec.
 
 ---
 
@@ -182,8 +186,10 @@ telemetry consumers.
 currently registered in `Scriba.Registry`, including those in
 `:stopped` state.
 
-`Scriba.rebuild/2`, `Scriba.swap!/1`, `Scriba.reset/1` are stubs that
-raise `Scriba.NotImplementedError` in v0.1. Document that explicitly.
+There is no `rebuild`, `swap!` or `reset` function. Rebuilding is not a
+library operation in v0.1: a new `version` running side-by-side (§5) is
+the mechanism, and cutting over is the application's choice of which
+read model to query.
 
 ---
 
@@ -216,6 +222,12 @@ Scriba.Application
                 └── Scriba.Projection.Pipeline (Broadway)
 ```
 
+The top-level supervisor also creates two shared ETS tables before
+starting any child: the position cache (§8.3) and `Scriba.Circuit`'s
+per-projection failure state, which must outlive a producer that dies
+deliberately on commit failure (§9). Both are owned by the supervisor
+process and live for the application's lifetime.
+
 ### 6.1 Why these choices
 
 - **`Registry` with unique keys.** Lookup of coordinator pid by
@@ -229,13 +241,13 @@ Scriba.Application
   internal lifecycle state is intact.
 - **`gen_statem` for the Coordinator** with `:handle_event_function`
   callback mode. Lifecycle is genuinely a state machine:
-  `:idle → :running → :paused → :draining → :stopped`. State-entry
-  hooks via `enter` events keep pipeline start/stop logic clean.
-  See §7.
+  `:initializing → :running → :paused → :draining → :stopped`, plus the
+  terminal `:halted`. State-entry hooks via `enter` events keep pipeline
+  start/stop logic clean. See §7.
 - **No singleton `Scriba.PositionStore` GenServer.** Position lives in
-  Postgres (authoritative) with an ETS cache per projection. See §8.
-  The original design's PositionStore process is removed — it was a
-  bottleneck.
+  Postgres (authoritative) with one shared ETS cache keyed by
+  `{name, version, stream_id}`. See §8. A mediating process would be a
+  bottleneck on the commit path.
 
 ### 6.2 Process registration
 
@@ -244,9 +256,10 @@ Broadway pipelines register as `{:via, Registry, {Scriba.Registry, {:pipeline, n
 
 ### 6.3 Telemetry event surface (v0.1)
 
-Four events fire from `Scriba.Projection.Pipeline`. Lag and throughput
-events are explicitly v0.2 (see §2) — do not add them here without
-amending that section.
+Twelve events fire. `Scriba.Telemetry`'s moduledoc is the catalog users
+read; this table is the same surface, and the two are kept in step. Lag
+and throughput events are explicitly out of scope (see §2) — do not add
+them here without amending that section.
 
 | Event | Emitter | Measurements | Metadata |
 | --- | --- | --- | --- |
@@ -258,6 +271,10 @@ amending that section.
 | `[:scriba, :projection, :started]` | `Scriba.Projection.Coordinator` (first `:initializing → :running`, fires once per Coordinator-process lifetime; Pipeline DOWN→re-running does NOT re-fire) | `system_time` | `projection` |
 | `[:scriba, :projection, :paused]` | `Scriba.Projection.Coordinator` (on `:running → :paused`, after source pause signal sent) | `system_time` | `projection` |
 | `[:scriba, :projection, :resumed]` | `Scriba.Projection.Coordinator` (on `:paused → :running`, after source resume signal sent) | `system_time` | `projection` |
+| `[:scriba, :projection, :event, :skipped]` | `handle_message/3` (no handler ran) | `system_time` | `projection`, `reason` (`:dedup` or `:handler`), `event_type`, `stream_id`, `position` |
+| `[:scriba, :projection, :cache_initialized]` | `Scriba.Position.init_cache/3` | `wiped_count`, `preloaded_count` | `name`, `version`, `source` |
+| `[:scriba, :source, :batch, :failed]` | the source's acknowledger (a batch did not commit; nothing was acknowledged) | `count` | `subscription`, `reason` |
+| `[:scriba, :projection, :halted]` | `halt_batch/3`, from `handle_batch/4` (structural commit failure; the projection has stopped making progress) | `system_time` | `projection`, `reason`, `failure` (SQLSTATE label) |
 
 Conventions:
 
@@ -266,23 +283,25 @@ Conventions:
 - The exception event uses Erlang's span shape — `kind` / `reason` /
   `stacktrace` in **metadata**, not measurements. `:telemetry.span/3`
   re-raises after emission, so Broadway still observes the failure and
-  marks the message. Phase C items 2 (retry) and 3 (dead-letter) will
-  wrap **outside** this span to intercept before Broadway's default
-  failure path.
-- Source-side dedup (§9.x) returns `:skip` **without**
-  emitting per-event telemetry — there was no handler call to measure.
-  A separate `[:scriba, :projection, :event, :skipped]` event can be
-  added if dedup visibility becomes operationally interesting.
+  marks the message. Retry and dead-letter routing wrap **outside** this
+  span, intercepting before Broadway's default failure path.
+- Neither dedup nor a `:skip` handler return emits the per-event span —
+  there was no handler call to measure. Both emit
+  `[:scriba, :projection, :event, :skipped]` instead, distinguished by
+  `reason` (`:dedup` or `:handler`). Skip is the only outcome that leaves
+  no other trace, so without this event the conservation identity
+  `delivered == rows + dead letters + skipped` cannot be closed.
 - Batch `:stop` is emitted only on the success branch (Multi committed).
-  Batch-failure observability is a hypothetical
-  `[:scriba, :projection, :batch, :exception]` event, not implemented
-  in v0.1. `batch_size` counts messages Broadway saw, including those
-  whose handler returned `:skip` — they consumed pipeline capacity.
-
-One additional event predates Phase C: `[:scriba, :projection, :cache_initialized]`
-fires from `Scriba.Position.init_cache/3` with measurements
-`%{wiped_count, preloaded_count}` and metadata `%{name, version, source}`
-where `source` is `:postgres` or `:empty`.
+  There is no batch-failure counterpart: failure is observable through
+  `[:scriba, :source, :batch, :failed]` and `[:scriba, :projection, :halted]`,
+  which say different things (§9). `batch_size` counts messages Broadway
+  saw, including those whose handler returned `:skip` — they consumed
+  pipeline capacity.
+- Two events come from outside the Pipeline and Coordinator:
+  `[:scriba, :projection, :cache_initialized]` fires from
+  `Scriba.Position.init_cache/3` (`source` is `:postgres` or `:empty`), and
+  `[:scriba, :source, :batch, :failed]` fires from the source's
+  acknowledger, because that is where the consequence lands.
 
 ---
 
@@ -304,6 +323,10 @@ where `source` is `:postgres` or `:empty`.
   alive; position frozen modulo in-flight settle.
 - `:draining` — pipeline received stop signal, finishing in-flight batch
 - `:stopped` — terminal; supervisor will not restart
+- `:halted` — terminal. A batch failed with a structural error (§9), which
+  neither replay nor dead-lettering can resolve. The Pipeline tree stays
+  alive but nothing is acknowledged and no cursor moves. The state carries
+  the cause, which `Scriba.info/2` exposes as `:halt_reason`.
 
 ### 7.2 Transitions
 
@@ -314,11 +337,17 @@ where `source` is `:postgres` or `:empty`.
 :running      -- stop                 --> :draining --> :stopped
 :paused       -- stop                 --> :stopped     (direct terminate)
 :running      -- Pipeline DOWN        --> :initializing (rest_for_one respawn)
+:running      -- structural failure   --> :halted       (terminal)
+:halted       -- stop                 --> :stopped
 any           -- crash                --> (supervisor restarts to :initializing, then auto-:running)
 ```
 
-`:running → :paused` is a **held-demand** transition (Phase C item 4),
-not stop-and-restart. The Coordinator calls `Source.pause/1` on the
+`pause` and `resume` are rejected from `:halted` with
+`{:error, {:invalid_state, :halted}}`. `stop` is the way out, once the
+schema or permission that caused the halt has been fixed.
+
+`:running → :paused` is a **held-demand** transition, not
+stop-and-restart. The Coordinator calls `Source.pause/1` on the
 Broadway producer pid — the source flips a `paused: true` flag in its
 GenStage state and accumulates demand without dispatching. The Pipeline
 tree (processors, batchers, target state) stays alive. Resume reverses
@@ -394,11 +423,17 @@ shorter and matches how Broadway emits its own periodic events.
 CREATE TABLE scriba_positions (
   projection_name varchar(255) NOT NULL,
   projection_version int NOT NULL,
+  stream_id varchar(255) NOT NULL,
   position bigint NOT NULL,
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (projection_name, projection_version)
+  updated_at timestamptz NOT NULL,
+  PRIMARY KEY (projection_name, projection_version, stream_id)
 );
 ```
+
+The cursor is **per stream**, not per projection: per-stream ordering is
+the guarantee (§3), so each stream carries its own position and a slow
+stream never holds back a fast one. A secondary index on
+`(projection_name, projection_version)` serves the whole-projection reads.
 
 The Ecto migration is provided by `Scriba.Migrations.up/0` and
 `down/0`. Users invoke it from their own migration file.
@@ -409,10 +444,26 @@ Every event commit looks like:
 
 ```elixir
 Multi.new()
-|> apply_handler_result(handler_return)            # user's intent
-|> Multi.update_all(:scriba_position, position_query, set: [position: new_pos])
+|> apply_handler_results(handler_returns)          # user's intent, one step per event
+|> Scriba.Position.multi(...)                      # one {:scriba_position, stream_id} step per stream
 |> Repo.transaction()
 ```
+
+Each cursor step is an upsert, not an update, and the new value is
+`GREATEST(existing, incoming)`:
+
+```sql
+INSERT INTO scriba_positions
+  (projection_name, projection_version, stream_id, position, updated_at)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (projection_name, projection_version, stream_id)
+DO UPDATE SET position = GREATEST(scriba_positions.position, EXCLUDED.position),
+              updated_at = EXCLUDED.updated_at
+```
+
+Monotonicity is enforced by the database rather than by the pipeline, so a
+redelivered older event cannot move a cursor backwards no matter what order
+batches commit in.
 
 If the transaction fails, neither the read-model write nor the
 position update is applied. The event is retried (via Broadway
@@ -420,10 +471,16 @@ re-delivery) or routed to dead-letter after N failures.
 
 ### 8.3 ETS cache layer
 
-One ETS table per projection, created when the Coordinator enters `:running`:
+**One shared table for the whole BEAM**, named `Scriba.Position.Cache` and
+created by the top-level supervisor, which owns it for the application's
+lifetime. Shared rather than per-projection because a per-projection table
+needs a per-projection atom, and atoms are never garbage-collected — a
+system that starts and stops projections dynamically would leak them.
+Rows are keyed by `{name, version, stream_id}`, so projections do not see
+each other's entries.
 
 ```elixir
-:ets.new(table_name, [
+:ets.new(Scriba.Position.Cache, [
   :set, :public, :named_table,
   {:write_concurrency, true},
   {:read_concurrency, true},
@@ -432,9 +489,13 @@ One ETS table per projection, created when the Coordinator enters `:running`:
 ```
 
 Workers update the cache after a successful commit. The cache is **not
-authoritative** — it is a hot-read optimization for `Scriba.info/1`
-and (in v0.2) the lag calculator. On Coordinator restart, the cache is
-rebuilt from Postgres in the `:idle → :running` transition.
+authoritative** — it is a hot-read optimization for `Scriba.info/2` and for
+source-side dedup. `Scriba.Position.init_cache/3` wipes and preloads one
+projection's entries once per Coordinator-process lifetime, from the
+Coordinator's `init/1`, so that pause → resume preserves the cache that
+dedup depends on while a Coordinator crash rebuilds it from Postgres.
+The preload is capped at 10,000 rows; streams beyond the cap fall back to
+a lazy read on first use.
 
 ### 8.4 No PositionStore process
 
@@ -447,13 +508,33 @@ on miss.
 
 ## 9. Error handling and dead-letter
 
-A handler can fail three ways:
+A commit can fail three ways, and they do **not** share a response:
 
-1. Returns `{:error, reason}` — explicit
-2. Raises — implicit, caught and converted to `{:error, exception}`
-3. The Multi transaction fails — DB-level error
+1. The handler returns `{:error, reason}` — explicit. Retried per §9.1,
+   then dead-lettered.
+2. The handler raises — caught, converted to `{:error, exception}`, and
+   treated as case 1.
+3. The Multi transaction fails — a database-level error affecting the whole
+   batch. Never dead-lettered on the strength of the batch failure alone:
+   `Scriba.Failure` classifies the SQLSTATE and the engine picks a response
+   that terminates —
 
-All three route to a dead-letter table:
+   - `:transient` (classes 08, 53, 57, serialization failures, deadlocks) —
+     nothing is acknowledged, the producer dies, the subscription rewinds and
+     the batch is replayed with backoff.
+   - `:integrity` (classes 22 and 23, constraint errors, invalid changesets)
+     — deterministic and specific to one event, so the batch is retried
+     per-event and the offending events are dead-lettered while the rest
+     commit.
+   - `:structural` (class 42 and anything unrecognised) — schema or
+     permissions do not match the code, which no replay can fix. The
+     projection halts (§7.1) and stays loud.
+
+Guessing from "did some events succeed?" is what this replaces: partial
+success measures uniformity, not determinism, and it is wrong in both
+directions.
+
+Dead-lettered events are written to:
 
 ```sql
 CREATE TABLE scriba_dead_letters (
@@ -534,41 +615,56 @@ operators can alert on it.
 
 ---
 
-## 10. Property tests (mandatory for v0.1)
+## 10. Property tests
 
-Use `StreamData`. These three properties are non-negotiable.
+All use `StreamData`. P1 is DB-free and always runs; the rest need a live
+Postgres and are excluded when `SCRIBA_TEST_DB_*` is unset.
 
 ### 10.1 P1 — Per-stream ordering
 
+`test/property/ordering_test.exs`, 1,000 runs, no database.
+
 For any stream S, the sequence of events delivered to `handle/2` is a
-prefix of the source order for S.
+prefix of the source order for S. Generator: events with monotonic
+per-stream sequence numbers, multiple streams interleaved. Assertion:
+handler-observed sequence numbers are monotonic per stream.
 
-Generator: lists of events with monotonic per-stream sequence numbers,
-multiple streams interleaved.
-Assertion: handler-observed sequence numbers are monotonic per stream.
+### 10.2 PD2 — Position consistency
 
-### 10.2 P2 — Position monotonicity
+`test/property_db/pd2_position_consistency_test.exs`, 200 runs, real Postgres.
 
-Across the whole projection, the committed position in Postgres is
-monotonically non-decreasing across all observed states.
+Every read-model row has a `scriba_positions` row whose cursor is ≥ that
+event's position — the read model can never drift ahead of the cursor. This
+is what the Multi atomicity of §8.2 buys, asserted against a real database
+rather than a double.
 
-Generator: arbitrary event streams.
-Assertion: `Scriba.info/1` position never goes backward across reads,
-including across simulated worker crashes.
+### 10.3 PD3 — Cursor resume
 
-### 10.3 P3 — Effectively-once under crash
+`test/property_db/pd3_cursor_resume_test.exs`, 100 runs, real Postgres.
 
-For each event, the handler's effect appears in the target exactly
-once after recovery from arbitrary crash schedules.
+Two phases per iteration: run a projection to completion, then start a new
+one with the same `(name, version)` and `:start_from` set to the committed
+cursor. Source-side filtering must drop every event at or below it, so the
+read model and `scriba_positions` are untouched by the second start. This is
+the resume-after-restart guarantee.
 
-Generator: `(events, crash_schedule)` pairs where `crash_schedule`
-injects `Process.exit/2` at random points in the pipeline.
-Test target: in-memory `Scriba.Target.Test` that records every
-`{event_id, position}` it commits.
-Assertion: deduped recorded list equals input event list.
+### 10.4 Supporting real-Postgres tests
 
-If P3 fails, do not ship. Everything else is negotiable; this one is the
-property that justifies Scriba's existence.
+- `e3_fault_injection_test.exs` — induces real Postgres failures (constraint
+  violation, missing column) and asserts the whole path: error → classifier →
+  pipeline response → dead-letter row or halt, with the conservation identity
+  `events in == read-model rows + dead letters + skipped` held throughout.
+- `multi_key_collision_test.exs` — a batch merged into one `Ecto.Multi`
+  collides on duplicate step keys where the per-event transactions of
+  `commanded_ecto_projections` did not.
+- `sandbox_harness_test.exs` — foundation test for the shared-mode Ecto
+  sandbox the others depend on.
+
+Effectively-once under injected crash schedules is **not** covered by a
+property test. The guarantee is enforced structurally — read-model primary
+key, Multi atomicity, PD2, PD3, and pipeline-side dedup — and the crash
+injection that would re-verify their composition is designed but deferred
+(`docs/post-v0.1.md`).
 
 ---
 
@@ -599,7 +695,9 @@ Notes:
   module guards with `Code.ensure_loaded?/1`.
 - No `:gen_state_machine`. Use Erlang's built-in `:gen_statem`
   directly. One less dep.
-- No metrics library. Telemetry events only. v0.2 adds `telemetry_metrics`.
+- No metrics library. Telemetry events only — attaching them to
+  `telemetry_metrics` or anything else is the consumer's choice, not a
+  dependency Scriba imposes.
 
 ---
 
@@ -614,11 +712,12 @@ scriba/
 ├── README.md
 ├── mix.exs
 ├── lib/
-│   ├── scriba.ex                 # public API: start_projection, pause, resume, info, list
+│   ├── scriba.ex                 # public API: start_projection, pause, resume, stop, info, list
 │   ├── scriba/
 │   │   ├── application.ex
 │   │   ├── supervisor.ex
 │   │   ├── registry.ex
+│   │   ├── event.ex              # %Scriba.Event{} — the engine's event shape
 │   │   ├── projection.ex         # the __using__ macro + behaviour
 │   │   ├── projections/
 │   │   │   └── supervisor.ex     # DynamicSupervisor
@@ -635,31 +734,31 @@ scriba/
 │   │   │   └── test.ex           # in-memory, for property tests
 │   │   ├── position.ex           # functions over Postgres + ETS, no process
 │   │   ├── dead_letter.ex
+│   │   ├── failure.ex            # SQLSTATE → :transient | :integrity | :structural
+│   │   ├── circuit.ex            # per-projection failure state, outlives the producer
+│   │   ├── info.ex               # %Scriba.Info{} — what Scriba.info/2 returns
 │   │   ├── partitioner.ex        # consistent hash logic
 │   │   ├── telemetry.ex          # event-catalog moduledoc; no runtime code
-│   │   ├── telemetry/
-│   │   │   └── handler.ex        # default-handler slot (no-op in v0.1)
 │   │   ├── migrations.ex         # up/0, down/0 for users to call
-│   │   └── errors.ex             # Scriba.NotImplementedError, etc.
+│   │   └── errors.ex             # Scriba.BatchCommitError
 └── test/
     ├── test_helper.exs
-    ├── support/
-    │   ├── repo.ex
-    │   ├── test_events.ex
-    │   └── test_projection.ex
-    ├── scriba/
-    │   ├── projection_test.exs
-    │   ├── coordinator_test.exs
-    │   ├── partitioner_test.exs
-    │   ├── source/
-    │   │   └── commanded_test.exs
-    │   └── target/
-    │       └── ecto_test.exs
-    └── property/
-        ├── ordering_test.exs       # P1
-        ├── monotonicity_test.exs   # P2
-        └── crash_recovery_test.exs # P3
+    ├── support/                    # repo, migrations, generators, test doubles
+    ├── scriba/                     # unit tests, mirroring lib/
+    ├── property/
+    │   └── ordering_test.exs       # P1 — DB-free, StreamData
+    └── property_db/                # real-Postgres suite, tagged :property_db
+        ├── pd2_position_consistency_test.exs
+        ├── pd3_cursor_resume_test.exs
+        ├── e3_fault_injection_test.exs
+        ├── multi_key_collision_test.exs
+        └── sandbox_harness_test.exs
 ```
+
+Two test trees, deliberately: `test/property/` is DB-free and always runs,
+while `test/property_db/` needs a live Postgres and is excluded when
+`SCRIBA_TEST_DB_*` is unset (see README). `bench/` and `examples/` are
+separate Mix projects and are not part of the published package.
 
 Do not add files outside this layout without justification. Do not
 create empty placeholder files for future versions.
@@ -673,6 +772,11 @@ create empty placeholder files for future versions.
 ```elixir
 @callback child_spec(opts :: keyword()) :: Supervisor.child_spec()
 @callback start_link(opts :: keyword()) :: GenServer.on_start()
+
+# Held-demand pause: the producer stops dispatching and accumulates
+# demand. The Pipeline tree stays alive (§7.2).
+@callback pause(producer_pid :: pid()) :: :ok
+@callback resume(producer_pid :: pid()) :: :ok
 
 # Broadway producer interface — Source modules implement
 # Broadway.Producer behaviour and yield events as
@@ -709,10 +813,12 @@ restart unless the caller explicitly passes a cursor.
 For production sources, the resume point should come from the source's
 own server-side subscription state, not from Scriba:
 
-* `Scriba.Source.Commanded` calls `subscribe_to(_, _, name, _, :origin)`
-  with a stable subscription `name`. Commanded's event store persists
-  that subscription's acked position; on Pipeline restart, the
-  re-subscription resumes from the persisted position.
+* `Scriba.Source.Commanded` subscribes with a stable subscription `name`
+  and a configurable `:start_from` (default `:origin`). Commanded's event
+  store persists that subscription's acked position; on Pipeline restart,
+  the re-subscription resumes from the persisted position. Acknowledgement
+  is issued by the producer process itself, because an event store may
+  identify the acking subscriber by its pid.
 * Future adapters (e.g. ExESDB) follow the same pattern — server-side
   subscription state is the source of truth for "where this projection
   has consumed up to."
@@ -749,12 +855,22 @@ rows.
 @callback init(opts :: keyword()) :: {:ok, state :: term()}
 @callback apply_batch(
             events :: [Scriba.Event.t()],
-            handler_results :: [term()],
+            handler_results :: [handler_result],
             projection :: %{name: String.t(), version: pos_integer()},
-            new_position :: non_neg_integer(),
+            stream_advances :: %{String.t() => non_neg_integer()},
+            dead_letters :: [dead_letter],
             state :: term()
           ) :: {:ok, state} | {:error, reason :: term(), state}
+
+# Optional. Lets a target declare which handler returns it can apply;
+# anything it rejects is dead-lettered rather than reaching apply_batch/6.
+@callback valid_result?(result :: handler_result) :: boolean()
 ```
+
+`stream_advances` is one cursor per stream touched by the batch, not a
+single position — the cursor is per stream (§8.1). `dead_letters` are
+written in the same transaction as the read-model rows, which is what makes
+"committed or dead-lettered, never neither" hold.
 
 The target is responsible for the atomic write. The Ecto target
 builds the Multi; the Test target appends to an Agent. The engine
@@ -762,27 +878,32 @@ treats them uniformly via this callback.
 
 ---
 
-## 14. What "done" looks like for v0.1
+## 14. Release gate
 
-Checklist for shipping `0.1.0`:
+Every release clears the same bar:
 
-- [ ] All files in §12 exist and are non-empty
-- [ ] `mix compile --warnings-as-errors` is clean
-- [ ] `mix credo --strict` passes
-- [ ] `mix dialyzer` passes
-- [ ] `mix test` passes including the three property tests in §10
-- [ ] `mix docs` generates without warnings
-- [ ] README has: install, 5-line example, link to design doc, scope
-      statement (what Scriba is/is not from §1)
-- [ ] CHANGELOG has a `0.1.0` entry
-- [ ] LICENSE is Apache-2.0
-- [ ] `mix hex.build` succeeds
-- [ ] A working example app in `examples/` consumes a real Commanded
-      event store and runs a real projection end-to-end
+- The file layout matches §12, and this document matches the code.
+- `mix compile --warnings-as-errors`, `mix credo --strict` and
+  `mix dialyzer` are clean.
+- `mix test.all` passes with `SCRIBA_TEST_DB_*` configured, so the
+  real-Postgres suite (§10) actually runs rather than skipping.
+- `mix docs` generates and `mix hex.build` succeeds. `mix docs` emits
+  "references … but it is hidden" warnings by design: this document names
+  internal modules, and internals carry `@moduledoc false`. The check is
+  that the count has not grown, not that it is zero.
+- CHANGELOG has an entry for the version, and the version tag exists
+  before publishing — the package links point at `blob/v<version>/`, so
+  publishing first yields 404s from HexDocs.
+- `examples/bank` runs end-to-end: a projection catching up to a
+  Commanded event store with telemetry firing.
 
-The example app is the acceptance test. If `mix run` on the example
-does not show a projection catching up to a Commanded event store
-with telemetry firing, v0.1 is not done.
+**The example app is not sufficient as an acceptance test.** It runs
+Commanded's InMemory adapter, and InMemory diverges from a persistent
+event store in subscription delivery and acknowledgement semantics — a
+divergence that hid a defect making projections stall permanently against
+`commanded_eventstore_adapter` while every test passed (fixed in 0.1.2).
+Anything touching the source, the acknowledger or the commit path is also
+exercised against a real event store via `bench/`.
 
 ---
 

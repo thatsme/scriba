@@ -521,7 +521,9 @@ defmodule Scriba.Projection.Pipeline do
       true ->
         # Everything resolved — committed or dead-lettered. The poison event
         # is out of the way and the projection moves on.
-        if outcome.committed > 0, do: Scriba.Circuit.reset(ctx.projection.name, ctx.projection.version)
+        if outcome.committed > 0,
+          do: Scriba.Circuit.reset(ctx.projection.name, ctx.projection.version)
+
         emit_batch_stop(ctx, start_time, length(messages))
         Enum.each(outcome.resolved, &emit_dead_letter(&1, ctx))
         messages
@@ -802,6 +804,7 @@ defmodule Scriba.Projection.Pipeline do
   # error_kind/1 — matches DeadLetter.normalize_error/1's kind output so
   # telemetry metadata and dead-letter rows agree on the kind label.
   defp error_kind({:error, _}), do: "error"
+
   defp error_kind({:exception, exception, _}) when is_exception(exception),
     do: exception.__struct__ |> Atom.to_string()
 

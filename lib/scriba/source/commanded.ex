@@ -14,6 +14,34 @@ defmodule Scriba.Source.Commanded do
       durable subscription tracking.
     * `:start_from` (default `:origin`) — where to start reading: `:origin`,
       `:current`, or a specific event number.
+    * `:buffer_size`, `:concurrency_limit`, `:partition_by` — forwarded
+      verbatim to the event store adapter's subscription. Unset means the
+      adapter's own default applies. See "Subscription buffer and throughput".
+
+  ## Subscription buffer and throughput
+
+  `:buffer_size` is how many events the store will send before it requires an
+  acknowledgement. `EventStore`'s default is **1**, and that default, not
+  `:parallelism`, is what bounds a projection's catch-up rate: Scriba
+  acknowledges after the batch commits, so a batcher waiting on a single
+  in-flight event waits out its full `:batch_timeout` before acking and
+  releasing the next one.
+
+  Measured against a real EventStore, 5,000 events over 100 streams:
+
+  | `:buffer_size` | Throughput | 10M events |
+  |---|---|---|
+  | unset (adapter default, 1) | 9.1 events/sec | 12.7 days |
+  | 500 | 2,448 events/sec | 68 minutes |
+
+  Scriba sets no default of its own — the adapter's applies unless configured.
+  Raising it trades memory and redelivered-work-after-a-crash for throughput:
+  up to `:buffer_size` events are held in flight, and an unclean restart
+  replays whatever had not been acknowledged.
+
+      source: {Scriba.Source.Commanded,
+               application: MyApp.CommandedApp,
+               buffer_size: 500}
 
   ## Optional dependency (§11)
 
@@ -100,7 +128,12 @@ defmodule Scriba.Source.Commanded do
     subscription_name = Keyword.get(opts, :subscription_name, "scriba")
     start_from = Keyword.get(opts, :start_from, :origin)
 
-    subscription = subscribe!(application, subscription_name, start_from)
+    # Forwarded verbatim to the adapter. Keyword.take rather than passing opts
+    # wholesale: everything else here is Scriba's own configuration, and an
+    # adapter that validates its options would reject it.
+    subscribe_opts = Keyword.take(opts, [:buffer_size, :concurrency_limit, :partition_by])
+
+    subscription = subscribe!(application, subscription_name, start_from, subscribe_opts)
 
     state = %{
       application: application,
@@ -132,13 +165,20 @@ defmodule Scriba.Source.Commanded do
   # longer than a DOWN takes to process and far shorter than a human notices.
   @resubscribe_backoff [50, 100, 200, 400, 800]
 
-  defp subscribe!(application, subscription_name, start_from, attempts \\ @resubscribe_backoff) do
+  defp subscribe!(
+         application,
+         subscription_name,
+         start_from,
+         subscribe_opts,
+         attempts \\ @resubscribe_backoff
+       ) do
     case apply(@event_store, :subscribe_to, [
            application,
            :all,
            subscription_name,
            self(),
-           start_from
+           start_from,
+           subscribe_opts
          ]) do
       {:ok, subscription} ->
         subscription
@@ -156,7 +196,7 @@ defmodule Scriba.Source.Commanded do
       {:error, :subscription_already_exists} when attempts != [] ->
         [delay | remaining] = attempts
         Process.sleep(delay)
-        subscribe!(application, subscription_name, start_from, remaining)
+        subscribe!(application, subscription_name, start_from, subscribe_opts, remaining)
 
       {:error, :subscription_already_exists} ->
         raise """
@@ -229,6 +269,20 @@ defmodule Scriba.Source.Commanded do
     dispatch(%{state | pending: new_pending})
   end
 
+  # Acks routed here from ack/3, which runs in a batch processor and cannot
+  # acknowledge on its own behalf (see the comment there). Events arrive in
+  # commit order; they are acked in that order. A failure to ack is not
+  # recoverable from here and must not take the producer down — the event
+  # simply stays unacknowledged and is redelivered after a restart, which is
+  # the same outcome as a crash between commit and ack.
+  def handle_info({:scriba_ack, events}, state) do
+    Enum.each(events, fn event ->
+      apply(@event_store, :ack_event, [state.application, state.subscription, event])
+    end)
+
+    {:noreply, [], state}
+  end
+
   def handle_info(:scriba_pause, state) do
     {:noreply, [], %{state | paused: true}}
   end
@@ -244,11 +298,32 @@ defmodule Scriba.Source.Commanded do
   @impl Broadway.Acknowledger
   def ack(ack_ref, successful, [] = _failed) do
     %{application: app, subscription: sub} = ack_ref
+    producer = Map.get(ack_ref, :producer)
 
-    Enum.each(successful, fn msg ->
-      {_module, _ref, commanded_event} = msg.acknowledger
-      apply(@event_store, :ack_event, [app, sub, commanded_event])
-    end)
+    events = Enum.map(successful, fn %Broadway.Message{acknowledger: {_m, _ref, ev}} -> ev end)
+
+    # The ack MUST be issued by the process that holds the subscription, and
+    # this callback does not run there — Broadway calls it in a batch-processor
+    # process. The two Commanded adapters disagree about whether that matters:
+    #
+    #   * InMemory takes the subscription pid as an explicit argument and
+    #     ignores the caller (in_memory.ex `ack_event/3`).
+    #   * EventStore resolves the subscriber from `self()`
+    #     (`EventStore.Subscriptions.Subscription.ack/2` → `{:ack, n, self()}`)
+    #     and its FSM drops the ack entirely when that pid is not a registered
+    #     subscriber of the subscription.
+    #
+    # Acking from here therefore worked against InMemory — which is what the
+    # test suite and the bank example run — and was silently discarded against
+    # a real EventStore, stalling the subscription forever once its in-flight
+    # buffer filled. Route through the producer, which is the subscriber, so
+    # both adapters see an ack from a pid they recognise.
+    if is_pid(producer) do
+      send(producer, {:scriba_ack, events})
+    else
+      # No producer: a message built outside a running pipeline (unit tests).
+      Enum.each(events, &apply(@event_store, :ack_event, [app, sub, &1]))
+    end
 
     :ok
   end
@@ -303,6 +378,7 @@ defmodule Scriba.Source.Commanded do
   # and ships it in the failure reason, because this process cannot remember
   # anything across its own deliberate death.
   defp replay_delay({:scriba_replay, _reason, delay}), do: delay
+
   defp replay_delay(reasons) when is_list(reasons) do
     reasons |> Enum.map(&replay_delay/1) |> Enum.max(fn -> 0 end)
   end

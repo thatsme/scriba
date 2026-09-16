@@ -198,7 +198,9 @@ defmodule Scriba.Target.EctoTest do
       # for stream-a — i.e. 2 (the dead-lettered event), not 1.
       advances = %{"stream-a" => 2}
 
-      multi = EctoTarget.build_multi(events, handler_results, projection(), advances, dead_letters)
+      multi =
+        EctoTarget.build_multi(events, handler_results, projection(), advances, dead_letters)
+
       ks = keys(multi)
 
       assert {:scriba_event, "e1"} in ks
@@ -243,6 +245,7 @@ defmodule Scriba.Target.EctoTest do
   describe "build_multi/5 — position updates appended after handler ops" do
     test "all per-stream position steps come after handler steps" do
       events = [event("e1", 1, "stream-a"), event("e2", 2, "stream-b")]
+
       results = [
         {:insert, %ReadModel{event_id: "e1", stream_id: "stream-a", position: 1}},
         {:insert, %ReadModel{event_id: "e2", stream_id: "stream-b", position: 2}}
@@ -254,8 +257,11 @@ defmodule Scriba.Target.EctoTest do
       handler_keys = [{:scriba_event, "e1"}, {:scriba_event, "e2"}]
       position_keys = [{:scriba_position, "stream-a"}, {:scriba_position, "stream-b"}]
 
-      handler_max_idx = handler_keys |> Enum.map(&Enum.find_index(ks, fn k -> k == &1 end)) |> Enum.max()
-      position_min_idx = position_keys |> Enum.map(&Enum.find_index(ks, fn k -> k == &1 end)) |> Enum.min()
+      handler_max_idx =
+        handler_keys |> Enum.map(&Enum.find_index(ks, fn k -> k == &1 end)) |> Enum.max()
+
+      position_min_idx =
+        position_keys |> Enum.map(&Enum.find_index(ks, fn k -> k == &1 end)) |> Enum.min()
 
       assert position_min_idx > handler_max_idx
     end
