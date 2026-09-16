@@ -76,6 +76,29 @@ defmodule Scriba.Source.Commanded do
   absent. `start_link/1` raises a clear error in that case; `child_spec/1` is
   always safe.
 
+  ## Standby: what happens when another subscriber holds the name
+
+  A persistent subscription admits one subscriber. Rather than failing, a
+  producer that is refused stands by: it starts, retries in the background,
+  and acquires the subscription when the holder releases it. On a multi-node
+  deployment that is a warm standby — one node projects, the others wait,
+  and a failover needs nobody's intervention.
+
+  The first five attempts are fast (50ms to 800ms), for the case where a
+  producer died deliberately to force a replay and the store has not yet
+  processed the DOWN. After those the cadence settles to about a minute with
+  jitter, so standbys that started together do not retry in lockstep.
+
+  `[:scriba, :source, :standby]` fires on every attempt and
+  `[:scriba, :source, :subscribed]` when the subscription is acquired, which
+  is how a takeover is observable. A standby's projection reports `:running`
+  — its pipeline is up and healthy — so the telemetry, not the status, is
+  what distinguishes the node doing the work from the ones waiting.
+
+  Configuration errors are not retried. An application that is not running
+  or a store that cannot be reached raises, because retrying forever would
+  hide it.
+
   ## Pause/resume memory caveat (v0.1)
 
   `pause/1` sets a `paused: true` flag — `handle_demand/2` returns no
@@ -155,12 +178,22 @@ defmodule Scriba.Source.Commanded do
     # adapter that validates its options would reject it.
     subscribe_opts = Keyword.take(opts, [:buffer_size, :concurrency_limit, :partition_by])
 
-    subscription = subscribe!(application, subscription_name, start_from, subscribe_opts)
+    # Not subscribed here. A persistent subscription admits one subscriber, so
+    # on a rolling deploy every node but one is refused — and refusing to
+    # start is the wrong answer for a node whose job is to take over when the
+    # holder goes away. The attempt is made after init and retried until it
+    # succeeds; see handle_info(:scriba_subscribe, _).
+    send(self(), :scriba_subscribe)
 
     state = %{
       application: application,
-      subscription: subscription,
+      subscription: nil,
       subscription_name: subscription_name,
+      start_from: start_from,
+      subscribe_opts: subscribe_opts,
+      # How long before the next subscribe attempt, and how many have been
+      # made. Reset once subscribed.
+      subscribe_attempt: 0,
       # This process is the event store's subscriber. ack/3 runs in a Broadway
       # batch-processor process, not here, so it needs an address to signal
       # when a batch fails to commit. Carried in every message's ack_ref.
@@ -212,70 +245,57 @@ defmodule Scriba.Source.Commanded do
   # it to the millisecond.
   @watermark_interval_ms 1_000
 
-  defp subscribe!(
-         application,
-         subscription_name,
-         start_from,
-         subscribe_opts,
-         attempts \\ @resubscribe_backoff
-       ) do
-    case apply(@event_store, :subscribe_to, [
-           application,
-           :all,
-           subscription_name,
-           self(),
-           start_from,
-           subscribe_opts
-         ]) do
-      {:ok, subscription} ->
-        subscription
+  # Once the fast reap-race attempts are spent, a standby retries about once
+  # a minute. The jitter keeps nodes that started together from retrying in
+  # lockstep.
+  @standby_interval_ms 60_000
+  @standby_jitter_ms 5_000
 
-      # Two very different situations produce this one error.
-      #
-      # The reap race: this producer just died to force a replay, and the
-      # event store has not yet processed the DOWN from our previous
-      # incarnation, so the subscription still looks held — by us. Transient
-      # by definition, and now reachable on *every* commit failure rather
-      # than only during a migration. Retry with backoff.
-      #
-      # A genuine conflict: another live process holds the name. Backoff will
-      # not clear it, so report it after the retries are spent.
-      {:error, :subscription_already_exists} when attempts != [] ->
-        [delay | remaining] = attempts
-        Process.sleep(delay)
-        subscribe!(application, subscription_name, start_from, subscribe_opts, remaining)
+  # Subscribing is retried until it succeeds, because "someone else holds
+  # this subscription" is a normal state on a rolling deploy, not an error.
+  # The node that loses the race stands by and takes over when the holder
+  # goes away.
+  #
+  # The first few attempts are fast, for the reap race: a producer that died
+  # deliberately to force a replay resubscribes within milliseconds, and the
+  # event store may not have processed the DOWN yet. After those, the delay
+  # settles at one minute with jitter — two standbys that started together
+  # should not keep retrying in lockstep.
+  defp attempt_subscribe(state) do
+    apply(@event_store, :subscribe_to, [
+      state.application,
+      :all,
+      state.subscription_name,
+      self(),
+      state.start_from,
+      state.subscribe_opts
+    ])
+  end
 
-      {:error, :subscription_already_exists} ->
-        raise """
-        Scriba could not subscribe: #{inspect(subscription_name)} is still held by \
-        another process after #{length(@resubscribe_backoff)} attempts over \
-        #{Enum.sum(@resubscribe_backoff)}ms.
-
-        A persistent subscription admits one subscriber. Most likely one of:
-
-          * Two Scriba projections share a :subscription_name. It defaults to
-            "scriba", so give each projection against the same Commanded
-            application an explicit name.
-
-          * You are migrating from commanded_ecto_projections and the old
-            projector is still running under this name. Stop it first, or give
-            Scriba a different name:
-
-                source: {Scriba.Source.Commanded,
-                  application: #{inspect(application)},
-                  subscription_name: "scriba-#{subscription_name}"}
-
-        If instead this producer is restarting after a commit failure, the
-        previous subscriber should have been reaped well within that window —
-        an event store not releasing the subscription is the thing to look at.
-        """
-
-      {:error, reason} ->
-        raise """
-        Scriba could not subscribe to #{inspect(subscription_name)} on \
-        #{inspect(application)}: #{inspect(reason)}
-        """
+  defp subscribe_delay(attempt) do
+    case Enum.at(@resubscribe_backoff, attempt - 1) do
+      nil -> @standby_interval_ms + :rand.uniform(@standby_jitter_ms)
+      delay -> delay
     end
+  end
+
+  defp standby_message(state) do
+    """
+    Scriba is standing by for subscription #{inspect(state.subscription_name)}: \
+    another subscriber holds it. Retrying every ~#{div(@standby_interval_ms, 1000)}s \
+    until it is released.
+
+    On a multi-node deployment this is expected — one node holds the
+    subscription and the others take over if it goes away. If you did not
+    expect it, the usual causes are:
+
+      * Two Scriba projections sharing a :subscription_name. It defaults to
+        "scriba", so give each projection against the same Commanded
+        application an explicit name.
+
+      * A commanded_ecto_projections projector still running under this name.
+        Stop it, or give Scriba a different name.
+    """
   end
 
   @impl GenStage
@@ -284,6 +304,56 @@ defmodule Scriba.Source.Commanded do
   end
 
   @impl GenStage
+  def handle_info(:scriba_subscribe, state) do
+    case attempt_subscribe(state) do
+      {:ok, subscription} ->
+        if state.subscribe_attempt > 0 do
+          Logger.info(
+            "Scriba acquired subscription #{inspect(state.subscription_name)} " <>
+              "after #{state.subscribe_attempt} attempt(s)"
+          )
+        end
+
+        :telemetry.execute(
+          [:scriba, :source, :subscribed],
+          %{attempts: state.subscribe_attempt},
+          %{subscription: state.subscription_name}
+        )
+
+        {:noreply, [], %{state | subscription: subscription, subscribe_attempt: 0}}
+
+      {:error, :subscription_already_exists} ->
+        attempt = state.subscribe_attempt + 1
+        delay = subscribe_delay(attempt)
+
+        # Loud once, quiet after. A standby is a steady state, and a line per
+        # minute per projection is noise; the telemetry event carries the
+        # ongoing signal.
+        if attempt == length(@resubscribe_backoff) + 1 do
+          Logger.info(standby_message(state))
+        end
+
+        :telemetry.execute(
+          [:scriba, :source, :standby],
+          %{attempt: attempt, retry_in_ms: delay},
+          %{subscription: state.subscription_name, reason: :subscription_already_exists}
+        )
+
+        Process.send_after(self(), :scriba_subscribe, delay)
+
+        {:noreply, [], %{state | subscribe_attempt: attempt}}
+
+      {:error, reason} ->
+        # Anything else is configuration, not contention: an application that
+        # is not running, a store that is not reachable. Retrying forever
+        # would hide it.
+        raise """
+        Scriba could not subscribe to #{inspect(state.subscription_name)} on \
+        #{inspect(state.application)}: #{inspect(reason)}
+        """
+    end
+  end
+
   def handle_info({:subscribed, sub}, %{subscription: sub} = state) do
     # Subscription confirmed live. Events buffered before this point (if the
     # adapter delivers early) are dispatched now rather than dropped.

@@ -20,6 +20,8 @@ defmodule Scriba.Telemetry do
   | `[:scriba, :projection, :paused]` | `Scriba.Projection.Coordinator` (on `:running → :paused` transition, after source pause signal sent) | `system_time` | `projection` |
   | `[:scriba, :projection, :resumed]` | `Scriba.Projection.Coordinator` (on `:paused → :running` transition, after source resume signal sent) | `system_time` | `projection` |
   | `[:scriba, :projection, :cache_initialized]` | `Scriba.Position.init_cache/3` | `wiped_count`, `preloaded_count` | `name`, `version`, `source` |
+  | `[:scriba, :source, :standby]` | the source, on each failed subscribe attempt (another subscriber holds the name) | `attempt`, `retry_in_ms` | `subscription`, `reason` |
+  | `[:scriba, :source, :subscribed]` | the source, when it acquires the subscription | `attempts` | `subscription` |
   | `[:scriba, :source, :batch, :failed]` | the source's acknowledger (a batch failed to commit; nothing was acknowledged) | `count` | `subscription`, `reason` |
   | `[:scriba, :projection, :lag]` | `Scriba.Projection.Coordinator`, on a timer (`:lag_interval`, default 5s; `0` disables) | `lag_ms`, `watermark` | `projection`, `status` |
   | `[:scriba, :projection, :halted]` | the Pipeline (structural commit failure; the projection has stopped making progress) | `system_time` | `projection`, `reason`, `failure` (SQLSTATE label) |

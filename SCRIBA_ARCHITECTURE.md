@@ -285,7 +285,7 @@ so the public registry stays readable.
 
 ### 6.3 Telemetry event surface (v0.1)
 
-Thirteen events fire. `Scriba.Telemetry`'s moduledoc is the catalog users
+Fifteen events fire. `Scriba.Telemetry`'s moduledoc is the catalog users
 read; this table is the same surface, and the two are kept in step. Lag
 and throughput events are explicitly out of scope (see §2) — do not add
 them here without amending that section.
@@ -302,7 +302,9 @@ them here without amending that section.
 | `[:scriba, :projection, :resumed]` | `Scriba.Projection.Coordinator` (on `:paused → :running`, after source resume signal sent) | `system_time` | `projection` |
 | `[:scriba, :projection, :event, :skipped]` | `handle_message/3` (no handler ran) | `system_time` | `projection`, `reason` (`:dedup` or `:handler`), `event_type`, `stream_id`, `position` |
 | `[:scriba, :projection, :cache_initialized]` | `Scriba.Position.init_cache/3` | `wiped_count`, `preloaded_count` | `name`, `version`, `source` |
-| `[:scriba, :source, :batch, :failed]` | the source's acknowledger (a batch did not commit; nothing was acknowledged) | `count` | `subscription`, `reason` |
+| `[:scriba, :source, :standby]` | the source, per failed subscribe attempt | `attempt`, `retry_in_ms` | `subscription`, `reason` |
+  | `[:scriba, :source, :subscribed]` | the source, on acquiring the subscription | `attempts` | `subscription` |
+  | `[:scriba, :source, :batch, :failed]` | the source's acknowledger (a batch did not commit; nothing was acknowledged) | `count` | `subscription`, `reason` |
 | `[:scriba, :projection, :lag]` | `Scriba.Projection.Coordinator`, on a `send_after` timer (`:lag_interval`, default 5s, `0` disables) | `lag_ms`, `watermark` | `projection`, `status` |
   | `[:scriba, :projection, :halted]` | `halt_batch/3`, from `handle_batch/4` (structural commit failure; the projection has stopped making progress) | `system_time` | `projection`, `reason`, `failure` (SQLSTATE label) |
 

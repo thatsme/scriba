@@ -289,7 +289,7 @@ re-delivers below that cursor.
 
 ### Telemetry
 
-Thirteen events fire — from the Pipeline, the Coordinator, position-cache
+Fifteen events fire — from the Pipeline, the Coordinator, position-cache
 init, and the source. The full surface table is in `Scriba.Telemetry`'s moduledoc
 and in architecture §6.3. Highlights:
 
@@ -301,6 +301,7 @@ and in architecture §6.3. Highlights:
 [:scriba, :projection, :started | :paused | :resumed]
 [:scriba, :projection, :cache_initialized]
 [:scriba, :projection, :lag]
+[:scriba, :source, :standby | :subscribed]
 [:scriba, :projection, :halted]
 [:scriba, :source, :batch, :failed]
 ```
@@ -542,6 +543,27 @@ Both are written outside the commit transaction and throttled to roughly one
 write a second while events are in flight, flushing immediately once the
 projection catches up. They can lag what was applied; they cannot run ahead
 of it. See `Scriba.Watermark` for why that direction is the safe one.
+
+### Running on more than one node
+
+Every node runs the same supervision tree, so every node tries to start the
+projection — and a persistent subscription admits one subscriber. Scriba
+treats that as normal: one node acquires the subscription and projects, the
+others stand by, retrying about once a minute, and take over when the holder
+goes away. No leader election, no extra dependency, nothing to configure.
+
+```
+[:scriba, :source, :standby]      # waiting; another subscriber holds the name
+[:scriba, :source, :subscribed]   # acquired it, including after a takeover
+```
+
+A standby's projection reports `:running` — its pipeline is up and healthy,
+it simply has no subscription yet — so those two events, not `info/2`, are
+what tell you which node is doing the work.
+
+The same behaviour covers a cutover from `commanded_ecto_projections`: start
+Scriba while the old projector still holds the name, and it picks up the
+moment you stop it.
 
 ---
 

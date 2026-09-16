@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A producer that cannot get its subscription now stands by instead of
+  failing.** A persistent subscription admits one subscriber, so on a
+  multi-node deployment every node but one is refused. Previously the loser
+  raised during `init`, which meant `DynamicSupervisor` never adopted it and
+  `start_projection/1` returned an error — no crash loop, but no standby
+  either: nothing retried, so a failover had nobody to fail over to.
+
+  The producer now starts, retries in the background, and acquires the
+  subscription when the holder releases it — five fast attempts for the
+  reap race after a deliberate producer death, then about once a minute with
+  jitter so standbys that started together do not retry in lockstep.
+  Configuration errors still raise; retrying those forever would hide them.
+
+  Two new telemetry events make a takeover observable:
+  `[:scriba, :source, :standby]` per failed attempt, and
+  `[:scriba, :source, :subscribed]` when acquired. A standby's projection
+  reports `:running`, because its pipeline is up — the telemetry is what
+  distinguishes the node doing the work.
+
+  This also covers a cutover from `commanded_ecto_projections`: Scriba can
+  be started while the old projector still holds the subscription name, and
+  picks up when it stops.
+
 ### Added
 
 - **`REBUILDING.md` and `Scriba.reset/2`.** Rebuilding a read model is a

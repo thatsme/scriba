@@ -89,9 +89,11 @@ source: {Scriba.Source.Commanded,
 Fewer moving parts, but **not** reversible — you have consumed the old
 subscription. And the old projector must be fully stopped first: a
 persistent subscription admits one subscriber, so Commanded returns
-`{:error, :subscription_already_exists}`. Scriba retries that with backoff
-— the same error is raised transiently when a producer is replaced — and
-then raises a message naming the subscription and the likely causes.
+`{:error, :subscription_already_exists}`. Scriba does not fail on that: it
+stands by and retries until the name is released, logging what it is waiting
+for. So a cutover can start Scriba while the old projector is still running
+— it picks up the moment you stop it — but nothing will be projected until
+you do.
 
 ### Seeding `scriba_positions` — not needed for the path above
 
