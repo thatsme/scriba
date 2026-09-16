@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The release gate (architecture §14) now requires the CHANGELOG entry to
+  account for everything in the release, checked against
+  `git log <previous tag>..HEAD`, and records that a published tag is not
+  moved afterwards.
+
 ## [0.1.4] - 2026-09-16
 
 Documentation only — no code change from 0.1.3.

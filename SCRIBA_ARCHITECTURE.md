@@ -949,9 +949,19 @@ Every release clears the same bar:
   `@moduledoc false`, so each mention would warn; `:skip_code_autolink_to`
   in `mix.exs` lists them instead. A new warning therefore means a genuinely
   broken reference, or a name that belongs on that list.
-- CHANGELOG has an entry for the version, and the version tag exists
-  before publishing — the package links point at `blob/v<version>/`, so
-  publishing first yields 404s from HexDocs.
+- **The CHANGELOG entry accounts for everything in the release.** Not that
+  an entry exists — that `git log <previous tag>..HEAD` holds nothing a
+  reader of the entry would be surprised by. An entry that understates its
+  own release is the same drift as a stale document, and it is easy to
+  produce: 0.1.4's entry listed a tooling fix and omitted the 39 corrected
+  documentation claims that were the substance of the release. Behaviour
+  changes, corrections, and anything a user would act on all belong in it;
+  a refactor with no observable effect does not.
+- The version tag exists before publishing — the package links point at
+  `blob/v<version>/`, so publishing first yields 404s from HexDocs. Once a
+  version is published the tag stays where it is: it names what was
+  released, and a later correction rides to the next version rather than
+  moving it.
 - `examples/bank` runs end-to-end: a projection catching up to a
   Commanded event store with telemetry firing.
 
