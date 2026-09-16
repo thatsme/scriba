@@ -43,7 +43,10 @@ cut over in place. No read-model rebuild, no maintenance window.
 ([`SCRIBA_ARCHITECTURE.md`](SCRIBA_ARCHITECTURE.md)) and the operational
 primitives — telemetry, dead-letter routing, retry policy, real
 pause/resume — are in place. Property tests cover per-stream ordering,
-position monotonicity, and effectively-once delivery under crash.
+cursor/read-model consistency, and resume-from-cursor after a restart;
+fault injection against real Postgres covers the failure taxonomy.
+Effectively-once under injected crash schedules is enforced
+structurally rather than by a property test — see architecture §10.
 
 What's deliberately out of scope for v0.1:
 
@@ -75,9 +78,9 @@ Scriba is an opinionated rewrite of that role with three principles:
    configuration that lets you turn this off, because you should not
    want to.
 2. **Per-stream ordering is preserved.** All events for a given
-   `stream_id` route to the same processor via consistent hash. Within
-   a processor, events are serial. Across streams, events are
-   parallel.
+   `stream_id` route to the same processor via modular hashing of the
+   stream id. Within a processor, events are serial. Across streams,
+   events are parallel.
 3. **Sharp edges are documented, not hidden.** Dead-lettered events
    advance the cursor (skip-and-continue, not block-the-projection).
    The handler return contract is six tagged tuples, not a DSL. Lag is
@@ -216,7 +219,7 @@ Your `handle(event, meta)` clauses must return one of these six values:
 
 | Return | Effect |
 |---|---|
-| `:skip` | Event acknowledged, no read-model write. Cursor still advances. |
+| `:skip` | Event acknowledged, no read-model write, **cursor does not advance** for that stream. |
 | `{:insert, schema_struct}` | `Ecto.Multi.insert/3` |
 | `{:update, schema_module, filter_keyword, [set: keyword]}` | `Ecto.Multi.update_all/4` filtered by the keyword |
 | `{:delete, schema_module, filter_keyword}` | `Ecto.Multi.delete_all/3` |
@@ -248,9 +251,10 @@ stable identifier across event-store rebuilds.
 
 ### Per-stream ordering
 
-Events with the same `stream_id` route to the same processor via
-consistent hashing — different events on the same stream are *never*
-processed concurrently. Events across streams *are* parallel,
+Events with the same `stream_id` route to the same processor —
+`:erlang.phash2(stream_id, parallelism)`, plain modular hashing rather
+than a consistent-hash ring — so different events on the same stream are
+*never* processed concurrently. Events across streams *are* parallel,
 bounded by `:parallelism`.
 
 This is the invariant that makes "balance += amount" projections
@@ -292,13 +296,15 @@ and in architecture §6.3. Highlights:
 `:event :stop` fires once per successful handler invocation —
 counting these gives you exact "events processed" without doing
 position-arithmetic across streams. `:dead_letter` fires once per
-dead-lettered event with `{name, version, position, stream_id,
-event_type, error_kind}` metadata for alerting.
+dead-lettered event, with `projection: %{name, version}` plus `position`,
+`stream_id`, `event_type` and `error_kind` metadata for alerting.
 
-`[:scriba, :source, :batch, :failed]` means a batch did not commit, nothing
-in it was acknowledged, and the source is restarting to replay from its last
-durable checkpoint. Isolated occurrences are normal under transient database
-trouble; a sustained stream of them means no progress.
+`[:scriba, :source, :batch, :failed]` means a batch did not commit and
+nothing in it was acknowledged. For a transient failure the source then
+restarts to replay from its last durable checkpoint; for a structural one it
+deliberately stays stopped, because no replay can fix a missing column.
+Isolated occurrences are normal under transient database trouble; a sustained
+stream of them means no progress.
 
 `[:scriba, :projection, :halted]` is the page. The projection hit a
 structural failure — a column that doesn't exist, a missing privilege — and
@@ -319,9 +325,9 @@ retry exhaustion — gets a row inserted into `scriba_dead_letters`
 block on bad events. This is a deliberate sharp edge, documented at
 architecture §9.2:
 
-> "When an event is dead-lettered, the position advances past it.
-> The alternative — blocking the projection until the bad event is
-> resolved — is the #2 complaint on ElixirForum after lag visibility."
+> "When an event is dead-lettered, the position advances past it. The
+> alternative — blocking the projection until the bad event is resolved —
+> stops every subsequent event for one bad one, and does it silently."
 
 If you want block-on-failure semantics for a specific projection,
 you build that on top: subscribe to `[:scriba, :projection,
@@ -420,14 +426,15 @@ stops at its first unresolved event rather than skipping past it.
 
 > **Verification status.** The replay path — the source refusing to
 > acknowledge, killing its producer, rewinding the subscription, backing off
-> and redelivering — is covered by **unit tests only**. It has never been
-> exercised against a real event store, and conservation across a database
-> outage (`events delivered == read-model rows + dead letters + skipped`) is
-> unverified. The reason is that Scriba's test double, `Scriba.Test.Source`,
-> discards failed messages instead of redelivering them, so the suite cannot
-> replay anything. The transient/integrity/structural classification above
-> *is* verified against real Postgres, including that a `docker stop` emits
-> `57P01` and is treated as transient.
+> and redelivering — is exercised by the suite through the `Scriba.Test.Source`
+> double, which requeues failed messages in position order, but **not against a
+> real event store**: conservation across a database outage
+> (`events delivered == read-model rows + dead letters + skipped`) is
+> unverified there. Of the failure classification, `:integrity` and
+> `:structural` are verified against real Postgres
+> (`test/property_db/e3_fault_injection_test.exs`); `:transient` is covered by
+> unit tests against constructed `Postgrex.Error` structs, including the
+> `57P01` a `docker stop` emits.
 
 
 ### Source redelivers events the projection has already committed
@@ -439,11 +446,12 @@ durably committed position. Source-side dedup at the Pipeline's
 position is at or below the committed cursor for their stream are
 returned as `:skip` without invoking the handler.
 
-This is the property `P3 — effectively-once under crash` exists to
-verify. Its real-Postgres property test is
-`test/property_db/pd3_cursor_resume_test.exs` (PD3 — recovery resumes
-from the committed cursor, 100 iterations against real Postgres), with
-the integration-test side in `test/scriba/projection/pipeline_test.exs`.
+`test/property_db/pd3_cursor_resume_test.exs` verifies this against real
+Postgres over 100 iterations: after a clean stop, a projection restarted
+with `:start_from` set to the committed cursor processes nothing it has
+already applied. The integration-test side, where the source replays from
+zero and dedup absorbs it, is in
+`test/scriba/projection/pipeline_test.exs`.
 
 ---
 
@@ -453,7 +461,7 @@ the integration-test side in `test/scriba/projection/pipeline_test.exs`.
 is a self-contained Mix project
 that demonstrates the full path: real Commanded
 (`Commanded.EventStore.Adapters.InMemory` for fast iteration), real
-Ecto, real read model. The projection module itself is ~50 lines
+Ecto, real read model. The projection module itself is under 70 lines
 including comments.
 
 ```sh

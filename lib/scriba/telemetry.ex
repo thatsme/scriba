@@ -40,18 +40,24 @@ defmodule Scriba.Telemetry do
       normal under transient database trouble. **A sustained stream of them
       means no progress.** See `Scriba.BatchCommitError`.
 
-    * `[:scriba, :projection, :halted]` — a batch failed with a *structural*
-      error (`Scriba.Failure` classifies SQLSTATE class 42 and anything
-      unrecognised this way): the schema or permissions do not match the code.
-      Neither replaying nor dead-lettering can resolve that, so the projection
-      deliberately stops. **This one is a page, not a warning.** Nothing is
+    * `[:scriba, :projection, :halted]` — the projection has stopped making
+      progress, for one of two reasons. Either a batch failed with a
+      *structural* error (`Scriba.Failure` classifies SQLSTATE class 42 and
+      anything unrecognised this way) — the schema or permissions do not
+      match the code — or **every** attempted write in a batch failed on
+      integrity grounds, which `Scriba.Circuit` reads as the same thing
+      rather than draining the stream into dead letters. In the second case
+      `failure` is `{:integrity_wipeout, n}` rather than a SQLSTATE label.
+      Neither replaying nor dead-lettering can resolve either, so the
+      projection deliberately stops. **This one is a page, not a warning.** Nothing is
       lost — no event is acknowledged and no cursor moves — but nothing
       proceeds either until someone fixes the cause and restarts.
 
-  Deterministic per-event failures do not reach either event. A commit failure
-  classified as `:integrity` is isolated by the pipeline's per-event fallback
-  and recorded in `scriba_dead_letters` with `error_kind` `"commit:<SQLSTATE>"`,
-  and the projection carries on.
+  An isolated `:integrity` commit failure reaches neither event: the
+  pipeline's per-event fallback records it in `scriba_dead_letters` with
+  `error_kind` `"commit:<SQLSTATE>"` and the projection carries on. Only when
+  every attempted write in the batch fails that way does it escalate to
+  `:halted`.
 
   ## Counting skips, and why it matters
 

@@ -3,20 +3,31 @@ defmodule Scriba.DeadLetter do
   Helpers for the `scriba_dead_letters` table — failed events recorded for
   later inspection or replay.
 
-  An event arrives here in two ways (§9), both after retry exhaustion:
+  An event arrives here in five ways (§9). Two are handler failures, after
+  retry exhaustion:
 
     1. The handler returned `{:error, reason}`.
     2. The handler raised — the engine catches it and tags it
        `{:exception, exception, stacktrace}`.
 
-  Both end up routed to a row in `scriba_dead_letters` with a serialized
+  Three more bypass the retry layer entirely, because retrying them changes
+  nothing:
+
+    3. The commit failed with an integrity-class error, isolated by the
+       per-event fallback pass (`{:commit_error, reason}`).
+    4. The handler returned a `{:multi, _}` whose operation names collide
+       with another event's in the same batch (`{:multi_key_collision, keys}`).
+    5. The handler returned a shape the target cannot apply.
+
+  All of them end up routed to a row in `scriba_dead_letters` with a serialized
   copy of the event and an error description. Per §9.2, the projection's
   position **advances past the dead-lettered event** — the projection does not
-  block. Replaying dead-letters is a v0.2 concern.
+  block. There is no replay function yet; replaying means reading the row and
+  re-dispatching the event yourself.
 
-  A failure of the target's atomic commit (e.g. `Repo.transaction/1`) is
-  **not** a dead-letter path: the whole batch is marked failed and its events
-  are redelivered. See `Scriba.Target`.
+  Transient and structural commit failures are *not* dead-letter paths: a
+  transient one replays the whole batch, a structural one halts the
+  projection. See `Scriba.Target`.
 
   This module exposes raw helpers; the routing decision (when to insert) lives
   in the Pipeline, which partitions failure-shape handler results out of the
@@ -39,8 +50,11 @@ defmodule Scriba.DeadLetter do
 
   Accepts:
     * `{:error, reason}` — `kind = "error"`, `message = inspect(reason)`
-    * `{:exception, exception, stacktrace}` — `kind = exception.__struct__`,
-      message + formatted stacktrace
+    * `{:exception, exception, stacktrace}` — `kind` is the exception module
+      as a string, message + formatted stacktrace
+    * `{:commit_error, reason}` — `kind = "commit:<SQLSTATE label>"`
+    * `{:multi_key_collision, keys}` — `kind = "multi_key_collision"`
+    * anything else — `kind = "invalid_return"`
   """
   @spec build_row(projection(), Event.t(), term()) :: map()
   def build_row(%{name: name, version: version}, %Event{} = event, error) do

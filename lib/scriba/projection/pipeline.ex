@@ -141,7 +141,7 @@ defmodule Scriba.Projection.Pipeline do
   producer registration — Coordinator's :initializing state guards
   this race.
 
-  The `pipeline_naming_smoke_test` integration test asserts this key
+  The `test/scriba/coordinator_test.exs` integration test asserts this key
   exists after a Pipeline starts, so a future Broadway upgrade that
   changes the naming convention surfaces loudly.
   """

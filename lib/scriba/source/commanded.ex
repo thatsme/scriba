@@ -79,7 +79,7 @@ defmodule Scriba.Source.Commanded do
   ## Pause/resume memory caveat (v0.1)
 
   `pause/1` sets a `paused: true` flag — `handle_demand/2` returns no
-  messages while paused, accumulating demand into `pending_demand`. The
+  messages while paused, accumulating it in the state's `:demand`. The
   Commanded subscription, however, **keeps pushing events** into the
   source's `pending :queue` regardless of pause state (we don't
   unsubscribe).

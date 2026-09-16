@@ -119,7 +119,8 @@ defmodule Scriba.MixProject do
         "Scriba.Projection.Pipeline.handle_batch/4",
         "Scriba.Source.Commanded.start_link/1",
         "Scriba.Source.Commanded.pause/1",
-        "Scriba.Source.Commanded.to_message/2"
+        "Scriba.Source.Commanded.to_message/2",
+        "Scriba.Position.safe_position/2"
       ],
       source_ref: "v#{@version}",
       source_url: @source_url

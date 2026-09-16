@@ -18,13 +18,15 @@ defmodule Scriba.Info do
   ## `:halted` is the one to alert on
 
   A halted projection hit a commit failure that neither replaying nor
-  dead-lettering can resolve — a missing column, a missing privilege. It has
+  dead-lettering can resolve — a missing column, a missing privilege, or a
+  batch in which every attempted write failed on integrity grounds. It has
   stopped acknowledging events and will not move again until the cause is
   fixed and the projection restarted. Nothing is lost: no event is
   acknowledged and no cursor advances.
 
-  `:halt_reason` carries the underlying error (typically a `Postgrex.Error`
-  whose SQLSTATE names the cause) and is `nil` in every other state. Polling
+  `:halt_reason` carries the underlying error — usually a `Postgrex.Error`
+  whose SQLSTATE names the cause, or `{:integrity_wipeout, n}` when a whole
+  batch failed on integrity grounds — and is `nil` in every other state. Polling
   `status` is enough to detect it — you do not have to have been subscribed to
   `[:scriba, :projection, :halted]` at the instant it fired.
 

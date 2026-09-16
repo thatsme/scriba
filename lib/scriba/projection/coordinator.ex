@@ -318,9 +318,9 @@ defmodule Scriba.Projection.Coordinator do
 
   ## Catch-all for invalid command/state combos
   #
-  # The seven cases this covers:
-  #   pause from :initializing | :paused | :stopped | :draining
-  #   resume from :initializing | :running | :stopped | :draining
+  # The thirteen cases this covers:
+  #   pause from :initializing | :paused | :stopped | :draining | :halted
+  #   resume from :initializing | :running | :stopped | :draining | :halted
   #   stop from :initializing | :stopped | :draining
   #
   # Uniform error shape: {:error, {:invalid_state, state}}. Inner atom
