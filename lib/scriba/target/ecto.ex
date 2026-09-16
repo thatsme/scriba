@@ -10,8 +10,9 @@ defmodule Scriba.Target.Ecto do
 
   ## Handler return contract (§4.2)
 
-    * `:skip` — no Multi op for this event (its stream's cursor still advances
-      if the event was not dedup-skipped; see Pipeline `stream_advances`).
+    * `:skip` — no Multi op for this event, and its stream's cursor does not
+      advance (see Pipeline `stream_advances`). Whether the skip came from
+      dedup or from the handler makes no difference.
     * `{:insert, schema_struct}` — `Ecto.Multi.insert/3`.
     * `{:update, schema_module, filter_keyword, [set: keyword]}` —
       `Ecto.Multi.update_all/4` filtered by `filter_keyword`.
@@ -103,7 +104,8 @@ defmodule Scriba.Target.Ecto do
 
   Order of steps in the assembled Multi:
 
-    1. Read-model ops (one `{:scriba_event, event.id}` per success event).
+    1. Read-model ops (one `{:scriba_event, event.id}` per non-`:skip`
+       success event).
     2. Per-stream cursor advances (one `{:scriba_position, stream_id}`).
     3. Dead-letter inserts (one `{:scriba_dead_letter, event.id}`).
   """

@@ -11,11 +11,14 @@ defmodule Scriba.Target do
   `c:init/1` is called once when the projection starts and returns the state
   threaded through every subsequent `c:apply_batch/6` call. `apply_batch/6`
   returns either `{:ok, state}` on success or `{:error, reason, state}` on
-  failure. A commit failure marks the whole batch failed via
-  `Broadway.Message.failed/2` — it does **not** dead-letter, because writing
-  the dead-letter row would need the transaction that just failed.
+  failure. What happens next depends on how `Scriba.Failure` classifies the
+  error: a transient one marks the whole batch failed via
+  `Broadway.Message.failed/2` and replays, a structural one halts the
+  projection, and an integrity one is isolated by retrying the batch event by
+  event — those events *are* dead-lettered, in a transaction of their own,
+  with `error_kind` `"commit:<SQLSTATE>"`.
 
-  Recovery is by replay, and it is the source's responsibility. Nothing in
+  On the replay path recovery is the source's responsibility. Nothing in
   the batch is acknowledged — not even the messages that succeeded, since
   event-store acks are prefix-acks and cannot express a gap. The source is
   then expected to force redelivery from its last durable checkpoint;
@@ -23,16 +26,20 @@ defmodule Scriba.Target do
   the subscription (see `Scriba.BatchCommitError`). Events that did commit are
   filtered by source-side dedup on the way back through.
 
-  Dead-lettering is for per-event handler failures (see below), never for
-  commit failures.
+  Dead-lettering covers per-event handler failures (see below) and
+  integrity-class commit failures. It never covers transient or structural
+  ones: no row can be written for a database that is unreachable, and a
+  schema that does not match the code would drain every event into
+  `scriba_dead_letters` over an empty read model.
 
   > #### Verification status (v0.1) {: .warning}
   >
   > The replay half of this — source refuses to ack, forces redelivery, dedup
-  > filters what committed — is covered by unit tests only and has never run
-  > against a real event store. `Scriba.Test.Source` drops failed messages
-  > rather than redelivering them, so the suite cannot exercise it. See
-  > `Scriba.BatchCommitError`.
+  > filters what committed — is exercised through `Scriba.Test.Source`, which
+  > requeues failed messages in position order, and against real Postgres for
+  > the integrity and structural classes. It has **not** been run against a
+  > real event store, so conservation across an event-store outage is
+  > unverified. See `Scriba.BatchCommitError`.
 
   ## stream_advances invariant
 

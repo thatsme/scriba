@@ -82,8 +82,10 @@ defmodule Scriba.Target.Test do
   def stream_positions(agent), do: Agent.get(agent, & &1.stream_positions)
 
   @doc """
-  Returns the safe replay point: the minimum cursor across all streams. 0
-  when no streams have committed yet.
+  Returns the minimum cursor across the streams this target has committed to,
+  or 0 when none have. Not a replay point: streams never written to contribute
+  nothing, so it reads too high — the same caveat as
+  `Scriba.Position.safe_position/2`.
   """
   @spec safe_position(agent()) :: non_neg_integer()
   def safe_position(agent) do

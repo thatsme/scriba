@@ -45,7 +45,9 @@ defmodule Scriba.Projection do
       raises at compile time.
     * `:handler` — `__MODULE__`. The module whose `handle/2` clauses the
       engine calls. Defaults to the module being `use`d.
-    * `:batch_size`, `:batch_timeout`, `:retry` — pass through to Pipeline
+    * `:batch_size` (default `50`), `:batch_timeout` (default `100` ms) and
+      `:retry` (default 3 attempts with `[100, 1000, 10_000]` ms backoff;
+      `retry: false` for a single attempt) — pass through to Pipeline
       and the retry layer respectively. See
       `Scriba.Projection.Pipeline` and `SCRIBA_ARCHITECTURE.md` §9.1 for
       defaults.

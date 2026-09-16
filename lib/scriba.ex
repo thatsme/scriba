@@ -218,6 +218,8 @@ defmodule Scriba do
           pattern-match this error case as success.
         - `:stopped` — terminal state.
         - `:draining` — stop in progress.
+        - `:halted` — terminal. A structural commit failure stopped the
+          projection; `stop/1` is the way out once the cause is fixed.
   """
   @spec pause(module() | String.t()) :: :ok | {:error, {:invalid_state, atom()}}
   def pause(module_or_name)

@@ -34,10 +34,11 @@ defmodule Scriba.Position do
   ## Lifecycle
 
     * `Scriba.Supervisor.init/1` calls `create_shared_table/0` once at boot.
-    * `Coordinator` on entering `:running` calls `init_cache/3` —
-      **wipe-then-preload**: deletes any stale rows for this projection
-      (from a previously-crashed Coordinator), then preloads from Postgres
-      if `:repo` is set. Idempotent across pause→resume cycles.
+    * `Coordinator.init/1` calls `init_cache/3` once per Coordinator-process
+      lifetime — **wipe-then-preload**: deletes any stale rows for this
+      projection (from a previously-crashed Coordinator), then preloads from
+      Postgres if `:repo` is set. Deliberately not on the `:running` enter,
+      so pause→resume preserves the cache that dedup depends on.
     * `Coordinator` on entering `:stopped` calls `drop_cache/2` to clean up
       this projection's rows. (Crash recovery is covered by the wipe in
       the next `init_cache/3`; `:stopped` cleanup matters for projections

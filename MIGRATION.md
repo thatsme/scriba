@@ -301,12 +301,10 @@ events are redelivered.
 
 **2. Multi keys must be unique per event.** The old docs used static atom
 keys (`:example_projection`) because each event had its own transaction. In
-one Scriba batch those collide, and `Ecto.Multi` raises:
-
-```
-** (ArgumentError) error when merging the following Ecto.Multi structs:
-   ... both declared operations: [:example_projection]
-```
+one Scriba batch those collide. Scriba detects the duplicate operation
+names before merging and dead-letters the colliding event with `error_kind`
+`"multi_key_collision"`, so one bad handler does not take the batch down —
+but that event's write never lands, which is not what you want either.
 
 Key by something unique — `meta.id` is the event's UUID:
 

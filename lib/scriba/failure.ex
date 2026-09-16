@@ -34,7 +34,8 @@ defmodule Scriba.Failure do
       restart, failover, still-starting-up), plus `40001` and `40P01`
       (serialization failure, deadlock), `25006` (a write that landed on a
       read-only replica mid-failover), any `Postgrex.Error` carrying no
-      SQLSTATE, and `DBConnection` errors. Nothing about the event is wrong.
+      SQLSTATE, and `DBConnection.ConnectionError`. Nothing about the event
+      is wrong.
       **Fail and replay.**
 
       Class 57 is here because of E3: `docker stop` emits `57P01`

@@ -177,9 +177,10 @@ new projection with a different version, declare a separate module
 with `version: 2`. Identity-overriding at runtime would silently
 create a different projection, almost always a bug.
 
-`Scriba.info/1` returns a `Scriba.Info` struct with `:name`,
-`:version`, `:status`, `:source`, `:target`, `:safe_position`,
-`:stream_positions`. Lag and throughput are NOT in v0.1 — they live in
+`Scriba.info/1` returns a `Scriba.Info` struct with `:name`, `:version`,
+`:status`, `:source`, `:target`, `:safe_position`, `:stream_positions` and
+`:halt_reason` (the cause when `:status` is `:halted`, `nil` otherwise).
+`:stream_positions` becomes `:truncated` above 1,000 streams. Lag and throughput are NOT in v0.1 — they live in
 telemetry consumers.
 
 `Scriba.list/0` returns `[%{name, version, state}]` for projections
@@ -253,6 +254,10 @@ process and live for the application's lifetime.
 
 Coordinators register as `{:via, Registry, {Scriba.Registry, {:coordinator, name, version}}}`.
 Broadway pipelines register as `{:via, Registry, {Scriba.Registry, {:pipeline, name, version}}}`.
+Per-projection supervisors register as
+`{:via, Registry, {Scriba.Registry, {:projection_supervisor, name, version}}}`.
+Broadway's own internal processes use `Scriba.Internals.Registry` instead,
+so the public registry stays readable.
 
 ### 6.3 Telemetry event surface (v0.1)
 
@@ -266,8 +271,8 @@ them here without amending that section.
 | `[:scriba, :projection, :event, :start]` | `handle_message/3` via `:telemetry.span/3` | `monotonic_time`, `system_time` | `projection`, `event_type`, `stream_id`, `position`, `telemetry_span_context` |
 | `[:scriba, :projection, :event, :stop]` | same | `duration`, `monotonic_time` | same as `:start` |
 | `[:scriba, :projection, :event, :exception]` | same | `duration`, `monotonic_time` | start metadata + `kind`, `reason`, `stacktrace` |
-| `[:scriba, :projection, :batch, :stop]` | `handle_batch/4` (manual `:telemetry.execute/3`, success branch only) | `duration`, `batch_size` | `projection` |
-| `[:scriba, :projection, :dead_letter]` | `handle_batch/4` (one per dead-lettered event, emitted AFTER Multi commit) | `system_time` | `projection`, `position`, `stream_id`, `event_type`, `error_kind` |
+| `[:scriba, :projection, :batch, :stop]` | `handle_batch/4` — two sites: the whole-batch commit, and the per-event fallback pass once it resolves everything | `duration`, `batch_size` | `projection` |
+| `[:scriba, :projection, :dead_letter]` | `handle_batch/4`, one per dead-lettered event after the Multi commits — both from the batch path and from the per-event fallback, which is the usual route for commit failures | `system_time` | `projection`, `position`, `stream_id`, `event_type`, `error_kind` |
 | `[:scriba, :projection, :started]` | `Scriba.Projection.Coordinator` (first `:initializing → :running`, fires once per Coordinator-process lifetime; Pipeline DOWN→re-running does NOT re-fire) | `system_time` | `projection` |
 | `[:scriba, :projection, :paused]` | `Scriba.Projection.Coordinator` (on `:running → :paused`, after source pause signal sent) | `system_time` | `projection` |
 | `[:scriba, :projection, :resumed]` | `Scriba.Projection.Coordinator` (on `:paused → :running`, after source resume signal sent) | `system_time` | `projection` |
@@ -337,7 +342,9 @@ Conventions:
 :running      -- stop                 --> :draining --> :stopped
 :paused       -- stop                 --> :stopped     (direct terminate)
 :running      -- Pipeline DOWN        --> :initializing (rest_for_one respawn)
-:running      -- structural failure   --> :halted       (terminal)
+any           -- structural failure   --> :halted       (terminal; the
+                                         halt cast is accepted from every
+                                         state except :halted itself)
 :halted       -- stop                 --> :stopped
 any           -- crash                --> (supervisor restarts to :initializing, then auto-:running)
 ```
@@ -369,9 +376,14 @@ Keep the Coordinator's state struct **small**:
   version: pos_integer(),
   source_spec: tuple(),
   target_spec: tuple(),
+  handler: module(),
   parallelism: pos_integer(),
+  repo: module(),
+  supervisor_pid: pid() | nil,
   pipeline_pid: pid() | nil,
-  pipeline_ref: reference() | nil
+  pipeline_ref: reference() | nil,
+  started: boolean(),          # gates once-per-lifetime :started telemetry
+  halt_reason: term() | nil    # surfaced by Scriba.info/2 as :halt_reason
 }
 ```
 
@@ -425,7 +437,7 @@ CREATE TABLE scriba_positions (
   projection_version int NOT NULL,
   stream_id varchar(255) NOT NULL,
   position bigint NOT NULL,
-  updated_at timestamptz NOT NULL,
+  updated_at timestamp(6) NOT NULL,   -- Ecto :utc_datetime_usec
   PRIMARY KEY (projection_name, projection_version, stream_id)
 );
 ```
@@ -525,7 +537,12 @@ A commit can fail three ways, and they do **not** share a response:
    - `:integrity` (classes 22 and 23, constraint errors, invalid changesets)
      — deterministic and specific to one event, so the batch is retried
      per-event and the offending events are dead-lettered while the rest
-     commit.
+     commit. Two outcomes qualify that: if any event is left unresolved the
+     batch is *replayed* rather than partially acknowledged (committed work
+     stands, dedup filters it on redelivery), and if **every** attempted
+     write failed on integrity grounds, `Scriba.Circuit` reads that as a
+     schema the handler no longer matches and halts rather than draining the
+     stream into `scriba_dead_letters` over an empty read model.
    - `:structural` (class 42 and anything unrecognised) — schema or
      permissions do not match the code, which no replay can fix. The
      projection halts (§7.1) and stays loud.
@@ -548,7 +565,7 @@ CREATE TABLE scriba_dead_letters (
   error_kind varchar(64) NOT NULL,
   error_message text,
   error_stacktrace text,
-  occurred_at timestamptz NOT NULL DEFAULT now()
+  occurred_at timestamp(6) NOT NULL DEFAULT now()   -- Ecto :utc_datetime_usec
 );
 ```
 
@@ -617,17 +634,20 @@ operators can alert on it.
 
 ## 10. Property tests
 
-All use `StreamData`. P1 is DB-free and always runs; the rest need a live
-Postgres and are excluded when `SCRIBA_TEST_DB_*` is unset.
+P1, PD2 and PD3 are `StreamData` properties; the §10.4 tests are plain
+ExUnit cases. P1 needs no database; everything in `test/property_db/` does,
+and is excluded when `SCRIBA_TEST_DB_*` is unset. `mix test.fast` excludes
+all of them.
 
 ### 10.1 P1 — Per-stream ordering
 
 `test/property/ordering_test.exs`, 1,000 runs, no database.
 
-For any stream S, the sequence of events delivered to `handle/2` is a
-prefix of the source order for S. Generator: events with monotonic
-per-stream sequence numbers, multiple streams interleaved. Assertion:
-handler-observed sequence numbers are monotonic per stream.
+For any stream S, the events that reach the target do so in source order.
+Generator: events with monotonic per-stream sequence numbers, multiple
+streams interleaved. Assertion: the positions the target committed, grouped
+by stream, are sorted — read from the test target's commit log rather than
+from `handle/2`, so it measures what was durably applied.
 
 ### 10.2 PD2 — Position consistency
 
@@ -679,8 +699,11 @@ defp deps do
     {:telemetry, "~> 1.2"},
     {:jason, "~> 1.4"},
 
-    # dev/test only
+    # Optional at runtime, all environments — only Scriba.Source.Commanded
+    # needs it, and that module guards with Code.ensure_loaded?/1.
     {:commanded, "~> 1.4", optional: true},
+
+    # dev/test only
     {:stream_data, "~> 1.0", only: [:dev, :test]},
     {:ex_doc, "~> 0.31", only: :dev, runtime: false},
     {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
@@ -705,12 +728,24 @@ Notes:
 
 ```
 scriba/
+├── .credo.exs
+├── .env.local.example
 ├── .formatter.exs
 ├── .gitignore
 ├── CHANGELOG.md
 ├── LICENSE                       # Apache-2.0
+├── MIGRATION.md                  # ships in the package
 ├── README.md
+├── SCRIBA_ARCHITECTURE.md        # this file; ships in the package
+├── docker-compose.yml            # dev Postgres on 5433
+├── docker/
+├── docs/
+│   └── post-v0.1.md              # deferred design notes (repo only)
+├── config/
+│   ├── config.exs
+│   └── test.exs                  # SCRIBA_TEST_DB_* gating
 ├── mix.exs
+├── mix.lock
 ├── lib/
 │   ├── scriba.ex                 # public API: start_projection, pause, resume, stop, info, list
 │   ├── scriba/
@@ -743,6 +778,7 @@ scriba/
 │   │   └── errors.ex             # Scriba.BatchCommitError
 └── test/
     ├── test_helper.exs
+    ├── scriba_test.exs
     ├── support/                    # repo, migrations, generators, test doubles
     ├── scriba/                     # unit tests, mirroring lib/
     ├── property/
@@ -755,9 +791,11 @@ scriba/
         └── sandbox_harness_test.exs
 ```
 
-Two test trees, deliberately: `test/property/` is DB-free and always runs,
-while `test/property_db/` needs a live Postgres and is excluded when
-`SCRIBA_TEST_DB_*` is unset (see README). `bench/` and `examples/` are
+Two test trees, deliberately: `test/property/` is DB-free, while
+`test/property_db/` needs a live Postgres and is excluded when
+`SCRIBA_TEST_DB_*` is unset (see README). Both are excluded from
+`mix test.fast`, which is the DB-free development loop; `mix test.all`
+runs everything the environment allows. `bench/` and `examples/` are
 separate Mix projects and are not part of the published package.
 
 Do not add files outside this layout without justification. Do not
@@ -778,8 +816,8 @@ create empty placeholder files for future versions.
 @callback pause(producer_pid :: pid()) :: :ok
 @callback resume(producer_pid :: pid()) :: :ok
 
-# Broadway producer interface — Source modules implement
-# Broadway.Producer behaviour and yield events as
+# Source modules are GenStage producers that Broadway starts, and they
+# implement Broadway.Acknowledger. They yield events as
 # %Broadway.Message{data: %Scriba.Event{}, acknowledger: ...}
 ```
 
@@ -855,9 +893,9 @@ PD3 (real-Postgres property test, 100 iterations) verifies adapter-level
 resume end-to-end against the Test source's `:start_from` filter.
 The fast-suite integration test in
 `test/scriba/projection/pipeline_test.exs` verifies Pipeline-side dedup
-by killing the Pipeline child (which kills the source) and observing
-that the new source's replay-from-zero produces no duplicate read-model
-rows.
+by terminating and restarting the Pipeline child through its supervisor
+(which takes the source with it) and observing that the new source's
+replay-from-zero produces no duplicate read-model rows.
 
 ### 13.2 `Scriba.Target`
 
@@ -892,7 +930,16 @@ treats them uniformly via this callback.
 
 Every release clears the same bar:
 
-- The file layout matches §12, and this document matches the code.
+- The file layout matches §12.
+- **Every document is audited against the code** — not only the ones the
+  release touched. README.md, this file, MIGRATION.md, every `@moduledoc`
+  and public `@doc` in `lib/`, `examples/bank/README.md`, `bench/README.md`
+  and `docs/post-v0.1.md`. Each checkable claim — function names and
+  arities, option names and defaults, return shapes, table and column
+  names, telemetry events, test coverage, counts, measured numbers — needs
+  a line of code that proves it. A document is never evidence for another
+  document. Auditing only what changed is how a false claim survives a
+  release: the documents drift against code they never mention.
 - `mix compile --warnings-as-errors`, `mix credo --strict` and
   `mix dialyzer` are clean.
 - `mix test.all` passes with `SCRIBA_TEST_DB_*` configured, so the

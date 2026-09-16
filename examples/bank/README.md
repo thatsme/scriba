@@ -10,8 +10,9 @@ The shortest path to seeing Scriba work.
 
 - The five-line `use Scriba.Projection` API in real use.
   See [`lib/bank/projections/balances.ex`](lib/bank/projections/balances.ex)
-  for the projection module the demo runs against — it's about 30 lines
-  total including comments.
+  for the projection module the demo runs against — under 70 lines
+  including comments, of which five are the `use Scriba.Projection`
+  declaration.
 - Real Commanded — events flow through `Commanded.Application`'s
   subscription machinery, the same path a production app uses.
 - Per-stream ordering: 3 accounts get interleaved deposits and
@@ -27,8 +28,9 @@ The shortest path to seeing Scriba work.
   `Commanded.EventStore.Adapters.InMemory` — restarting the demo
   forgets everything. See "Persistent event store" below for the
   10-line swap to `commanded_eventstore_adapter`.
-- Crash recovery / cursor resume. Scriba's PD3 property test covers
-  this; the bank demo is about the happy path.
+- Crash recovery. Scriba's PD3 property test covers cursor *resume* after
+  a clean restart; recovery under injected crashes is not covered by a
+  property test at all. The bank demo is about the happy path.
 - Dead-letter routing and retries. Both are exercised by Scriba's
   test suite; this demo keeps the output clean.
 

@@ -40,14 +40,13 @@ defmodule Scriba.BatchCommitError do
   ## Verification status (v0.1)
 
   This mechanism — refuse to ack, kill the producer, rewind the subscription,
-  back off, replay — is covered by **unit tests only**. It has never been
-  exercised against a real event store.
+  back off, replay — is exercised by the suite through `Scriba.Test.Source`,
+  which requeues failed messages in position order, and against real Postgres
+  for integrity and structural commit failures.
 
-  Scriba's own test double, `Scriba.Test.Source`, discards failed messages
-  instead of redelivering them, so the suite cannot replay anything and cannot
-  close the conservation identity across an outage. Measuring it requires a
-  persistent event store. Treat the paragraphs above as the design, not as
-  observed behaviour.
+  It has **not** been run against a real event store, so the conservation
+  identity across an event-store outage — as opposed to a database one —
+  remains unverified. `bench/` is where that would be measured.
   """
 
   defexception [:count, :reason]

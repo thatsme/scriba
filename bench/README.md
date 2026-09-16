@@ -39,12 +39,12 @@ mix bench.throughput --reseed                           # append a fresh batch f
 Output:
 
 ```
-5000 events projected in 2042ms
-Throughput: 2448.6 events/sec
+5000 events projected in 833ms
+Throughput: 6002.4 events/sec
 
 Reference points at this rate:
-  1M events:  6.8 min
-  10M events: 68.1 min
+  1M events:  2.8 min
+  10M events: 27.8 min
 ```
 
 Each run subscribes under a name never used before and truncates the read
@@ -73,7 +73,7 @@ Recorded on 5,000 events over 100 streams, Postgres 16 in Docker, one machine,
 | `:buffer_size` | Throughput | 10M events |
 |---|---|---|
 | unset (adapter default, 1) | 9.1 events/sec | 12.7 days |
-| 500 | 2,448 events/sec | 68 minutes |
+| 500 | 6,002 events/sec | 28 minutes |
 
 The adapter default is one in-flight event per subscriber. Acknowledgement
 happens after the batch commits, so a batcher holding a single event waits out
