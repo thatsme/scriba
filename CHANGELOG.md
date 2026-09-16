@@ -9,7 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.4] - 2026-09-16
 
+Documentation only — no code change from 0.1.3.
+
 ### Changed
+
+- **Every shipped document audited against the code; 39 claims corrected.**
+  README.md, SCRIBA_ARCHITECTURE.md, MIGRATION.md, every `@moduledoc` and
+  public `@doc` in `lib/`, `examples/bank/README.md` and `bench/README.md`
+  were checked claim by claim against the implementation, with no document
+  treated as evidence for another. Several described the opposite of what the
+  engine does:
+
+    - A handler `:skip` does **not** advance its stream's cursor — the
+      pipeline rejects every `:skip` from `stream_advances`, dedup-induced or
+      not. The README and `Scriba.Target.Ecto` said it does.
+    - Integrity-class commit failures **are** dead-lettered, in a transaction
+      of their own, with `error_kind` `"commit:<SQLSTATE>"`. `Scriba.Target`
+      and `Scriba.DeadLetter` said commit failures never are.
+    - A projection also halts when **every** attempted write in a batch fails
+      on integrity grounds, and `:halt_reason` is then
+      `{:integrity_wipeout, n}` rather than a `Postgrex.Error`. Only
+      structural errors were documented as halting.
+    - `Scriba.Test.Source` requeues failed messages in position order; three
+      places still said it discards them "so the suite cannot replay
+      anything".
+    - Events reach the dead-letter table by five paths, not two: multi-key
+      collisions and unapplicable handler returns bypass the retry layer.
+
+  Also corrected: the Coordinator state struct (11 fields, not 7), the halt
+  transition (accepted from every state, not just `:running`),
+  `Scriba.Info`'s `:halt_reason` field, the §8/§9 DDL
+  (`:utc_datetime_usec` is `timestamp`, not `timestamptz`), P1's assertion
+  (the target's commit log, not `handle/2`), two dual-emit telemetry sites,
+  the §12 file layout, the `Scriba.Source` behaviour (a GenStage producer
+  plus `Broadway.Acknowledger`, not `Broadway.Producer`), `:commanded`'s
+  dependency grouping, the missing `:halted` case in `pause/1` and
+  `resume/1`, MIGRATION.md's claim that multi-key collisions raise
+  `ArgumentError`, and `bench/README.md`'s pre-watermark figures.
+
+- **A full documentation audit is now a release gate** (architecture §14).
+  Auditing only the documents a change touches is what let the above survive:
+  documents drift against code they never mention.
 
 - `mix docs` now generates without warnings. Internal modules carry
   `@moduledoc false`, so every deliberate mention of one — the telemetry
