@@ -28,7 +28,7 @@ defmodule Scriba.Source do
     * `Scriba.Source.Commanded`'s EventStore subscription keeps pushing
       events into the source's `pending :queue`. Memory grows during
       pause, bounded by however many events the upstream produces in the
-      pause window. This is a documented sharp edge for v0.1. The
+      pause window. This is a documented sharp edge. The
       cleaner alternative — unsubscribe on pause, re-subscribe on resume
       from the current cursor — is v0.5 hardening territory.
 
@@ -61,4 +61,9 @@ defmodule Scriba.Source do
   GenStage `handle_info/2`.
   """
   @callback resume(producer_pid :: pid()) :: :ok
+
+  # Injected option, not a callback: the Pipeline adds `:scriba_watermark`
+  # to every source's opts, carrying `repo:` and `projection:`. A source that
+  # can compute a contiguous global position persists it there (see
+  # `Scriba.Watermark`); one that cannot ignores the option.
 end

@@ -157,7 +157,7 @@ defmodule Mix.Tasks.Bench.Throughput do
   defp reset_read_side do
     Ecto.Adapters.SQL.query!(
       Repo,
-      "TRUNCATE bench_rows, scriba_positions, scriba_dead_letters",
+      "TRUNCATE bench_rows, scriba_positions, scriba_dead_letters, scriba_watermarks",
       []
     )
   end

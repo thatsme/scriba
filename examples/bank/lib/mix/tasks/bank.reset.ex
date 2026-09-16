@@ -19,7 +19,7 @@ defmodule Mix.Tasks.Bank.Reset do
   def run(_args) do
     Mix.Task.run("app.start", [])
 
-    Bank.Repo.query!("TRUNCATE account_balances, scriba_positions, scriba_dead_letters")
+    Bank.Repo.query!("TRUNCATE account_balances, scriba_positions, scriba_dead_letters, scriba_watermarks")
 
     Mix.shell().info("Bank demo state reset.")
   end

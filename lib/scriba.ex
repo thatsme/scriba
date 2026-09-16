@@ -34,6 +34,7 @@ defmodule Scriba do
   `Scriba.list/0` enumerates running projections via `Scriba.Registry`.
   """
 
+  alias Ecto.Adapters.SQL
   alias Scriba.Info
   alias Scriba.Projection.Coordinator
 
@@ -375,9 +376,24 @@ defmodule Scriba do
   Coordinator registered in `:stopped`, and that counts as stopped.
 
       :ok = Scriba.stop(MyApp.Projections.OrdersV2)
-      {:ok, %{positions: 1_284, watermark: 1}} = Scriba.reset(MyApp.Projections.OrdersV2)
 
-  Returns the number of rows removed per table.
+      {:ok, %{positions: 1_284, watermark: 1, dead_letters: 0}} =
+        Scriba.reset(MyApp.Projections.OrdersV2)
+
+  ## Options
+
+    * `:dead_letters` — `true` deletes them too (default `false`).
+    * `:repo` — required for the name form, which has no config to read it
+      from; optional for the module form, which takes it from the
+      projection's target.
+    * `:version` — for the name form only (default `1`).
+
+  ## Returns
+
+    * `{:ok, %{positions: n, watermark: n, dead_letters: n}}` — rows removed
+      per table. `dead_letters` is `0` unless you asked for them.
+    * `{:error, {:running, state}}` — the projection is live; stop it first.
+    * `{:error, :no_repo}` — no repo was given and none could be resolved.
   """
   @spec reset(module() | String.t(), keyword()) ::
           {:ok, map()} | {:error, {:running, atom()}} | {:error, :no_repo}
@@ -432,7 +448,7 @@ defmodule Scriba do
 
   defp delete_where(repo, table, name, version) do
     %{num_rows: rows} =
-      Ecto.Adapters.SQL.query!(
+      SQL.query!(
         repo,
         "DELETE FROM #{table} WHERE projection_name = $1 AND projection_version = $2",
         [name, version]

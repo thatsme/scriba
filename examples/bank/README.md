@@ -28,9 +28,11 @@ The shortest path to seeing Scriba work.
   `Commanded.EventStore.Adapters.InMemory` — restarting the demo
   forgets everything. See "Persistent event store" below for the
   10-line swap to `commanded_eventstore_adapter`.
-- Crash recovery. Scriba's PD3 property test covers cursor *resume* after
-  a clean restart; recovery under injected crashes is not covered by a
-  property test at all. The bank demo is about the happy path.
+- Crash recovery. Scriba's PD3 property test covers cursor *resume* after a
+  clean restart, and `e3_fault_injection_test.exs` covers real Postgres
+  failures; recovery under *injected process crashes* is covered by
+  `bench/test/ack_loss_test.exs` against a real event store rather than by a
+  property test. The bank demo is about the happy path.
 - Dead-letter routing and retries. Both are exercised by Scriba's
   test suite; this demo keeps the output clean.
 
@@ -67,7 +69,7 @@ Expected output:
 Opened 3 accounts.
 Dispatched 50 deposit/withdraw commands in 12ms
 Waiting for projection to catch up...
-Caught up in 31ms.
+Caught up in 5.8s.
 
 account_balances:
   4f3e8a07... balance: 1840.50 USD  (last event: pos 47)
@@ -79,7 +81,13 @@ Projection state:       running
 Safe position:          42
 ```
 
-The exact numbers vary — the deposit/withdraw amounts are random.
+The exact numbers vary — the deposit/withdraw amounts are random. The
+catch-up time does not vary much, and it is worth understanding: the
+InMemory adapter hands over one event at a time, so each of the 53 events
+waits out the batcher's 100ms `:batch_timeout`. That is a property of the
+demo's event store, not of Scriba — against a real EventStore with
+`buffer_size` set, the same work runs in milliseconds (see the README's
+throughput section).
 Negative balances are expected and intentional; the demo does not
 enforce an overdraft check.
 

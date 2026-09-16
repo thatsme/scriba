@@ -41,19 +41,17 @@ defmodule Scriba.Projection do
     * `:version` — `1`. Bump to run a new projection side-by-side with the
       old one (two modules, two version integers).
     * `:partition_by` — `:stream_id`. **Only `:stream_id` is supported in
-      v0.1.** Custom partitioners are post-v0.1; passing anything else
+      today.** Custom partitioners are not supported; passing anything else
       raises at compile time.
     * `:handler` — `__MODULE__`. The module whose `handle/2` clauses the
       engine calls. Defaults to the module being `use`d.
     * `:batch_size` (default `50`), `:batch_timeout` (default `100` ms) and
       `:retry` (default 3 attempts with `[100, 1000, 10_000]` ms backoff;
-      `retry: false` for a single attempt) — pass through to Pipeline
+      `retry: false` for a single attempt) — pass through to the batcher and
+      the retry layer respectively. See `SCRIBA_ARCHITECTURE.md` §9.1.
     * `:lag_interval` (default `5_000` ms, `0` disables) — how often the
-      Coordinator emits `[:scriba, :projection, :lag]`. Fires on a timer
-      rather than on traffic, so an idle projection still reports.
-      and the retry layer respectively. See
-      `Scriba.Projection.Pipeline` and `SCRIBA_ARCHITECTURE.md` §9.1 for
-      defaults.
+      Coordinator emits `[:scriba, :projection, :lag]`. On a timer rather
+      than on traffic, so an idle projection still reports.
 
   ## `handle/2` callback contract
 
@@ -84,7 +82,7 @@ defmodule Scriba.Projection do
   the cause — where the alternative fails silently and looks like a working
   projection over an incomplete read model.
 
-  Loud is the v0.1 choice. It is also the one that stays open: an opt-in
+  Loud is the choice. It is also the one that stays open: an opt-in
   `on_unmatched: :skip` can be added in any 0.1.x without breaking anyone,
   whereas changing the *default* to skip would silently convert recorded
   failures into nothing.
@@ -192,7 +190,7 @@ defmodule Scriba.Projection do
     # own defaults apply otherwise — keeps the macro from duplicating
     # default values that live in lib/scriba/projection/pipeline.ex.
     passthrough =
-      Enum.reduce([:batch_size, :batch_timeout, :retry], %{}, fn key, acc ->
+      Enum.reduce([:batch_size, :batch_timeout, :retry, :lag_interval], %{}, fn key, acc ->
         case Keyword.fetch(opts, key) do
           {:ok, value} -> Map.put(acc, key, value)
           :error -> acc
@@ -250,7 +248,7 @@ defmodule Scriba.Projection do
 
   defp legacy_opt_message(:schema_prefix, _value) do
     """
-    Scriba does not support :schema_prefix in v0.1.
+    Scriba does not support :schema_prefix.
 
     `scriba_positions` and `scriba_dead_letters` live in the repo's default
     prefix. You can still pass `prefix:` on your own operations via a
@@ -341,7 +339,7 @@ defmodule Scriba.Projection do
 
       other ->
         raise ArgumentError, """
-        :partition_by must be :stream_id in v0.1; custom partitioners are post-v0.1.
+        :partition_by must be :stream_id; custom partitioners are not supported.
         Got: #{inspect(other)}
         """
     end

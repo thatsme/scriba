@@ -60,7 +60,7 @@ defmodule Scriba.Target do
   schema that does not match the code would drain every event into
   `scriba_dead_letters` over an empty read model.
 
-  > #### Verification status (v0.1) {: .warning}
+  > #### Verification status {: .warning}
   >
   > The replay half of this — source refuses to ack, forces redelivery, dedup
   > filters what committed — is exercised through `Scriba.Test.Source`, which

@@ -284,7 +284,7 @@ defmodule Scriba.Position do
     end
   end
 
-  # Deliberately NOT part of the v0.1 public API — see the reasoning below.
+  # Deliberately NOT part of the public API — see the reasoning below.
   #
   # The direction of the asymmetry decides this: publishing it now and
   # removing it later is a breaking change, whereas keeping it internal now
@@ -416,7 +416,7 @@ defmodule Scriba.Position do
 
   Trade-off, deliberately taken: `GREATEST` also masks a genuine Pipeline bug
   that computes a regressing advance, converting loud corruption into a silent
-  no-op. That is the right trade for a v0.1 whose stated first principle is
+  no-op. That is the right trade for a library whose first principle is
   correctness over throughput. If detection is later wanted, add
   `WHERE EXCLUDED.position > scriba_positions.position` and raise on zero rows
   affected — but do not go back to an unconditional `SET`.

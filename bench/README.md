@@ -48,8 +48,26 @@ Reference points at this rate:
 ```
 
 Each run subscribes under a name never used before and truncates the read
-model and cursor tables first, so runs are independent and repeatable. Seeding
+model, cursor, dead-letter and watermark tables first, so runs are
+independent and repeatable. Seeding
 is not timed.
+
+## The experiments
+
+`bench/` is also where tests that need a real event store live, rather than a
+real database. `mix test` in this directory runs them:
+
+| Test | What it establishes |
+|---|---|
+| `ack_loss_test.exs` | An event still in its handler survives a crash that acknowledged later events. Fails on 0.1.2, passes since 0.1.3. |
+| `standby_test.exs` | A projection that cannot get its subscription stands by and takes over when the holder dies. |
+| `watermark_test.exs` | A caught-up projection's watermark equals the last position, and never runs ahead of the read model. |
+| `multi_node_contention_test.exs` | A projection that loses the subscription race does not damage the one that has it. |
+| `broadway_dashboard_spike_test.exs` | `broadway_dashboard` discovers and attaches to Scriba's pipelines. |
+
+Each of them refutes or confirms a claim made in the library's
+documentation, which is why they are kept rather than deleted after the
+question was answered.
 
 ## What it measures, and what it does not
 

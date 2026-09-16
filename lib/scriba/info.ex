@@ -4,11 +4,17 @@ defmodule Scriba.Info do
 
   ## Population
 
-  All fields are populated when `Scriba.info/2` finds a registered
+  `Scriba.info/2` populates every field it can when it finds a registered
   Coordinator: `:name`, `:version` and the position fields
   (`:safe_position`, `:stream_positions`) come from the position cache;
   `:status`, `:source` and `:target` come from the Coordinator's status
-  call. When no Coordinator is registered, `Scriba.info/2` returns
+  call; `:watermark` and `:lag_ms` are read from `scriba_watermarks`.
+
+  Three fields are legitimately `nil`: `:halt_reason` outside `:halted`, and
+  `:watermark`/`:lag_ms` before the projection has committed anything or for
+  a source that reports no watermark.
+
+  When no Coordinator is registered, `Scriba.info/2` returns
   `{:error, :not_found}` rather than a partially-populated struct.
 
   `:status` is one of `:initializing | :running | :paused | :draining |

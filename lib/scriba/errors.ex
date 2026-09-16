@@ -37,7 +37,7 @@ defmodule Scriba.BatchCommitError do
   correct observable behaviour for what remains. A silent stall is not, and
   neither is an infinite loop against a bad column name.
 
-  ## Verification status (v0.1)
+  ## Verification status
 
   This mechanism — refuse to ack, kill the producer, rewind the subscription,
   back off, replay — is exercised by the suite through `Scriba.Test.Source`,

@@ -120,8 +120,11 @@ defmodule Scriba.ProjectionTest do
       end
     end
 
-    test "non-:stream_id :partition_by raises with v0.1 limitation message" do
-      assert_raise ArgumentError, ~r/v0\.1/, fn ->
+    test "non-:stream_id :partition_by raises, saying custom partitioners are unsupported" do
+      # Asserting the limitation rather than the version it was introduced in:
+      # the message outlives any particular release, and pinning a version
+      # string makes the test fail when the docs are brought up to date.
+      assert_raise ArgumentError, ~r/custom partitioners are not supported/, fn ->
         Code.eval_quoted(
           quote do
             defmodule BadPartitionBy do

@@ -104,8 +104,12 @@ defmodule Scriba.Target.Ecto do
 
   Order of steps in the assembled Multi:
 
-    1. Read-model ops (one `{:scriba_event, event.id}` per non-`:skip`
-       success event).
+    1. Read-model ops. `{:insert, _}`, `{:update, _, _, _}` and
+       `{:delete, _, _}` each add one step keyed `{:scriba_event, event.id}`;
+       `{:multi, _}` is merged under the user's own operation names, which is
+       why colliding names across a batch have to be caught before assembly
+       (see `{:multi_key_collision, _}` in `Scriba.DeadLetter`). `:skip` adds
+       nothing.
     2. Per-stream cursor advances (one `{:scriba_position, stream_id}`).
     3. Dead-letter inserts (one `{:scriba_dead_letter, event.id}`).
   """

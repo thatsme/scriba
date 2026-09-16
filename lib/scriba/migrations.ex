@@ -39,13 +39,20 @@ defmodule Scriba.Migrations do
   is explicit rather than detected: guessing wrong would either skip a step
   or re-run one, and your migration file is the thing that knows.
 
+  Every step is idempotent (`create_if_not_exists`), which matters more than
+  it looks. Your original migration called `up()`, and `up()` means "latest"
+  — so on a **fresh** database it now creates the version 2 table too, and
+  the upgrade migration you added runs second and finds it already there.
+  Without idempotent steps that combination fails for every new deployment of
+  your app while working fine on the ones you were upgrading.
+
   All tables are owned by the user's repo.
 
   ## stream_id constraint
 
   `stream_id` is `varchar(255)`. Adapters whose native stream identifiers are
   richer (UUIDs, integers, composite keys) must convert to a string at the
-  boundary. This is a deliberate v0.1 simplification — it lets the position
+  boundary. This is a deliberate simplification — it lets the position
   cursor schema and ETS keys share one type without per-adapter generics.
   """
 
@@ -112,7 +119,7 @@ defmodule Scriba.Migrations do
     # the row whose stream_id equals the event's stream_id; cross-partition
     # commit ordering can no longer cause silent drops because each stream
     # has its own cursor.
-    create table(:scriba_positions, primary_key: false) do
+    create_if_not_exists table(:scriba_positions, primary_key: false) do
       add :projection_name, :string, size: 255, null: false, primary_key: true
       add :projection_version, :integer, null: false, primary_key: true
       add :stream_id, :string, size: 255, null: false, primary_key: true
@@ -121,9 +128,9 @@ defmodule Scriba.Migrations do
     end
 
     # Aggregate lookups across all streams of one projection need this index.
-    create index(:scriba_positions, [:projection_name, :projection_version])
+    create_if_not_exists index(:scriba_positions, [:projection_name, :projection_version])
 
-    create table(:scriba_dead_letters) do
+    create_if_not_exists table(:scriba_dead_letters) do
       add :projection_name, :string, size: 255, null: false
       add :projection_version, :integer, null: false
       add :position, :bigint, null: false
@@ -136,8 +143,8 @@ defmodule Scriba.Migrations do
       add :occurred_at, :utc_datetime_usec, null: false, default: fragment("now()")
     end
 
-    create index(:scriba_dead_letters, [:projection_name, :projection_version])
-    create index(:scriba_dead_letters, [:occurred_at])
+    create_if_not_exists index(:scriba_dead_letters, [:projection_name, :projection_version])
+    create_if_not_exists index(:scriba_dead_letters, [:occurred_at])
   end
 
   ## Version 2 — the contiguous watermark
@@ -147,7 +154,7 @@ defmodule Scriba.Migrations do
     # question per-stream cursors cannot: how far has this projection got
     # *overall*, counting nothing it has not yet applied. See
     # `Scriba.Watermark`.
-    create table(:scriba_watermarks, primary_key: false) do
+    create_if_not_exists table(:scriba_watermarks, primary_key: false) do
       add :projection_name, :string, size: 255, null: false, primary_key: true
       add :projection_version, :integer, null: false, primary_key: true
       add :position, :bigint, null: false
@@ -156,10 +163,10 @@ defmodule Scriba.Migrations do
     end
   end
 
-  defp step_down(2), do: drop(table(:scriba_watermarks))
+  defp step_down(2), do: drop_if_exists(table(:scriba_watermarks))
 
   defp step_down(1) do
-    drop table(:scriba_dead_letters)
-    drop table(:scriba_positions)
+    drop_if_exists table(:scriba_dead_letters)
+    drop_if_exists table(:scriba_positions)
   end
 end

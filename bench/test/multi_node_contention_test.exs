@@ -5,14 +5,19 @@ defmodule ScribaBench.MultiNodeContentionTest do
 
   This is the shape of a rolling deploy. A persistent subscription admits one
   subscriber, so on a three-node deploy one node wins the race and the others
-  get `{:error, :subscription_already_exists}`. `Scriba.Source.Commanded`
-  retries that five times over ~1.5s and then raises, and a raising producer
-  is restarted by `Scriba.Projection.Supervisor` — which runs at 30 restarts
-  per 60 seconds and, when that budget is exhausted, dies and propagates
-  toward `Scriba.Projections.Supervisor` and the host application.
+  get `{:error, :subscription_already_exists}`.
 
-  The claim under test is therefore not "the loser fails" — it is supposed to
-  fail. It is: **does the loser's failure damage the winner?**
+  When this test was written the loser raised, and a design review predicted
+  that the raising producer would be restarted by
+  `Scriba.Projection.Supervisor` until its 30-in-60 budget was exhausted,
+  taking the host application with it. That did not happen — a child that
+  fails during `init` is never adopted, so nothing restarted it — and the
+  measurement is what led to standby: the loser now waits and takes over
+  (`standby_test.exs`).
+
+  The claim still under test is the one that outlives both behaviours:
+  **does a projection that cannot get its subscription damage the one that
+  has it?**
 
   Measured here:
 

@@ -158,9 +158,10 @@ Nothing — Scriba never reads or writes it. It is left exactly as the old
 library left it.
 
 Keep it until the cutover is proven (it is your rollback state). Drop it
-afterwards in your own migration. `Scriba.Migrations.up/0` only creates
-`scriba_positions` and `scriba_dead_letters`; it does not touch or
-supersede the old table automatically.
+afterwards in your own migration. `Scriba.Migrations.up/1` creates only
+Scriba's own tables — `scriba_positions`, `scriba_dead_letters` and
+`scriba_watermarks` — and does not touch or supersede the old table
+automatically.
 
 ---
 
@@ -254,15 +255,19 @@ source, defaulting to `"scriba"`.
 **If you run more than one projection against one Commanded application,
 give each an explicit `:subscription_name`.** This is the most likely
 first-deploy mistake, because the default is shared: the second projection
-to start asks for a subscription the first already holds, the event store
-returns `{:error, :subscription_already_exists}`, and its producer refuses
-to start with that error. Under a supervisor that is a restart loop, and
-only the projection that lost the race is affected — the other one runs
-normally, so the symptom is "one of my projections never processes
-anything."
+to start asks for a subscription the first already holds, and the event
+store returns `{:error, :subscription_already_exists}`.
 
-The same collision is what happens if you start Scriba while the old
-projector still holds the subscription name you gave it.
+That does not fail loudly. Scriba treats a held subscription as a standby
+situation — the projection starts, reports `:running`, retries in the
+background, and projects nothing until the name is released. The symptom is
+"one of my projections never processes anything" with a healthy-looking
+status, which is harder to spot than a crash. Watch for
+`[:scriba, :source, :standby]`, or read the log line it emits once.
+
+That behaviour is deliberate, because it is also what lets you deploy Scriba
+while the old projector still holds the name: Scriba waits, and picks up the
+moment you stop it.
 
 Also: if your old projector was named `"orders_v2"`, drop the suffix and
 use `version: 2`. Scriba warns at compile time when `:name` matches
@@ -433,7 +438,9 @@ handlers.
 3. Give `{:multi, _}` returns event-unique keys.
 4. Audit dispatch sites for `consistency: :strong` on this projector.
 5. Audit handlers for cross-stream shared state.
-6. Run `Scriba.Migrations.up/0` in a migration.
+6. Run `Scriba.Migrations.up()` in a migration — or, if you are already
+   running Scriba 0.1.x, `Scriba.Migrations.up(from: 1)` to add the
+   watermark table to the schema you have.
 7. Record `last_seen_event_number` from `projection_versions`.
 8. Stop the old projector; deploy Scriba with `subscription_name:` (new)
    and `start_from:` (the recorded number).

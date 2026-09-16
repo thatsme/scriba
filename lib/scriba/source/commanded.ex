@@ -76,6 +76,22 @@ defmodule Scriba.Source.Commanded do
   absent. `start_link/1` raises a clear error in that case; `child_spec/1` is
   always safe.
 
+  ## Watermark persistence
+
+  The producer also records how far the projection has got. `ack_contiguous/1`
+  already computes the highest gapless committed position in order to
+  acknowledge safely, so persisting that number costs a write rather than a
+  second calculation: it goes to `scriba_watermarks` (see `Scriba.Watermark`),
+  throttled to at most one write a second while events are in flight and
+  flushed immediately once the in-flight queue drains, so an idle projection
+  does not sit on a stale number.
+
+  The Pipeline supplies the repo and projection identity through a
+  `:scriba_watermark` option it injects into every source's opts. A source
+  that does not compute a contiguous position ignores it, and a failed write
+  is logged rather than raised — the watermark is observability, and losing
+  one should not cost the projection.
+
   ## Standby: what happens when another subscriber holds the name
 
   A persistent subscription admits one subscriber. Rather than failing, a
@@ -84,12 +100,16 @@ defmodule Scriba.Source.Commanded do
   deployment that is a warm standby — one node projects, the others wait,
   and a failover needs nobody's intervention.
 
-  The first five attempts are fast (50ms to 800ms), for the case where a
-  producer died deliberately to force a replay and the store has not yet
-  processed the DOWN. After those the cadence settles to about a minute with
-  jitter, so standbys that started together do not retry in lockstep.
+  The curve has three phases, because two different failures share it. The
+  first five attempts are milliseconds apart (50ms to 800ms), for the case
+  where a producer died deliberately to force a replay and the store has not
+  yet processed the DOWN. The next thirty are a second apart: a killed
+  supervision tree holds its registered names until its slowest in-flight
+  handler returns, so recovery can take longer than the fast attempts cover.
+  Only after that does the cadence settle to about a minute with jitter, so
+  standbys that started together do not retry in lockstep.
 
-  `[:scriba, :source, :standby]` fires on every attempt and
+  `[:scriba, :source, :standby]` fires on every *failed* attempt and
   `[:scriba, :source, :subscribed]` when the subscription is acquired, which
   is how a takeover is observable. A standby's projection reports `:running`
   — its pipeline is up and healthy — so the telemetry, not the status, is
@@ -99,7 +119,7 @@ defmodule Scriba.Source.Commanded do
   or a store that cannot be reached raises, because retrying forever would
   hide it.
 
-  ## Pause/resume memory caveat (v0.1)
+  ## Pause/resume memory caveat
 
   `pause/1` sets a `paused: true` flag — `handle_demand/2` returns no
   messages while paused, accumulating it in the state's `:demand`. The
@@ -116,7 +136,7 @@ defmodule Scriba.Source.Commanded do
   The cleaner alternative — unsubscribe on pause, re-subscribe on
   resume from the current cursor — is v0.5 hardening territory and
   changes EventStore subscription state in non-trivial ways. Out of
-  scope for v0.1.
+  scope for now.
   """
 
   @behaviour Scriba.Source
@@ -354,9 +374,6 @@ defmodule Scriba.Source.Commanded do
         attempt = state.subscribe_attempt + 1
         delay = subscribe_delay(attempt)
 
-        # Loud once, quiet after. A standby is a steady state, and a line per
-        # minute per projection is noise; the telemetry event carries the
-        # ongoing signal.
         # Loud once, quiet after. A standby is a steady state, and a line per
         # minute per projection is noise; the telemetry event carries the
         # ongoing signal.

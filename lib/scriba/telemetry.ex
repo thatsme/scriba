@@ -6,7 +6,7 @@ defmodule Scriba.Telemetry do
   no central emitter. This module documents the surface so users attaching
   handlers (via `:telemetry.attach_many/4`) have a single place to read.
 
-  ## v0.1 events
+  ## Events
 
   | Event | Emitter | Measurements | Metadata |
   | --- | --- | --- | --- |

@@ -39,19 +39,22 @@ cut over in place. No read-model rebuild, no maintenance window.
 
 ## Status
 
-**v0.1.** The architectural contract is frozen
+**v0.2.** The architectural contract is frozen
 ([`SCRIBA_ARCHITECTURE.md`](SCRIBA_ARCHITECTURE.md)) and the operational
-primitives — telemetry, dead-letter routing, retry policy, real
-pause/resume — are in place. Property tests cover per-stream ordering,
-cursor/read-model consistency, and resume-from-cursor after a restart;
-fault injection against real Postgres covers the failure taxonomy.
-Effectively-once under injected crash schedules is enforced
-structurally rather than by a property test — see architecture §10.
+primitives — telemetry, dead-letter routing and inspection, retry policy,
+real pause/resume, lag reporting, multi-node standby — are in place.
+Property tests cover per-stream ordering, cursor/read-model consistency,
+and resume-from-cursor after a restart; fault injection against real
+Postgres covers the failure taxonomy; a separate harness (`bench/`)
+exercises acknowledgement, standby takeover and the watermark against a
+real event store. Effectively-once under injected crash schedules is
+enforced structurally rather than by a property test — see architecture
+§10.
 
-What's deliberately out of scope for v0.1:
+What's deliberately out of scope:
 
 - A LiveView dashboard. `broadway_dashboard` already renders Scriba
-  projections — see above.
+  projections — see "Seeing a projection in LiveDashboard" below.
 - Throughput metrics of Scriba's own — Broadway's batch telemetry and the
   per-event `:stop` events already carry the rate.
 - Online rebuild / shadow targets / atomic swap (v0.3).
@@ -85,7 +88,7 @@ Scriba is an opinionated rewrite of that role with three principles:
    events are parallel.
 3. **Sharp edges are documented, not hidden.** Dead-lettered events
    advance the cursor (skip-and-continue, not block-the-projection).
-   The handler return contract is six tagged tuples, not a DSL. Lag is
+   The handler return contract is six return shapes, not a DSL. Lag is
    a telemetry-consumer concern, not an engine feature.
 
 Migrating an existing projector is a mechanical rewrite —
@@ -518,7 +521,7 @@ claim honest.
 
 ## How far along, and how far behind
 
-`Scriba.info/2` reports two numbers an operator can alert on:
+`Scriba.info/1` reports two numbers an operator can alert on:
 
 ```elixir
 {:ok, info} = Scriba.info(MyApp.Projections.Orders)
@@ -558,7 +561,7 @@ goes away. No leader election, no extra dependency, nothing to configure.
 ```
 
 A standby's projection reports `:running` — its pipeline is up and healthy,
-it simply has no subscription yet — so those two events, not `info/2`, are
+it simply has no subscription yet — so those two events, not `info/1`, are
 what tell you which node is doing the work.
 
 The same behaviour covers a cutover from `commanded_ecto_projections`: start
@@ -590,8 +593,10 @@ dead-lettering is papering over — and if a whole batch fails that way at
 once, `Scriba.Circuit` halts the projection rather than draining the stream
 into the table.
 
-A row carries `:position`, `:stream_id`, `:event_type`, `:error_kind`,
-`:error_message`, `:occurred_at` and the serialized `:event_data`. There is
+A row carries `:id`, `:position`, `:stream_id`, `:event_type`,
+`:error_kind`, `:error_message`, `:occurred_at` and the serialized
+`:event_data`. `:id` orders rows that share a timestamp and is the natural
+paging key alongside `:limit` and `:offset`. There is
 no replay function: `:event_data` records what failed rather than a value
 that can be re-dispatched, so replaying means reading the event from the
 source by `:position`. Filters, paging and ordering are in
@@ -697,20 +702,25 @@ Migrations run in `test_helper.exs` against an existing connection.
   changes engine behavior.
 - [`examples/bank/README.md`](https://github.com/thatsme/scriba/blob/main/examples/bank/README.md)
   — example app walkthrough.
-- `Scriba.Telemetry` moduledoc — full v0.1 telemetry event surface.
+- `Scriba.Telemetry` moduledoc — the full telemetry event surface.
 
 ---
 
 ## Versioning
 
-Scriba follows semver. The v0.1.0 API surface (`start_projection`,
-`pause`, `resume`, `stop`, `info` and `list` in `Scriba`, plus the macro at
-`Scriba.Projection`) is frozen — no breaking changes within 0.1.x. New
-optional features may land in 0.1.x patch releases.
+Scriba follows semver. The public API is `start_projection`, `pause`,
+`resume`, `stop`, `info`, `list`, `dead_letters`, `dead_letter_stats` and
+`reset` in `Scriba`, plus the macro at `Scriba.Projection` and the
+test-time helpers in `Scriba.Testing`. The six lifecycle functions frozen
+at v0.1.0 have not changed; 0.2.0 added the last three, which are
+additive.
+
+0.2.0 adds a table (`scriba_watermarks`), so upgrading from 0.1.x means one
+migration — `Scriba.Migrations.up(from: 1)`. Nothing else breaks.
 
 `Scriba.Target` and `Scriba.Source` behaviours are not frozen, and will
 widen if other sources or targets are built. Custom adapter authors should
-pin against a specific 0.1.x.
+pin against a specific minor version.
 
 Only Commanded and Ecto/Postgres ship today, and nothing else is being
 prepared for speculatively — an interface with one implementation behind it

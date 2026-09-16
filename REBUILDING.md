@@ -49,9 +49,11 @@ Scriba.start_projection(MyApp.Projections.OrdersV2,
 Two details matter here.
 
 **Its own `subscription_name`.** A persistent subscription admits one
-subscriber; sharing the name with v1 means one of them fails to start. The
-default is `"scriba"`, so give every projection against the same Commanded
-application an explicit name.
+subscriber, and sharing the name with v1 does not fail loudly: the loser
+stands by, reports `:running`, and projects nothing. A rebuild that appears
+to start and never advances is usually this. The default name is
+`"scriba"`, so give every projection against the same Commanded application
+an explicit one, and watch for `[:scriba, :source, :standby]`.
 
 **`buffer_size`.** The adapter default is one in-flight event, which caps
 catch-up at roughly 9 events/sec — a million events would take over a day.
@@ -88,9 +90,11 @@ Then retire v1:
 {:ok, _} = Scriba.reset("orders", version: 1, repo: MyApp.Repo)
 ```
 
-`reset/2` clears the version's cursors and watermark. It accepts a stopped
-projection and refuses a running one, and it does not touch the read model —
-drop or truncate the old table yourself.
+`reset/2` clears the version's cursors and watermark. It keeps its dead
+letters unless you pass `dead_letters: true` — they are the record of what
+went wrong on the version you are retiring. It accepts a stopped projection
+and refuses a running one, and it does not touch the read model, so drop or
+truncate the old table yourself.
 
 `stop/1` does not remove the projection: its Coordinator stays registered in
 a terminal `:stopped` state, which is why `reset/2` still finds it. To start
@@ -98,6 +102,7 @@ the same `(name, version)` again — rather than a new version — remove the
 supervision child first:
 
 ```elixir
+# pid is what start_projection/1,2 returned: the projection's supervisor
 DynamicSupervisor.terminate_child(Scriba.Projections.Supervisor, pid)
 ```
 

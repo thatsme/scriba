@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-16
+
+Operational release: a projection can now say how far behind it is, be
+tested without a pipeline, be inspected after it dead-letters, be rebuilt,
+and survive a rolling deploy. Upgrading from 0.1.x means one migration —
+`Scriba.Migrations.up(from: 1)` — and nothing else breaks.
+
 ### Changed
 
 - Documented the assumption `:position` carries: a global, monotonic,
@@ -17,6 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not a single increasing integer (commit/prepare pairs, a vector clock) is
   a design question rather than an adapter detail, and is left open rather
   than guessed at.
+
+- `bench/` gained a suite of experiments that need a real event store rather
+  than a real database: acknowledgement loss under a straggler, standby
+  takeover, the watermark end to end, subscription contention, and the
+  `broadway_dashboard` integration. Each one refutes or confirms a claim the
+  documentation makes, which is why they are kept rather than deleted once
+  the question was answered. The contention experiment is the reason standby
+  exists: it disproved a predicted crash loop and found the real gap, which
+  was that nothing retried.
 
 - Documented that the target is the transaction boundary — read-model rows,
   cursor advances and dead letters commit together or not at all — and that
@@ -39,9 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   either: nothing retried, so a failover had nobody to fail over to.
 
   The producer now starts, retries in the background, and acquires the
-  subscription when the holder releases it — five fast attempts for the
-  reap race after a deliberate producer death, then about once a minute with
-  jitter so standbys that started together do not retry in lockstep.
+  subscription when the holder releases it. The retry curve has three
+  phases, because two different failures share the path: five attempts in
+  milliseconds for the reap race after a deliberate producer death, then one
+  a second for half a minute — a killed tree holds its names until its
+  slowest in-flight handler returns — then about once a minute with jitter,
+  so standbys that started together do not retry in lockstep.
   Configuration errors still raise; retrying those forever would hide them.
 
   Two new telemetry events make a takeover observable:
@@ -96,6 +115,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `{:via, Registry, ...}` pipeline names. Scriba will not ship a dashboard of
   its own.
 
+- `:lag_interval` set in `use Scriba.Projection` was accepted and then
+  ignored — the macro validated it but never passed it on, so `lag_interval: 0`
+  did not disable anything and the Coordinator always used the 5s default.
+  Found by the release audit, between the option shipping and the release.
+
 - **`[:scriba, :projection, :lag]` telemetry.** The Coordinator emits it on a
   timer — `:lag_interval`, default 5s, `0` disables — carrying `lag_ms` and
   the `watermark` it was derived from, with the projection's `status` in the
@@ -130,6 +154,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one write a second while events are in flight, flushed immediately once the
   projection catches up — so it can trail what was applied but never runs
   ahead of it, which is the only direction that is recoverable.
+
+- Migration steps are idempotent (`create_if_not_exists`). Without that, the
+  documented upgrade path broke fresh installs: an app's original migration
+  calls `up()`, which means "latest", so a new database got the version 2
+  table from it and then the upgrade migration collided. Found by running
+  `examples/bank` end to end as part of the release gate.
 
 - **Versioned migrations.** `Scriba.Migrations.up/1` takes `:from` and `:to`,
   so a schema change ships as a numbered step: version 1 is
