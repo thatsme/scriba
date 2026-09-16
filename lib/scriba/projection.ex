@@ -164,8 +164,11 @@ defmodule Scriba.Projection do
     # Surface unknown keys early — typos in option names would otherwise
     # silently fall through to "default applied" behavior.
     case Enum.reject(Keyword.keys(opts), &(&1 in @valid_keys)) do
-      [] -> :ok
-      unknown -> raise ArgumentError, """
+      [] ->
+        :ok
+
+      unknown ->
+        raise ArgumentError, """
         Unknown option(s) #{inspect(unknown)} in use Scriba.Projection.
         Valid options: #{inspect(@valid_keys)}
         """

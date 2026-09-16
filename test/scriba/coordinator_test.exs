@@ -204,6 +204,7 @@ defmodule Scriba.Projection.CoordinatorTest do
       # Snapshot must be stable — proves pause is actually holding the
       # source, not just slow.
       Process.sleep(50)
+
       assert length(TestTarget.commits(agent)) == commits_after_settle,
              "commit count grew during pause from #{commits_after_settle} to " <>
                "#{length(TestTarget.commits(agent))} — pause didn't hold the source"
@@ -327,6 +328,7 @@ defmodule Scriba.Projection.CoordinatorTest do
 
       for {stream_id, stream_commits} <- by_stream do
         positions = Enum.map(stream_commits, fn {_id, _sid, p} -> p end)
+
         assert positions == Enum.sort(positions),
                "pause/resume broke per-stream order for #{stream_id}: #{inspect(positions)}"
       end

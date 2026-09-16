@@ -74,6 +74,7 @@ defmodule Scriba.Source.CommandedTest do
         ScribaCommanded.to_message(recorded, build_state())
 
       assert event.stream_id == "account-xyz"
+
       refute is_nil(event.stream_id),
              "stream_id is nil — to_message/2 likely reads the wrong field from RecordedEvent"
     end

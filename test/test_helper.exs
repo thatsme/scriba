@@ -77,12 +77,12 @@ case Application.get_env(:scriba, Scriba.Test.Repo) do
         all: true
       )
 
-    # Sandbox in :manual mode — tests explicitly check out a connection.
-    # Property_db tests use the shared-mode helper in
-    # `Scriba.Test.PropertyDbHelpers.setup_sandbox/1` to make the connection
-    # visible across the projection's process tree (Coordinator, Pipeline,
-    # Broadway producer/processors/batchers, Ecto target transaction). See
-    # `test/property_db/sandbox_harness_test.exs` for the foundation test.
+      # Sandbox in :manual mode — tests explicitly check out a connection.
+      # Property_db tests use the shared-mode helper in
+      # `Scriba.Test.PropertyDbHelpers.setup_sandbox/1` to make the connection
+      # visible across the projection's process tree (Coordinator, Pipeline,
+      # Broadway producer/processors/batchers, Ecto target transaction). See
+      # `test/property_db/sandbox_harness_test.exs` for the foundation test.
       Ecto.Adapters.SQL.Sandbox.mode(Scriba.Test.Repo, :manual)
     else
       ExUnit.configure(exclude: [property_db: true])

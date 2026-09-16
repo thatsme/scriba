@@ -378,6 +378,7 @@ defmodule Scriba.Source.Commanded do
   # and ships it in the failure reason, because this process cannot remember
   # anything across its own deliberate death.
   defp replay_delay({:scriba_replay, _reason, delay}), do: delay
+
   defp replay_delay(reasons) when is_list(reasons) do
     reasons |> Enum.map(&replay_delay/1) |> Enum.max(fn -> 0 end)
   end
