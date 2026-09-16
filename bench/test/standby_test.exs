@@ -114,11 +114,15 @@ defmodule ScribaBench.StandbyTest do
         delay
       end
 
-    assert Enum.take(delays, 5) == [50, 100, 200, 400, 800],
-           "the fast reap-race attempts changed: #{inspect(delays)}"
+    assert delays == [50, 100, 200, 400, 800, 1000],
+           """
+           The retry schedule changed: #{inspect(delays)}
 
-    assert List.last(delays) >= 50_000,
-           "the standby cadence did not settle to about a minute: #{inspect(delays)}"
+           Expected the five fast reap-race attempts, then the one-second
+           recovery cadence. The minute-long standby cadence starts too late
+           to assert here; `Scriba.Source.Commanded.subscribe_delay/1` is
+           unit-tested for the whole curve.
+           """
   end
 
   ## Helpers

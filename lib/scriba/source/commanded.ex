@@ -251,6 +251,11 @@ defmodule Scriba.Source.Commanded do
   @standby_interval_ms 60_000
   @standby_jitter_ms 5_000
 
+  # After the fast attempts, one per second for half a minute. This is the
+  # window in which a deliberate producer death has to recover.
+  @recovery_interval_ms 1_000
+  @recovery_attempts 30
+
   # Subscribing is retried until it succeeds, because "someone else holds
   # this subscription" is a normal state on a rolling deploy, not an error.
   # The node that loses the race stands by and takes over when the holder
@@ -272,18 +277,41 @@ defmodule Scriba.Source.Commanded do
     ])
   end
 
-  defp subscribe_delay(attempt) do
-    case Enum.at(@resubscribe_backoff, attempt - 1) do
-      nil -> @standby_interval_ms + :rand.uniform(@standby_jitter_ms)
-      delay -> delay
+  # Three phases, because two different failures share this path and they
+  # want opposite things.
+  #
+  # A producer that died deliberately to force a replay resubscribes at once,
+  # and the event store releases the old subscriber in about 100ms — so the
+  # first attempts are milliseconds apart, and the next thirty are a second
+  # apart. Recovery has to be quick: the projection is making no progress
+  # until it resubscribes, and backing off to a minute here would stall it
+  # for a minute.
+  #
+  # A standby on another node is a steady state that can last for weeks, so
+  # after that first half-minute the cadence settles to a minute, jittered so
+  # that standbys started together do not retry in lockstep.
+  @doc false
+  @spec subscribe_delay(pos_integer()) :: pos_integer()
+  def subscribe_delay(attempt) do
+    fast = length(@resubscribe_backoff)
+
+    cond do
+      attempt <= fast ->
+        Enum.at(@resubscribe_backoff, attempt - 1)
+
+      attempt <= fast + @recovery_attempts ->
+        @recovery_interval_ms
+
+      true ->
+        @standby_interval_ms + :rand.uniform(@standby_jitter_ms)
     end
   end
 
   defp standby_message(state) do
     """
     Scriba is standing by for subscription #{inspect(state.subscription_name)}: \
-    another subscriber holds it. Retrying every ~#{div(@standby_interval_ms, 1000)}s \
-    until it is released.
+    another subscriber holds it. Retrying every second for the next \
+    #{@recovery_attempts}s, then about once a minute, until it is released.
 
     On a multi-node deployment this is expected — one node holds the
     subscription and the others take over if it goes away. If you did not
@@ -326,6 +354,9 @@ defmodule Scriba.Source.Commanded do
         attempt = state.subscribe_attempt + 1
         delay = subscribe_delay(attempt)
 
+        # Loud once, quiet after. A standby is a steady state, and a line per
+        # minute per projection is noise; the telemetry event carries the
+        # ongoing signal.
         # Loud once, quiet after. A standby is a steady state, and a line per
         # minute per projection is noise; the telemetry event carries the
         # ongoing signal.

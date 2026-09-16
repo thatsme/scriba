@@ -79,7 +79,12 @@ defmodule ScribaBench.AckLossTest do
     # event that has not committed. Waiting for ALL of them would not work:
     # per-stream ordering hashes streams onto processors, so the fast streams
     # sharing the straggler's processor are queued behind it by design.
-    assert wait_until(fn -> count_fast() >= 50 end, 30_000),
+    # Ten, not fifty: the guard only has to establish that batches were
+    # committing while the straggler was still inside its handler. Waiting
+    # for a large share of them makes the setup race the straggler's own
+    # timer under load, and the test then fails for having taken too long
+    # rather than for losing an event.
+    assert wait_until(fn -> count_fast() >= 10 end, 30_000),
            "no fast events committed: #{count_fast()}/#{fast_total}"
 
     assert count_slow(slow_stream) == 0,
@@ -196,9 +201,28 @@ defmodule ScribaBench.AckLossTest do
       5_000 -> flunk("projection did not die")
     end
 
-    # The event store needs to see the subscriber go away before the next
-    # subscribe under the same name succeeds.
-    Process.sleep(500)
+    # Wait for the corpse to deregister rather than sleeping a guessed
+    # interval. Killing a supervision tree tears its children down
+    # asynchronously, and Broadway refuses to start a topology whose via-tuple
+    # names are still held — so a restart races the tree it is replacing.
+    # Wait for the old tree to deregister every one of its Broadway processes,
+    # not just the producer. A :kill on the supervisor reaches the supervisors
+    # as a trappable exit, so they shut their children down in an orderly way
+    # — and a processor sleeping inside the straggler's handler does not
+    # return for eight seconds. Until those names are free, Broadway refuses
+    # to start a replacement topology, so a restart that does not wait here
+    # spends the window colliding with the tree it is replacing.
+    wait_until(
+      fn ->
+        Scriba.Internals.Registry
+        |> Registry.select([{{:"$1", :_, :_}, [], [:"$1"]}])
+        |> Enum.all?(fn
+          {"ackloss", 1, _} -> false
+          _ -> true
+        end)
+      end,
+      30_000
+    )
   end
 
   defp stop_projection do

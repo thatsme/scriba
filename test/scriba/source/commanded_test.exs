@@ -130,6 +130,40 @@ defmodule Scriba.Source.CommandedTest do
     end
   end
 
+  describe "subscribe_delay/1 — the retry curve" do
+    # Two failures share this path and want opposite things. A producer that
+    # died deliberately to force a replay has to resubscribe in milliseconds,
+    # because the projection makes no progress until it does. A standby on
+    # another node may wait for weeks and must not hammer the event store.
+    # The curve is the compromise, so its shape is worth pinning.
+
+    test "starts in milliseconds, for the reap race after a deliberate death" do
+      assert Enum.map(1..5, &ScribaCommanded.subscribe_delay/1) == [50, 100, 200, 400, 800]
+    end
+
+    test "holds at one second through the recovery window" do
+      # Long enough to cover a tree whose slowest in-flight handler delays
+      # teardown, which is when the name is still held.
+      for attempt <- 6..35 do
+        assert ScribaCommanded.subscribe_delay(attempt) == 1_000
+      end
+    end
+
+    test "settles to about a minute once it is clearly a standby" do
+      for attempt <- 36..60 do
+        delay = ScribaCommanded.subscribe_delay(attempt)
+        assert delay >= 60_000
+        assert delay <= 65_000
+      end
+    end
+
+    test "jitters, so standbys started together do not retry in lockstep" do
+      delays = Enum.map(1..50, fn _ -> ScribaCommanded.subscribe_delay(40) end)
+
+      assert length(Enum.uniq(delays)) > 1
+    end
+  end
+
   describe "ack/3 — success path acknowledges from the subscriber process" do
     # Regression coverage for a bug that made Scriba unusable against any
     # event store that identifies the acking subscriber by `self()`.

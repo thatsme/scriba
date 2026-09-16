@@ -20,7 +20,7 @@ defmodule ScribaBench.StragglerProjection do
   alias ScribaBench.Events.Ticked
   alias ScribaBench.ReadModel
 
-  @straggler_delay_ms 8_000
+  @straggler_delay_ms 15_000
 
   def handle(%Ticked{stream: "slow-" <> _ = stream, n: n}, %{position: pos}) do
     Process.sleep(@straggler_delay_ms)
