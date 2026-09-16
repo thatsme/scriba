@@ -816,9 +816,19 @@ own server-side subscription state, not from Scriba:
 * `Scriba.Source.Commanded` subscribes with a stable subscription `name`
   and a configurable `:start_from` (default `:origin`). Commanded's event
   store persists that subscription's acked position; on Pipeline restart,
-  the re-subscription resumes from the persisted position. Acknowledgement
-  is issued by the producer process itself, because an event store may
-  identify the acking subscriber by its pid.
+  the re-subscription resumes from the persisted position.
+
+  Two rules govern how that position advances, and both are load-bearing:
+
+  1. **The producer acknowledges, not the batch processor.** An event store
+     may resolve the acking subscriber from `self()` and discard an ack from
+     any other process, without an error.
+  2. **Only a gapless prefix is acknowledged.** Acks are prefix acks and
+     batches commit out of order under `:parallelism > 1`, so an event still
+     inside its handler holds the watermark back regardless of how many
+     later events have committed. Acknowledging per committed batch instead
+     checkpoints past an uncommitted event, and a crash there loses it
+     silently — verified against a real event store, not reasoned about.
 * Future adapters (e.g. ExESDB) follow the same pattern — server-side
   subscription state is the source of truth for "where this projection
   has consumed up to."

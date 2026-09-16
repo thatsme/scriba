@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-16
+
+### Fixed
+
+- **Acknowledgement advances only across a gapless prefix of committed
+  events.** Scriba acknowledged each batch as it committed. Acks are prefix
+  acks — acking event 7 acknowledges everything up to 7 — and batches do not
+  commit in source order when `:parallelism` exceeds 1. A handler still
+  working on event 5, or sleeping in the retry loop, did not stop events 6
+  and 7 from committing and acking, which moved the subscription's
+  checkpoint past event 5. A crash in that window lost event 5 outright: the
+  store believed it had been delivered, the per-stream cursor never
+  advanced, and nothing redelivered it. No dead letter, no cursor anomaly,
+  no log line, and `Scriba.info/2` still reporting `:running`.
+
+  The producer now tracks dispatched events in delivery order and
+  acknowledges only the longest run of committed ones with no gap. An
+  uncommitted event holds the watermark back however many later events have
+  committed; a crash then replays from below it, and pipeline-side dedup
+  drops whatever had already been applied.
+
+  **0.1.2 users should upgrade.** That release forwards `:buffer_size` and
+  its documentation recommends raising it — which is exactly what opens this
+  window. At the adapter default of one in-flight event, no later event can
+  overtake a straggler, so the window is nearly unreachable; with
+  `buffer_size: 500` it is wide.
+
+  Reproduced against a real EventStore in `bench/test/ack_loss_test.exs`,
+  which fails on 0.1.2 and passes here.
+
+  Also faster: one acknowledgement per drain rather than one per event
+  removes a `GenServer.call` per event from the commit path. The benchmark
+  went from 2,448 to 4,761 events/sec at `buffer_size: 500`.
+
 ## [0.1.2] - 2026-09-16
 
 ### Added

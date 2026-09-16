@@ -27,12 +27,15 @@ defmodule Scriba.Source.Commanded do
   in-flight event waits out its full `:batch_timeout` before acking and
   releasing the next one.
 
-  Measured against a real EventStore, 5,000 events over 100 streams:
+  Measured against a real EventStore, 500 events over 50 streams:
 
   | `:buffer_size` | Throughput | 10M events |
   |---|---|---|
-  | unset (adapter default, 1) | 9.1 events/sec | 12.7 days |
-  | 500 | 2,448 events/sec | 68 minutes |
+  | unset (adapter default, 1) | 9.0 events/sec | 12.9 days |
+  | 500 | 2,183 events/sec | 76 minutes |
+
+  Longer runs amortise startup and go faster still — 5,000 events at
+  `buffer_size: 500` reaches roughly 4,700/sec on the same machine.
 
   Scriba sets no default of its own — the adapter's applies unless configured.
   Raising it trades memory and redelivered-work-after-a-crash for throughput:
@@ -42,6 +45,23 @@ defmodule Scriba.Source.Commanded do
       source: {Scriba.Source.Commanded,
                application: MyApp.CommandedApp,
                buffer_size: 500}
+
+  ## Acknowledgement watermark
+
+  Two properties of this producer make a larger buffer safe.
+
+  Acknowledgement is issued **by this process**, not by the Broadway batch
+  processor that committed the batch. An event store may resolve the acking
+  subscriber from `self()` and silently ignore an ack from anywhere else,
+  which stalls the subscription for good once its buffer fills.
+
+  And only the longest **gapless** run of committed events is acknowledged.
+  Acks are prefix acks — acking event 7 acks everything up to 7 — while
+  batches commit out of source order whenever `:parallelism` exceeds 1. A
+  handler still working on event 5 must therefore hold the watermark at 4,
+  however many later events have committed; otherwise a crash in that window
+  loses event 5 with no dead letter, no cursor anomaly and no log line,
+  because the store believes it was delivered and nothing redelivers it.
 
   ## Optional dependency (§11)
 
@@ -150,7 +170,15 @@ defmodule Scriba.Source.Commanded do
       subscribed: false,
       pending: :queue.new(),
       demand: 0,
-      paused: false
+      paused: false,
+      # Events dispatched downstream and not yet acknowledged to the store, in
+      # delivery order, as {event_number, commanded_event}. Bounded by the
+      # subscription's buffer_size: the store will not send more than that
+      # before requiring an acknowledgement.
+      in_flight: :queue.new(),
+      # Event numbers whose batch committed but which cannot be acknowledged
+      # yet, because an earlier event has not committed. See ack_contiguous/2.
+      committed: MapSet.new()
     }
 
     {:producer, state}
@@ -276,11 +304,12 @@ defmodule Scriba.Source.Commanded do
   # simply stays unacknowledged and is redelivered after a restart, which is
   # the same outcome as a crash between commit and ack.
   def handle_info({:scriba_ack, events}, state) do
-    Enum.each(events, fn event ->
-      apply(@event_store, :ack_event, [state.application, state.subscription, event])
-    end)
+    committed =
+      Enum.reduce(events, state.committed, fn event, set ->
+        MapSet.put(set, event.event_number)
+      end)
 
-    {:noreply, [], state}
+    {:noreply, [], ack_contiguous(%{state | committed: committed})}
   end
 
   def handle_info(:scriba_pause, state) do
@@ -404,6 +433,54 @@ defmodule Scriba.Source.Commanded do
 
   ## Internals
 
+  # Acknowledges the longest run of committed events starting at the oldest
+  # unacknowledged one, and nothing past a gap.
+  #
+  # Acknowledging each batch as it commits is not safe, because acks are
+  # prefix acks and batches do not commit in source order. With
+  # `parallelism > 1` a handler can still be working on event 5 — or sleeping
+  # in the retry loop — while events 6 and 7 from other streams commit. The
+  # event store treats an ack for 7 as an ack for everything up to 7
+  # (`EventStore.Subscriptions.Subscriber.acknowledge/2`: "All in-flight
+  # events up to the ack'd event number are also ack'd"), so its checkpoint
+  # moves past 5. A crash in that window loses event 5 outright: the store
+  # believes it delivered it, the per-stream cursor never advanced, and
+  # nothing redelivers it — no dead letter, no cursor anomaly, no log line.
+  # Reproduced against a real EventStore in `bench/test/ack_loss_test.exs`.
+  #
+  # So the watermark only advances across a gapless prefix. Event 5 holds it
+  # back until 5 itself commits, at which point 5, 6 and 7 are acknowledged
+  # by a single ack for 7. A crash before that replays from below 5 and
+  # pipeline-side dedup drops whatever already committed.
+  defp ack_contiguous(state) do
+    {last_contiguous, in_flight, committed} =
+      drain_contiguous(state.in_flight, state.committed, nil)
+
+    if last_contiguous do
+      apply(@event_store, :ack_event, [state.application, state.subscription, last_contiguous])
+    end
+
+    %{state | in_flight: in_flight, committed: committed}
+  end
+
+  defp drain_contiguous(in_flight, committed, last) do
+    case :queue.peek(in_flight) do
+      {:value, {position, event}} ->
+        if MapSet.member?(committed, position) do
+          drain_contiguous(
+            :queue.drop(in_flight),
+            MapSet.delete(committed, position),
+            event
+          )
+        else
+          {last, in_flight, committed}
+        end
+
+      :empty ->
+        {last, in_flight, committed}
+    end
+  end
+
   defp dispatch(%{subscribed: false} = state), do: {:noreply, [], state}
   defp dispatch(%{paused: true} = state), do: {:noreply, [], state}
   defp dispatch(%{demand: 0} = state), do: {:noreply, [], state}
@@ -414,7 +491,20 @@ defmodule Scriba.Source.Commanded do
 
     messages = Enum.map(events_to_send, &to_message(&1, state))
 
-    {:noreply, messages, %{state | pending: remaining_pending, demand: remaining_demand}}
+    # Recorded in delivery order, which is source order: the acknowledgement
+    # watermark is defined against this sequence.
+    in_flight =
+      Enum.reduce(events_to_send, state.in_flight, fn event, q ->
+        :queue.in({event.event_number, event}, q)
+      end)
+
+    {:noreply, messages,
+     %{
+       state
+       | pending: remaining_pending,
+         demand: remaining_demand,
+         in_flight: in_flight
+     }}
   end
 
   defp drain_queue(queue, 0, acc), do: {Enum.reverse(acc), queue, 0}
