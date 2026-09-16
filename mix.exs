@@ -1,7 +1,7 @@
 defmodule Scriba.MixProject do
   use Mix.Project
 
-  @version "0.2.0"
+  @version "0.2.1"
   @source_url "https://github.com/thatsme/scriba"
 
   def project do
@@ -11,6 +11,9 @@ defmodule Scriba.MixProject do
       elixir: "~> 1.17",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
+      # dev/ holds a Mix task, so Mix has to be in the PLT for dialyzer to
+      # analyse it rather than report every Mix call as unknown.
+      dialyzer: [plt_add_apps: [:mix]],
       deps: deps(),
       aliases: aliases(),
       name: "Scriba",
@@ -38,7 +41,10 @@ defmodule Scriba.MixProject do
     ]
   end
 
-  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  # dev/ holds the release gate task. Not in :prod, and not in the package —
+  # `files:` lists lib explicitly, so nothing here ships.
+  defp elixirc_paths(:test), do: ["lib", "test/support", "dev"]
+  defp elixirc_paths(:dev), do: ["lib", "dev"]
   defp elixirc_paths(_), do: ["lib"]
 
   defp deps do

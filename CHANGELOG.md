@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-16
+
+Documentation and tooling. No library code changed.
+
+### Added
+
+- README section comparing Scriba with `Commanded.Event.Handler` — the
+  alternative that actually ships with Commanded, and the one a reader is
+  most likely weighing Scriba against. It says what the handler gives you
+  (`:concurrency`, `partition_by/2`, `handle_batch/1`, `error/3`), the two
+  constraints worth knowing (batching and concurrency cannot be combined;
+  acknowledgement happens when `handle/2` returns, so the read-model
+  database holds no record of progress), what Scriba adds, and when the
+  handler is the better choice.
+
+  The README argued only against `commanded_ecto_projections`, whose last
+  release was January 2024 — which meant the pitch never addressed the
+  maintained option.
+
+  Checked against Commanded 1.4.11, which is now also what the test suites
+  run against (`mix.lock` moved 1.4.9 → 1.4.11, both suites green). The
+  section names that version, because a comparison with no version on it goes
+  stale silently — 1.4.10 added `:batch_timeout`, which the first draft of
+  this section missed by reading a vendored copy.
+
+- `mix scriba.gate` — the release gate from architecture §14 as a command
+  that exits non-zero. Checks version consistency (the README install snippet
+  against `mix.exs`, and scope claims pinned to older versions), that the
+  CHANGELOG has an entry for the current version and nothing stranded under
+  `[Unreleased]`, then format, compile, credo, docs warnings, dialyzer, tests
+  and `hex.build`.
+
+  It exists because 0.2.0 shipped with `{:scriba, "~> 0.1"}` in its install
+  snippet — the most-copied block in the README — after an audit that flagged
+  it and a gate I reported as passing. A list a human interprets is not a
+  gate.
+
+### Fixed
+
+- Stale version references across the shipped documents: the README install
+  snippet (`~> 0.1` → `~> 0.2`) and its "only source shipped in v0.1" note,
+  five "no equivalent in v0.1" cells in MIGRATION.md, and five section
+  headings and scope sentences in SCRIBA_ARCHITECTURE.md that pinned current
+  behaviour to v0.1.
+
+- `examples/bank` and `mix bench.throughput` did not truncate
+  `scriba_watermarks`, so a stale watermark survived a reset.
+
 ## [0.2.0] - 2026-09-16
 
 Operational release: a projection can now say how far behind it is, be

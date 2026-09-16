@@ -72,9 +72,10 @@ in-scope / out-of-scope split.
 You're running Commanded. You need read models. The library you'd
 have reached for —
 [`commanded_ecto_projections`](https://github.com/commanded/commanded-ecto-projections)
-— has been unmaintained for years and has known sharp edges around
+— last saw a release in January 2024 and has known sharp edges around
 crash recovery, per-stream ordering across parallelism, and lag
-visibility.
+visibility. The alternative that is maintained, `Commanded.Event.Handler`,
+is compared against Scriba in the next section.
 
 Scriba is an opinionated rewrite of that role with three principles:
 
@@ -100,15 +101,98 @@ carry-over.
 
 ---
 
+## Do you need Scriba?
+
+Commanded already ships `Commanded.Event.Handler`, and for many projections
+it is the right answer. It is worth being specific about where the line is.
+
+Everything below was checked against **Commanded 1.4.11** (July 2026), which
+is what Scriba's own test suite runs against. If you are reading this against
+a later release, check its changelog — this section is a snapshot, and saying
+so is more useful than pretending otherwise.
+
+### What `Commanded.Event.Handler` gives you
+
+`:concurrency` starts several handler processes, and a `partition_by/2`
+callback routes events so that related ones land on the same process and
+stay ordered. `handle_batch/1` with `:batch_size` delivers events in
+batches, and since 1.4.10 `:batch_timeout` flushes a partial batch on time
+as well as on size — so a low-volume stream no longer waits for a batch to
+fill. `error/3` is called when a handler fails and you decide what happens —
+`{:retry, context}`, `{:retry, delay, context}`, `:skip` or
+`{:stop, reason}`. With no `error/3` at all, the handler stops on the reason
+your handler returned.
+
+That covers a great many projections, costs no extra dependency, and is
+maintained by the people who maintain your event store.
+
+Two constraints are worth knowing before you compare. Batching and
+concurrency cannot be combined — setting both raises — so you choose between
+parallel handlers and batched writes. And a handler acknowledges an event
+once `handle/2` returns, so "what has this projection applied?" is answered
+by the subscription's checkpoint, not by anything in your read-model
+database.
+
+### What Scriba adds
+
+- **The cursor and the read-model write commit together.** One
+  `Ecto.Multi`, one transaction. A crash cannot leave the read model ahead
+  of the cursor or behind it, and there is no configuration to turn that
+  off.
+- **Batching and per-stream parallelism at the same time.** Events for one
+  `stream_id` are serial; different streams run in parallel; commits are
+  batched underneath both.
+- **A failure taxonomy rather than a callback.** `Scriba.Failure` reads the
+  SQLSTATE and picks the response that terminates: transient errors replay,
+  integrity errors dead-letter that one event and continue, structural
+  errors halt the projection loudly. You are not asked to classify database
+  failures in application code.
+- **A dead-letter table you can query** — `Scriba.dead_letters/2` and
+  `dead_letter_stats/2`, with the error-kind distribution that separates a
+  poison event from a schema problem.
+- **An answer to "how far behind is it?"** — a contiguous watermark,
+  `:lag_ms` on `Scriba.info/1`, and `[:scriba, :projection, :lag]` on a
+  timer, so an idle projection still reports.
+- **Rebuilds as a procedure** — `(name, version)` runs a new version beside
+  the old one against the same events (`REBUILDING.md`).
+- **Standby on every other node** — one node holds the subscription, the
+  rest wait and take over.
+- **Tests without a pipeline** — `Scriba.Testing.project/3` runs your
+  handlers and commits through the real target so you assert on rows.
+
+### When the handler is the better choice
+
+- The projection is small, the volume is low, and a missed event is
+  something you would notice and fix by hand.
+- Your handler is naturally idempotent, so at-least-once delivery costs you
+  nothing.
+- You do not want a third table, another dependency, or another thing to
+  upgrade.
+- You need something Scriba deliberately does not do — non-Postgres targets,
+  fan-out to several read models, custom partitioning.
+
+### The honest summary
+
+Scriba is for projections where being wrong is expensive and being down is
+noticeable: where you want a crash to be recoverable rather than
+investigated, a bad event to be quarantined rather than blocking, and "is it
+caught up?" to have a numeric answer. If none of that is pressing, the
+handler you already have is less machinery for the same result.
+
+Migrating later is not costly either way — a Scriba projection is a module
+with `handle/2` clauses, which is very close to what you already have.
+
+---
+
 ## Installation
 
 ```elixir
 defp deps do
   [
-    {:scriba, "~> 0.1"},
+    {:scriba, "~> 0.2"},
 
     # Optional — needed only if you use Scriba.Source.Commanded,
-    # which is the only source shipped in v0.1.
+    # which is the only source that ships today.
     {:commanded, "~> 1.4"}
   ]
 end

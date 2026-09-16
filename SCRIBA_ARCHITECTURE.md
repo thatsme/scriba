@@ -96,14 +96,14 @@ violates one of these, the choice is wrong.
    process under a known supervisor. The supervision tree is
    inspectable in `:observer` and tells the truth about runtime
    structure.
-5. **No magic dependencies.** Deps for v0.1 are listed in §11. Adding
+5. **No magic dependencies.** Deps are listed in §11. Adding
    one requires justification. Removing one is fine.
 6. **The five-line API is the contract.** See §4. If a feature
    requires breaking that API, the feature is wrong, not the API.
 
 ---
 
-## 4. Public API surface (frozen for v0.1)
+## 4. Public API surface
 
 ### 4.1 The user-facing projection module
 
@@ -132,7 +132,7 @@ end
 ```
 
 `:version` defaults to `1` and is usually omitted; `:partition_by`
-defaults to `:stream_id` (the only value supported in v0.1).
+defaults to `:stream_id` (the only value supported).
 `use Scriba.Projection` enforces required options at compile time and
 emits a warning if `:name` matches the legacy `"_v<integer>"` suffix
 pattern (per §5, version belongs in its own option, not in the name).
@@ -301,7 +301,7 @@ Per-projection supervisors register as
 Broadway's own internal processes use `Scriba.Internals.Registry` instead,
 so the public registry stays readable.
 
-### 6.3 Telemetry event surface (v0.1)
+### 6.3 Telemetry event surface
 
 Fifteen events fire. `Scriba.Telemetry`'s moduledoc is the catalog users
 read; this table is the same surface, and changing one without the other is
@@ -698,7 +698,7 @@ without overriding backoff.
 **Telemetry:** each retry attempt re-invokes `:telemetry.span/3`,
 producing its own `:event :start` / `:event :stop` / `:event :exception`
 triple. Operators counting `:event :start` events per `event_id` can
-detect retry activity. No dedicated `:event :retry` event in v0.1.
+detect retry activity. There is no dedicated `:event :retry` event.
 
 **Dead-letter after exhaustion:** the final failure result (original
 `{:error, _}` or `{:exception, _, _}`) is what routes to dead-letter,
@@ -1067,7 +1067,10 @@ Every release clears the same bar:
 
 - The file layout matches §12.
 - **Every document is audited against the code** — not only the ones the
-  release touched. README.md, this file, MIGRATION.md, every `@moduledoc`
+  release touched. A claim about a *third-party* library names the version it
+  was verified against, and that version is the one `mix.lock` resolves: a
+  comparison written from a vendored copy two releases old is worse than no
+  comparison, because it is the first thing a reader checks. README.md, this file, MIGRATION.md, every `@moduledoc`
   and public `@doc` in `lib/`, `examples/bank/README.md`, `bench/README.md`
   and `docs/post-v0.1.md`. Each checkable claim — function names and
   arities, option names and defaults, return shapes, table and column

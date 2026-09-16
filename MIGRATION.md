@@ -245,8 +245,8 @@ you migrate a projector that maintains a counter, a total, or a ranking.
 | `name:` | `name:` — but see below |
 | — | `parallelism:` (required, no default) |
 | — | `version:` (defaults to `1`) |
-| `schema_prefix:` | no equivalent in v0.1 |
-| `timeout:` | no equivalent in v0.1 |
+| `schema_prefix:` | no equivalent |
+| `timeout:` | no equivalent |
 
 `:name` is Scriba's *projection* identity (it keys `scriba_positions`), not
 the event-store subscription name — that's `:subscription_name` on the
@@ -355,9 +355,9 @@ Rewrites required:
 | `metadata.created_at` | `meta.occurred_at` |
 | `metadata.handler_name` | — (you know your own module) |
 | `metadata[:my_key]` | `meta.metadata[:my_key]` — but see the serializer note below |
-| `metadata.correlation_id` | **not available in v0.1** |
-| `metadata.causation_id` | **not available in v0.1** |
-| `metadata.stream_version` | **not available in v0.1** |
+| `metadata.correlation_id` | **not available** |
+| `metadata.causation_id` | **not available** |
+| `metadata.stream_version` | **not available** |
 
 **Serializer note.** Whether your metadata keys are atoms or strings is a
 property of your event store's serializer, not of Scriba — both libraries
@@ -391,7 +391,7 @@ the event to `scriba_dead_letters` and **advances past it**. Your projection
 never blocks; a bad event becomes an alert, not an outage. Subscribe to
 `[:scriba, :projection, :dead_letter]` and page on it.
 
-**`schema_prefix/1,2`** — no equivalent in v0.1. You can still pass
+**`schema_prefix/1,2`** — no equivalent. You can still pass
 `prefix:` on your own operations via `{:multi, _}`, but `scriba_positions`
 and `scriba_dead_letters` live in the repo's default prefix. Multi-tenant
 projectors that relied on prefix-per-tenant should stay on the old library
