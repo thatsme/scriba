@@ -230,4 +230,32 @@ defmodule Scriba.PositionTest do
       assert Position.cache_get(other, 1, "stream-x") == {:ok, 999}
     end
   end
+
+  describe "resolve_repo/2" do
+    # The Coordinator preloads the cache and the Pipeline lazy-loads into it.
+    # If those two resolved the repo differently, one would write a cache the
+    # other never reads and dedup would quietly stop working, so both call
+    # this.
+
+    test "an explicit :repo wins over the target's" do
+      assert Position.resolve_repo([repo: MyRepo], {Scriba.Target.Ecto, repo: OtherRepo}) ==
+               MyRepo
+    end
+
+    test "falls back to the Ecto target's repo" do
+      assert Position.resolve_repo([], {Scriba.Target.Ecto, repo: MyRepo}) == MyRepo
+    end
+
+    test "a target with no repo resolves to nil" do
+      assert Position.resolve_repo([], {Scriba.Target.Test, agent: :whatever}) == nil
+    end
+
+    test "an Ecto target missing its repo raises rather than resolving to nil" do
+      # nil here would disable the preload and the lazy load silently, on a
+      # target that cannot work without a repo anyway.
+      assert_raise KeyError, fn ->
+        Position.resolve_repo([], {Scriba.Target.Ecto, []})
+      end
+    end
+  end
 end
