@@ -140,6 +140,52 @@ defmodule Scriba.Source.Commanded do
   """
 
   @behaviour Scriba.Source
+
+  defmodule State do
+    @moduledoc false
+
+    # The producer's state. A struct rather than a bare map so a mistyped
+    # field fails at compile time: this holds the acknowledgement bookkeeping
+    # that decides whether an event can be lost, and a silent nil there is
+    # the most expensive kind of typo in the library.
+
+    @enforce_keys [:application, :subscription_name, :start_from, :subscribe_opts, :producer]
+
+    defstruct [
+      :application,
+      :subscription_name,
+      :start_from,
+      :subscribe_opts,
+      :producer,
+      # Where to persist the contiguous watermark, and who to persist it as.
+      # nil when the source runs outside a pipeline (unit tests), or against
+      # a target with no repo.
+      :watermark,
+      # The live subscription, once acquired. nil while standing by.
+      subscription: nil,
+      # Attempts made since the last successful subscribe; drives the retry
+      # curve and resets on success.
+      subscribe_attempt: 0,
+      # Commanded sends {:subscribed, subscription} once the subscription is
+      # live, explicitly so subscribers can defer work until then. Recorded
+      # rather than assumed: dispatch/1 will not emit before it arrives.
+      subscribed: false,
+      pending: :queue.new(),
+      demand: 0,
+      paused: false,
+      # Events dispatched downstream and not yet acknowledged to the store,
+      # in delivery order, as {event_number, commanded_event}. Bounded by the
+      # subscription's buffer_size.
+      in_flight: :queue.new(),
+      # Event numbers whose batch committed but which cannot be acknowledged
+      # yet, because an earlier event has not. See ack_contiguous/1.
+      committed: MapSet.new(),
+      # Throttle for the watermark write: the last position written, and when.
+      watermark_written: 0,
+      watermark_written_at: nil
+    ]
+  end
+
   @behaviour Broadway.Acknowledger
 
   use GenStage
@@ -205,47 +251,16 @@ defmodule Scriba.Source.Commanded do
     # succeeds; see handle_info(:scriba_subscribe, _).
     send(self(), :scriba_subscribe)
 
-    state = %{
+    state = %State{
       application: application,
-      subscription: nil,
       subscription_name: subscription_name,
       start_from: start_from,
       subscribe_opts: subscribe_opts,
-      # How long before the next subscribe attempt, and how many have been
-      # made. Reset once subscribed.
-      subscribe_attempt: 0,
       # This process is the event store's subscriber. ack/3 runs in a Broadway
       # batch-processor process, not here, so it needs an address to signal
       # when a batch fails to commit. Carried in every message's ack_ref.
       producer: self(),
-      # Commanded sends {:subscribed, subscription} once the subscription is
-      # live, explicitly so subscribers can defer work until then
-      # (Commanded.EventStore.subscribe_to/5 docs). Recorded rather than
-      # assumed: dispatch/1 will not emit before it arrives.
-      subscribed: false,
-      pending: :queue.new(),
-      demand: 0,
-      paused: false,
-      # Events dispatched downstream and not yet acknowledged to the store, in
-      # delivery order, as {event_number, commanded_event}. Bounded by the
-      # subscription's buffer_size: the store will not send more than that
-      # before requiring an acknowledgement.
-      in_flight: :queue.new(),
-      # Event numbers whose batch committed but which cannot be acknowledged
-      # yet, because an earlier event has not committed. See ack_contiguous/2.
-      committed: MapSet.new(),
-      # Where to persist the contiguous watermark, and who to persist it as.
-      # nil when the source runs outside a pipeline (unit tests) or against a
-      # target with no repo.
-      watermark: watermark_config(opts),
-      # Throttle state: the last position written and when. A projection
-      # committing thousands of events a second does not need thousands of
-      # watermark writes a second.
-      watermark_written: 0,
-      # nil, not 0: BEAM monotonic time has an arbitrary origin and is
-      # routinely negative, so `now - 0` is not an elapsed interval and the
-      # first write would never clear the throttle.
-      watermark_written_at: nil
+      watermark: watermark_config(opts)
     }
 
     {:producer, state}

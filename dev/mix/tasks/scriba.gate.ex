@@ -8,11 +8,11 @@ defmodule Mix.Tasks.Scriba.Gate do
       mix scriba.gate --fast       # skip dialyzer and the test suites
       mix scriba.gate --published  # after publishing: check what users see
 
-  It exists because the gate was a list a human read and applied selectively.
-  Releases went out with a stale install snippet, a changelog that understated
-  its own contents, and an option that was documented but never wired up —
-  each time after someone (me) checked the list and reported it clean. A list
-  you interpret is not a gate; a command that exits non-zero is.
+  It exists because the gate was a list to read and apply by hand. Releases
+  went out with a stale install snippet, a changelog that understated its own
+  contents, and an option that was documented but never wired up — each time
+  after the list had been checked and reported clean. A list someone
+  interprets is not a gate; a command that exits non-zero is.
 
   Not covered here, because no script can check it: whether every claim in
   every document is true. That still takes reading the documents against the
@@ -195,23 +195,36 @@ defmodule Mix.Tasks.Scriba.Gate do
   # 0.1.3" is history, and `docs/post-v0.1.md` is a filename — none of those
   # are stale, and a check that flags them gets ignored, which is worse than
   # not having it.
+  @shipped_docs ~w(README.md MIGRATION.md REBUILDING.md SCRIBA_ARCHITECTURE.md)
+
   @scope_phrase ~r/\b(?:in|for|frozen for|supported in|shipped in|available in|as of)\s+v?(\d+)\.(\d+)\b(?!\.\d)/i
 
   defp check_stale_version_mentions(errors, major, minor) do
-    {current_major, current_minor} = {String.to_integer(major), String.to_integer(minor)}
+    current = {String.to_integer(major), String.to_integer(minor)}
 
-    for file <- ~w(README.md MIGRATION.md REBUILDING.md SCRIBA_ARCHITECTURE.md),
-        File.exists?(file),
-        {line, index} <- file |> File.read!() |> String.split("\n") |> Enum.with_index(1),
-        [_, found_major, found_minor] <- Regex.scan(@scope_phrase, line),
-        older?({found_major, found_minor}, {current_major, current_minor}),
-        reduce: errors do
-      acc ->
-        [
-          "#{file}:#{index} pins scope to an older version: #{String.trim(line)}"
-          | acc
-        ]
-    end
+    stale =
+      @shipped_docs
+      |> Enum.filter(&File.exists?/1)
+      |> Enum.flat_map(&stale_lines(&1, current))
+
+    stale ++ errors
+  end
+
+  defp stale_lines(file, current) do
+    file
+    |> File.read!()
+    |> String.split("\n")
+    |> Enum.with_index(1)
+    |> Enum.filter(fn {line, _} -> pins_older_version?(line, current) end)
+    |> Enum.map(fn {line, number} ->
+      "#{file}:#{number} pins scope to an older version: #{String.trim(line)}"
+    end)
+  end
+
+  defp pins_older_version?(line, current) do
+    @scope_phrase
+    |> Regex.scan(line)
+    |> Enum.any?(fn [_, major, minor] -> older?({major, minor}, current) end)
   end
 
   defp older?({found_major, found_minor}, {current_major, current_minor}) do

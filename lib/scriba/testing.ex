@@ -149,45 +149,66 @@ defmodule Scriba.Testing do
 
   ## Internals
 
+  # An outcome is `{event_data, meta, handler_result}`. Three steps, each
+  # nameable: decide what the target can take, describe what happened, apply
+  # it.
   defp commit(outcomes, target_module, target_opts, projection_id) do
     {appliable, rejected} = Enum.split_with(outcomes, &appliable?(&1, target_module))
 
-    # :skip is an applicable result — the target has a clause for it — so the
-    # skipped events are found among those, not among the rejected ones.
-    skipped =
-      for {data, meta, :skip} <- appliable, do: {data, meta}
+    result = summarise(appliable, rejected)
 
-    result = %{classify(rejected) | skipped: skipped}
+    case apply_to_target(appliable, target_module, target_opts, projection_id) do
+      :ok -> result
+      {:error, reason} -> raise commit_failure_message(reason)
+    end
+  end
 
+  defp summarise(appliable, rejected) do
+    %{classify(rejected) | skipped: skipped(appliable), committed: count_committed(appliable)}
+  end
+
+  defp apply_to_target(appliable, target_module, target_opts, projection_id) do
     events = Enum.map(appliable, fn {data, meta, _} -> event_struct(data, meta) end)
     results = Enum.map(appliable, fn {_, _, result} -> result end)
-
-    # Same rule the pipeline applies: a :skip leaves its stream's cursor
-    # where it is, whatever the reason for the skip.
-    stream_advances =
-      appliable
-      |> Enum.reject(fn {_, _, result} -> result == :skip end)
-      |> Enum.group_by(fn {_, meta, _} -> meta.stream_id end, fn {_, meta, _} -> meta.position end)
-      |> Map.new(fn {stream_id, positions} -> {stream_id, Enum.max(positions)} end)
+    advances = stream_advances(appliable)
 
     {:ok, state} = target_module.init(target_opts)
 
-    case target_module.apply_batch(events, results, projection_id, stream_advances, [], state) do
-      {:ok, _state} ->
-        committed = Enum.count(appliable, fn {_, _, result} -> result != :skip end)
-        %{result | committed: committed}
-
-      {:error, reason, _state} ->
-        raise """
-        Scriba.Testing.project/3 could not commit the batch.
-
-            #{inspect(reason)}
-
-        This is a target failure, not a handler outcome — the read model
-        schema, the repo or the migration is the thing to look at. Scriba's
-        engine would classify this and either replay, dead-letter or halt.
-        """
+    case target_module.apply_batch(events, results, projection_id, advances, [], state) do
+      {:ok, _state} -> :ok
+      {:error, reason, _state} -> {:error, reason}
     end
+  end
+
+  # `:skip` is an applicable result — the target has a clause for it — so
+  # skipped events are found among those, not among the rejected ones.
+  defp skipped(appliable) do
+    for {data, meta, :skip} <- appliable, do: {data, meta}
+  end
+
+  defp count_committed(appliable) do
+    Enum.count(appliable, fn {_, _, result} -> result != :skip end)
+  end
+
+  # The rule the pipeline applies: a `:skip` leaves its stream's cursor where
+  # it is, whatever the reason for the skip.
+  defp stream_advances(appliable) do
+    appliable
+    |> Enum.reject(fn {_, _, result} -> result == :skip end)
+    |> Enum.group_by(fn {_, meta, _} -> meta.stream_id end, fn {_, meta, _} -> meta.position end)
+    |> Map.new(fn {stream_id, positions} -> {stream_id, Enum.max(positions)} end)
+  end
+
+  defp commit_failure_message(reason) do
+    """
+    Scriba.Testing.project/3 could not commit the batch.
+
+        #{inspect(reason)}
+
+    This is a target failure, not a handler outcome — the read model schema,
+    the repo or the migration is the thing to look at. Scriba's engine would
+    classify this and either replay, dead-letter or halt.
+    """
   end
 
   defp classify(rejected) do
@@ -203,6 +224,13 @@ defmodule Scriba.Testing do
   # :skip is appliable — it produces no Multi op but must still be counted, and
   # the target's own valid_result?/1 says so.
   defp appliable?({_data, _meta, result}, target_module) do
+    # Code.ensure_loaded? first: function_exported?/3 answers false for a
+    # module that simply has not been loaded yet, which made this check
+    # depend on whether something else had happened to call the target
+    # already. A validation that silently turns itself off is worse than no
+    # validation.
+    Code.ensure_loaded?(target_module)
+
     if function_exported?(target_module, :valid_result?, 1) do
       target_module.valid_result?(result)
     else

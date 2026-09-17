@@ -34,7 +34,8 @@ defmodule Scriba do
   `Scriba.list/0` enumerates running projections via `Scriba.Registry`.
   """
 
-  alias Ecto.Adapters.SQL
+  require Logger
+
   alias Scriba.Info
   alias Scriba.Projection.Coordinator
 
@@ -209,12 +210,12 @@ defmodule Scriba do
   def dead_letters(module_or_name, opts \\ [])
 
   def dead_letters(module, opts) when is_atom(module) and module not in [nil, true, false] do
-    {projection, repo} = dead_letter_target!(module, opts)
+    {projection, repo} = resolve_projection!(module, opts)
     Scriba.DeadLetter.list(repo, projection, opts)
   end
 
   def dead_letters(name, opts) when is_binary(name) do
-    {projection, repo} = dead_letter_target!(name, opts)
+    {projection, repo} = resolve_projection!(name, opts)
     Scriba.DeadLetter.list(repo, projection, opts)
   end
 
@@ -233,12 +234,12 @@ defmodule Scriba do
   def dead_letter_stats(module_or_name, opts \\ [])
 
   def dead_letter_stats(module, opts) when is_atom(module) and module not in [nil, true, false] do
-    {projection, repo} = dead_letter_target!(module, opts)
+    {projection, repo} = resolve_projection!(module, opts)
     Scriba.DeadLetter.stats(repo, projection, opts)
   end
 
   def dead_letter_stats(name, opts) when is_binary(name) do
-    {projection, repo} = dead_letter_target!(name, opts)
+    {projection, repo} = resolve_projection!(name, opts)
     Scriba.DeadLetter.stats(repo, projection, opts)
   end
 
@@ -413,57 +414,28 @@ defmodule Scriba do
   defp do_reset(_name, _version, nil, _opts), do: {:error, :no_repo}
 
   defp do_reset(name, version, repo, opts) do
+    projection = %{name: name, version: version}
+
     # `stop/1` leaves the Coordinator alive in a terminal `:stopped` state,
     # still registered, so "not found" is not the only way to be stopped —
     # and refusing to reset a stopped projection would refuse the normal
-    # case. Anything else still has a live pipeline that could commit
-    # against the cache this is about to clear.
+    # case. Anything else still has a live pipeline that could commit against
+    # the cache this is about to clear.
     case Coordinator.get_status(name, version) do
-      {:ok, %{state: :stopped}} ->
-        do_reset_rows(name, version, repo, opts)
-
-      {:ok, status} ->
-        {:error, {:running, Map.get(status, :state)}}
-
-      {:error, :not_found} ->
-        do_reset_rows(name, version, repo, opts)
+      {:ok, %{state: :stopped}} -> {:ok, Scriba.Reset.run(repo, projection, opts)}
+      {:ok, status} -> {:error, {:running, Map.get(status, :state)}}
+      {:error, :not_found} -> {:ok, Scriba.Reset.run(repo, projection, opts)}
     end
   end
 
-  defp do_reset_rows(name, version, repo, opts) do
-    positions = delete_where(repo, "scriba_positions", name, version)
-    watermark = delete_where(repo, "scriba_watermarks", name, version)
-
-    dead_letters =
-      if Keyword.get(opts, :dead_letters, false) do
-        delete_where(repo, "scriba_dead_letters", name, version)
-      else
-        0
-      end
-
-    Scriba.Position.drop_cache(name, version)
-
-    {:ok, %{positions: positions, watermark: watermark, dead_letters: dead_letters}}
-  end
-
-  defp delete_where(repo, table, name, version) do
-    %{num_rows: rows} =
-      SQL.query!(
-        repo,
-        "DELETE FROM #{table} WHERE projection_name = $1 AND projection_version = $2",
-        [name, version]
-      )
-
-    rows
-  end
-
-  ## Internals
-
+  # Resolves `{projection, repo}` for the functions that read or clear a
+  # projection's stored state: dead_letters/2, dead_letter_stats/2, reset/2.
+  #
   # A module knows its own repo; a name does not, so the caller supplies one.
-  # Reading config rather than asking the Coordinator is deliberate: dead
-  # letters outlive the process that produced them, and the projection is
-  # often stopped by the time anyone reads them.
-  defp dead_letter_target!(module, opts) when is_atom(module) do
+  # Reading config rather than asking the Coordinator is deliberate: these
+  # rows outlive the process that produced them, and the projection is often
+  # stopped — or gone — by the time anyone reads them.
+  defp resolve_projection!(module, opts) when is_atom(module) do
     config = load_config!(module)
 
     projection = %{
@@ -486,7 +458,7 @@ defmodule Scriba do
     {projection, repo}
   end
 
-  defp dead_letter_target!(name, opts) when is_binary(name) do
+  defp resolve_projection!(name, opts) when is_binary(name) do
     repo = Keyword.get(opts, :repo)
 
     unless repo do
@@ -558,7 +530,18 @@ defmodule Scriba do
       repo -> Scriba.Watermark.get(repo, %{name: name, version: version})
     end
   rescue
-    _ -> nil
+    # info/2's job is to answer about the projection, and :status is the field
+    # an operator is most likely asking for — a watermark read that fails must
+    # not take the whole answer with it. It is logged rather than swallowed,
+    # because a nil watermark otherwise reads as "nothing committed yet" when
+    # the truth may be "this repo is unreachable".
+    exception ->
+      Logger.debug(
+        "Scriba could not read the watermark for #{name} v#{version}: " <>
+          Exception.message(exception)
+      )
+
+      nil
   end
 
   defp lag_ms(%{occurred_at: %DateTime{} = occurred_at}) do

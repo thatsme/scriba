@@ -3,6 +3,8 @@ defmodule Scriba.Projection.Coordinator do
 
   @behaviour :gen_statem
 
+  require Logger
+
   alias Scriba.Projection.Pipeline
 
   defstruct [
@@ -387,7 +389,18 @@ defmodule Scriba.Projection.Coordinator do
         :ok
     end
   rescue
-    _ -> :ok
+    # A metric must not take the projection down: this runs on a timer, the
+    # next tick is seconds away, and a repo that is briefly unreachable is not
+    # the projection's problem. But swallowing it silently would hide a
+    # misconfigured repo forever, so the reason is logged and the caller is
+    # left alone.
+    exception ->
+      Logger.debug(
+        "Scriba could not read the watermark for lag reporting: " <>
+          Exception.message(exception)
+      )
+
+      :ok
   end
 
   ## Helpers
