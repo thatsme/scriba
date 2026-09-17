@@ -26,6 +26,7 @@ defmodule ScribaBench.StandbyTest do
   alias Ecto.Adapters.SQL
   alias ScribaBench.{CommandedApp, Repo}
   alias ScribaBench.Events.Ticked
+  alias ScribaBench.Wait
 
   setup do
     reset_event_store()
@@ -63,7 +64,7 @@ defmodule ScribaBench.StandbyTest do
 
     {:ok, holder} = start(ScribaBench.Projection, subscription)
     assert_receive {^ref, :subscribed, _, %{subscription: ^subscription}}, 10_000
-    assert wait_until(fn -> rows() > 0 end, 30_000), "the holder never committed"
+    assert Wait.until(fn -> rows() > 0 end, 30_000), "the holder never committed"
 
     # The standby starts rather than failing, which is the change: it is a
     # supervised, running projection that simply has no subscription yet.
@@ -87,7 +88,7 @@ defmodule ScribaBench.StandbyTest do
     rows_before = rows()
     seed(25)
 
-    assert wait_until(fn -> rows() > rows_before end, 30_000),
+    assert Wait.until(fn -> rows() > rows_before end, 30_000),
            """
            The standby acquired the subscription but never committed anything:
            #{rows()} rows, was #{rows_before}. A standby that takes over and
@@ -164,13 +165,5 @@ defmodule ScribaBench.StandbyTest do
     {:ok, conn} = Postgrex.start_link(config)
     EventStore.Storage.Initializer.reset!(conn, config)
     GenServer.stop(conn)
-  end
-
-  defp wait_until(fun, timeout_ms, waited \\ 0) do
-    cond do
-      fun.() -> true
-      waited >= timeout_ms -> false
-      true -> (fn -> Process.sleep(200) end).() && wait_until(fun, timeout_ms, waited + 200)
-    end
   end
 end

@@ -41,6 +41,7 @@ defmodule ScribaBench.MultiNodeContentionTest do
   alias Ecto.Adapters.SQL
   alias ScribaBench.{CommandedApp, Repo, StragglerProjection}
   alias ScribaBench.Events.Ticked
+  alias ScribaBench.Wait
 
   @observe_ms 25_000
   @sample_ms 250
@@ -67,7 +68,7 @@ defmodule ScribaBench.MultiNodeContentionTest do
 
     # The winner: takes the subscription and starts committing.
     {:ok, winner} = start(ScribaBench.Projection, subscription)
-    assert wait_until(fn -> rows() > 0 end, 30_000), "winner never committed anything"
+    assert Wait.until(fn -> rows() > 0 end, 30_000), "winner never committed anything"
     rows_before = rows()
 
     # The loser: same subscription name, different projection identity. This
@@ -197,13 +198,5 @@ defmodule ScribaBench.MultiNodeContentionTest do
     {:ok, conn} = Postgrex.start_link(config)
     EventStore.Storage.Initializer.reset!(conn, config)
     GenServer.stop(conn)
-  end
-
-  defp wait_until(fun, timeout_ms, waited \\ 0) do
-    cond do
-      fun.() -> true
-      waited >= timeout_ms -> false
-      true -> (fn -> Process.sleep(200) end).() && wait_until(fun, timeout_ms, waited + 200)
-    end
   end
 end

@@ -246,10 +246,7 @@ defmodule ScribaTest do
   defp stop_projection(name, version) do
     # Best-effort teardown: stop if still running, then terminate the
     # per-projection supervisor from the DynamicSupervisor.
-    case Scriba.stop(name, version) do
-      :ok -> :ok
-      _ -> :ok
-    end
+    _ = Scriba.stop(name, version)
 
     case Registry.lookup(Scriba.Registry, {:projection_supervisor, name, version}) do
       [{sup_pid, _}] -> DynamicSupervisor.terminate_child(Scriba.Projections.Supervisor, sup_pid)

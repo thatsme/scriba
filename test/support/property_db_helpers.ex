@@ -84,6 +84,32 @@ defmodule Scriba.Test.PropertyDbHelpers do
   end
 
   @doc """
+  Polls `fun` until it returns true, or the deadline passes.
+
+  For conditions with no telemetry to wait on — a row appearing, a
+  registry key clearing, a projection reaching a state. Returns whether the
+  condition held, so a caller can `assert` on it and say what timed out.
+  """
+  @spec wait_until((-> boolean()), pos_integer()) :: boolean()
+  def wait_until(fun, timeout_ms \\ 5_000) do
+    do_wait_until(fun, System.monotonic_time(:millisecond) + timeout_ms)
+  end
+
+  defp do_wait_until(fun, deadline) do
+    cond do
+      fun.() ->
+        true
+
+      System.monotonic_time(:millisecond) > deadline ->
+        false
+
+      true ->
+        Process.sleep(50)
+        do_wait_until(fun, deadline)
+    end
+  end
+
+  @doc """
   Wait until `test_read_models` contains `expected_count` rows scoped to
   `name_prefix` (rows whose `event_id` starts with `<name_prefix>-`).
 

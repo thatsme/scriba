@@ -38,6 +38,7 @@ defmodule ScribaBench.AckLossTest do
   alias Ecto.Adapters.SQL
   alias ScribaBench.{CommandedApp, Repo, StragglerProjection}
   alias ScribaBench.Events.Ticked
+  alias ScribaBench.Wait
 
   @fast_events 300
   @fast_streams 30
@@ -84,7 +85,7 @@ defmodule ScribaBench.AckLossTest do
     # for a large share of them makes the setup race the straggler's own
     # timer under load, and the test then fails for having taken too long
     # rather than for losing an event.
-    assert wait_until(fn -> count_fast() >= 10 end, 30_000),
+    assert Wait.until(fn -> count_fast() >= 10 end, 30_000),
            "no fast events committed: #{count_fast()}/#{fast_total}"
 
     assert count_slow(slow_stream) == 0,
@@ -99,7 +100,7 @@ defmodule ScribaBench.AckLossTest do
     start_projection(subscription)
 
     recovered? =
-      wait_until(
+      Wait.until(
         fn ->
           count_slow(slow_stream) == 1 or dead_lettered?(slow_stream)
         end,
@@ -212,7 +213,7 @@ defmodule ScribaBench.AckLossTest do
     # return for eight seconds. Until those names are free, Broadway refuses
     # to start a replacement topology, so a restart that does not wait here
     # spends the window colliding with the tree it is replacing.
-    wait_until(
+    Wait.until(
       fn ->
         Scriba.Internals.Registry
         |> Registry.select([{{:"$1", :_, :_}, [], [:"$1"]}])
@@ -254,12 +255,4 @@ defmodule ScribaBench.AckLossTest do
   end
 
   defp dead_lettered?(stream), do: count_dead_letters(stream) > 0
-
-  defp wait_until(fun, timeout_ms, waited \\ 0) do
-    cond do
-      fun.() -> true
-      waited >= timeout_ms -> false
-      true -> (fn -> Process.sleep(250) end).() && wait_until(fun, timeout_ms, waited + 250)
-    end
-  end
 end

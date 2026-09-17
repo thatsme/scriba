@@ -22,6 +22,7 @@ defmodule ScribaBench.WatermarkTest do
   alias Ecto.Adapters.SQL
   alias ScribaBench.{CommandedApp, Repo}
   alias ScribaBench.Events.Ticked
+  alias ScribaBench.Wait
 
   @events 300
 
@@ -52,12 +53,12 @@ defmodule ScribaBench.WatermarkTest do
            buffer_size: 500}
       )
 
-    assert wait_until(fn -> rows() == @events end, 60_000),
+    assert Wait.until(fn -> rows() == @events end, 60_000),
            "projection never caught up: #{rows()}/#{@events}"
 
     # The watermark is written on a throttle, so it lands shortly after the
     # last commit rather than with it.
-    assert wait_until(fn -> watermark_position() == @events end, 15_000),
+    assert Wait.until(fn -> watermark_position() == @events end, 15_000),
            "watermark never reached #{@events}, stopped at #{inspect(watermark_position())}"
 
     {:ok, info} = Scriba.info(ScribaBench.Projection)
@@ -140,13 +141,5 @@ defmodule ScribaBench.WatermarkTest do
     {:ok, conn} = Postgrex.start_link(config)
     EventStore.Storage.Initializer.reset!(conn, config)
     GenServer.stop(conn)
-  end
-
-  defp wait_until(fun, timeout_ms, waited \\ 0) do
-    cond do
-      fun.() -> true
-      waited >= timeout_ms -> false
-      true -> (fn -> Process.sleep(200) end).() && wait_until(fun, timeout_ms, waited + 200)
-    end
   end
 end

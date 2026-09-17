@@ -258,13 +258,7 @@ defmodule Scriba.Projection.CoordinatorTest do
       assert Coordinator.state(name, v) == :paused
 
       # The Pipeline is still alive in :paused. Stop must terminate it.
-      pipeline_pid_before =
-        case Registry.lookup(Scriba.Registry, {:pipeline, name, v}) do
-          [{pid, _}] -> pid
-          [] -> nil
-        end
-
-      assert is_pid(pipeline_pid_before)
+      assert [{pipeline_pid_before, _}] = Registry.lookup(Scriba.Registry, {:pipeline, name, v})
       assert Process.alive?(pipeline_pid_before)
 
       :ok = Coordinator.stop(name, v)

@@ -73,10 +73,9 @@ defmodule Scriba.Source.CommandedTest do
       %Broadway.Message{data: %Scriba.Event{} = event} =
         ScribaCommanded.to_message(recorded, build_state())
 
-      assert event.stream_id == "account-xyz"
-
-      refute is_nil(event.stream_id),
-             "stream_id is nil — to_message/2 likely reads the wrong field from RecordedEvent"
+      assert event.stream_id == "account-xyz",
+             "expected the RecordedEvent's stream_id; got #{inspect(event.stream_id)} — " <>
+               "to_message/2 likely reads the wrong field from RecordedEvent"
     end
 
     test "maps event_id, event_type, data, position, occurred_at correctly" do

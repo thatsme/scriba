@@ -84,8 +84,8 @@ defmodule Scriba.PropertyDb.DeadLetterInspectionTest do
   test "pages", %{projection: p} do
     for n <- 1..5, do: write(p, position: n)
 
-    assert length(DeadLetter.list(Repo, p, limit: 2)) == 2
-    assert length(DeadLetter.list(Repo, p, limit: 2, offset: 4)) == 1
+    assert [_, _] = DeadLetter.list(Repo, p, limit: 2)
+    assert [_] = DeadLetter.list(Repo, p, limit: 2, offset: 4)
     assert DeadLetter.count(Repo, p) == 5
   end
 

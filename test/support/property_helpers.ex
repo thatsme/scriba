@@ -75,15 +75,16 @@ defmodule Scriba.Test.PropertyHelpers do
       {:projection_supervisor, name, version}
     ]
 
-    if Enum.all?(keys, &(Registry.lookup(Scriba.Registry, &1) == [])) do
-      :ok
-    else
-      if System.monotonic_time(:millisecond) > deadline do
+    cond do
+      Enum.all?(keys, &(Registry.lookup(Scriba.Registry, &1) == [])) ->
+        :ok
+
+      System.monotonic_time(:millisecond) > deadline ->
         :timeout
-      else
+
+      true ->
         Process.sleep(5)
         do_wait_clean(name, version, deadline)
-      end
     end
   end
 
