@@ -329,7 +329,95 @@ defmodule Scriba.Projection.CoordinatorTest do
     end
   end
 
+  describe "a Pipeline that goes DOWN while the projection is paused" do
+    # A pause lives in the producer, and a replacement producer starts
+    # unpaused, so the Coordinator has to reapply it. Without that, the
+    # projection resumes processing while `Scriba.info/2` still says :paused —
+    # and because the stale monitor ref matches no later DOWN, it is never
+    # noticed again either.
+    #
+    # The DOWN is delivered directly rather than by killing the Pipeline.
+    # `Process.exit(pipeline, :kill)` brings the projection's own supervisor
+    # down with it, which restarts the Coordinator too and so tests something
+    # else entirely. What this clause owns is the Coordinator's reaction to
+    # losing the process it monitors; that is what is driven here.
+
+    test "reapplies the pause to the producer", %{name: name, version: v} do
+      eventually(fn -> assert Coordinator.state(name, v) == :running end)
+      :ok = Coordinator.pause(name, v)
+      producer = Scriba.Projection.Pipeline.get_producer_pid(name, v)
+      assert Scriba.Test.Source.paused?(producer)
+
+      # Unpause it behind the Coordinator's back, which is the state a
+      # replacement producer comes up in.
+      :ok = Scriba.Test.Source.resume(producer)
+      refute Scriba.Test.Source.paused?(producer)
+
+      report_pipeline_down(name, v)
+
+      eventually(fn -> assert Coordinator.state(name, v) == :paused end, 2_000)
+
+      assert Scriba.Test.Source.paused?(producer),
+             "the projection reports :paused but its producer is emitting"
+    end
+
+    test "resumes normally afterwards", %{name: name, version: v} do
+      eventually(fn -> assert Coordinator.state(name, v) == :running end)
+      :ok = Coordinator.pause(name, v)
+
+      report_pipeline_down(name, v)
+      eventually(fn -> assert Coordinator.state(name, v) == :paused end, 2_000)
+
+      assert :ok = Coordinator.resume(name, v)
+      eventually(fn -> assert Coordinator.state(name, v) == :running end)
+    end
+
+    test "monitors the Pipeline again, so a later DOWN is still noticed", %{
+      name: name,
+      version: v
+    } do
+      eventually(fn -> assert Coordinator.state(name, v) == :running end)
+      :ok = Coordinator.pause(name, v)
+
+      ref_before = pipeline_ref(name, v)
+      report_pipeline_down(name, v)
+      eventually(fn -> assert Coordinator.state(name, v) == :paused end, 2_000)
+
+      # A fresh ref is the half that the state alone cannot show: keeping the
+      # dead one would leave the projection paused forever beside an
+      # unwatched Pipeline.
+      ref_after = pipeline_ref(name, v)
+      assert is_reference(ref_after)
+      refute ref_after == ref_before
+
+      # And it acts on it: a second DOWN is handled like the first.
+      report_pipeline_down(name, v)
+      eventually(fn -> assert Coordinator.state(name, v) == :paused end, 2_000)
+    end
+  end
+
   ## Test helpers
+
+  defp coordinator_pid(name, v) do
+    assert [{pid, _}] = Registry.lookup(Scriba.Registry, {:coordinator, name, v})
+    pid
+  end
+
+  defp pipeline_ref(name, v) do
+    {_state, data} = :sys.get_state(coordinator_pid(name, v))
+    data.pipeline_ref
+  end
+
+  # Tells the Coordinator its Pipeline died, without killing anything: the
+  # message it would receive from its own monitor.
+  defp report_pipeline_down(name, v) do
+    coordinator = coordinator_pid(name, v)
+    {_state, data} = :sys.get_state(coordinator)
+
+    send(coordinator, {:DOWN, data.pipeline_ref, :process, data.pipeline_pid, :killed})
+
+    :ok
+  end
 
   # :telemetry handlers are node-global, not scoped to the attaching process
   # or test. Every projection alive on the node emits into this handler,

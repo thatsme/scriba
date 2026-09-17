@@ -72,6 +72,16 @@ defmodule Scriba.Test.Source do
   @spec pending_count(GenServer.server()) :: non_neg_integer()
   def pending_count(source), do: GenStage.call(source, :pending_count)
 
+  @doc """
+  Whether the source is currently withholding events.
+
+  A pause lives in the producer, so this is the only place that can say
+  whether one is in force. The projection's own state is a separate claim,
+  and the two disagreeing is precisely the failure worth testing for.
+  """
+  @spec paused?(GenServer.server()) :: boolean()
+  def paused?(source), do: GenStage.call(source, :paused?)
+
   ## Pause/resume
 
   @impl Scriba.Source
@@ -128,6 +138,10 @@ defmodule Scriba.Test.Source do
   @impl GenStage
   def handle_call(:acked_cursor, _from, state) do
     {:reply, state.acked_cursor, [], state}
+  end
+
+  def handle_call(:paused?, _from, state) do
+    {:reply, state.paused, [], state}
   end
 
   def handle_call(:pending_count, _from, state) do

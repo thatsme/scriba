@@ -32,6 +32,14 @@ defmodule Scriba.Source do
       cleaner alternative — unsubscribe on pause, re-subscribe on resume
       from the current cursor — is v0.5 hardening territory.
 
+  A pause lives in the producer, not in the Coordinator, so a Pipeline that
+  dies while the projection is paused would otherwise come back emitting: its
+  replacement producer starts unpaused. The Coordinator reapplies the pause to
+  the new producer before returning to `:paused`, so the pause survives a
+  Pipeline restart. It does not survive a Coordinator restart, which is the
+  process holding the instruction — that is a restart of the projection as a
+  whole, and it comes back `:running`.
+
   The Coordinator's `pause/2` returns `:ok` once the pause signal is
   sent to the producer (asynchronous `send/2`). It does NOT wait for
   the source's `handle_info` to run. In-flight events already in

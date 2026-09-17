@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A pause now survives a Pipeline restart. A pause lives in the producer, and
+  the replacement producer starts unpaused, so a Pipeline that died while the
+  projection was paused came back emitting while `Scriba.info/2` still
+  reported `:paused`. The Coordinator reapplies the pause before returning to
+  `:paused`. It also monitors the replacement: previously the stale monitor
+  reference matched no later `:DOWN`, leaving the projection beside a Pipeline
+  it had stopped watching.
+
+- `Scriba.Position.cache_put/4` no longer moves a stream's cursor backwards.
+  The cache is what source-side dedup reads, so a lower position overwriting a
+  higher one re-applies events that already committed.
+  `Scriba.Watermark.put/4` has always guarded this in SQL with `GREATEST`; the
+  cache now guards it too.
+
 ### Added
 
 - `mix scriba.gate --published` — the after-publishing half of the gate:

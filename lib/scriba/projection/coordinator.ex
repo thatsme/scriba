@@ -30,7 +30,12 @@ defmodule Scriba.Projection.Coordinator do
     # Set when the Pipeline reports a structural commit failure. Kept in data
     # rather than inferred, so `Scriba.info/2` can name the cause and not just
     # the state.
-    halt_reason: nil
+    halt_reason: nil,
+    # Set when a Pipeline dies while the projection is paused. A pause lives
+    # in the producer, and the supervisor's replacement producer starts
+    # unpaused, so the instruction has to be reapplied to it — otherwise a
+    # crash quietly defeats the pause. Cleared as soon as it is.
+    pause_on_ready: false
   ]
 
   # Used only for the one-shot pipeline-pid lookup re-arm (see :state_timeout
@@ -310,6 +315,24 @@ defmodule Scriba.Projection.Coordinator do
      [{:next_event, :internal, :try_monitor}]}
   end
 
+  # A paused projection still has a live Pipeline, so it can still die — the
+  # producer is built to die on commit failure to force a replay. Re-monitor
+  # it the same way `:running` does, but come back to `:paused` rather than to
+  # `:running`: the pause was an operator instruction, and the replacement
+  # producer starts unpaused. Without this clause the projection resumes
+  # processing behind the operator's back while `Scriba.info/2` still reports
+  # `:paused`, and the stale ref means no later DOWN is ever matched again.
+  def handle_event(
+        :info,
+        {:DOWN, ref, :process, _pid, _reason},
+        :paused,
+        %{pipeline_ref: ref} = data
+      ) do
+    {:next_state, :initializing,
+     %{data | pipeline_pid: nil, pipeline_ref: nil, pause_on_ready: true},
+     [{:next_event, :internal, :try_monitor}]}
+  end
+
   def handle_event(:info, {:DOWN, _ref, _, _, _}, _state, _data),
     do: :keep_state_and_data
 
@@ -422,10 +445,33 @@ defmodule Scriba.Projection.Coordinator do
   defp transition_from_initializing(data) do
     case ensure_monitored(data) do
       {:ok, new_data} ->
-        {:next_state, :running, emit_started_once(new_data)}
+        ready(emit_started_once(new_data))
 
       :pending ->
         {:keep_state, data, [{:state_timeout, @poll_interval, :try_monitor}]}
+    end
+  end
+
+  # Where a newly monitored Pipeline lands: `:running`, unless a pause was in
+  # force when the previous one died.
+  defp ready(%{pause_on_ready: false} = data), do: {:next_state, :running, data}
+
+  defp ready(data) do
+    {source_module, _source_opts} = data.source_spec
+
+    case Pipeline.get_producer_pid(data.name, data.version) do
+      nil ->
+        # Registered a moment ago in ensure_monitored/1 and gone again. Go
+        # round rather than report a pause that was never applied.
+        {:keep_state, data, [{:state_timeout, @poll_interval, :try_monitor}]}
+
+      producer_pid ->
+        :ok = source_module.pause(producer_pid)
+
+        # No `[:scriba, :projection, :paused]` here: the projection is not
+        # entering a pause, it is restoring one that never ended, and an
+        # operator counting those events should not see a second.
+        {:next_state, :paused, %{data | pause_on_ready: false}}
     end
   end
 

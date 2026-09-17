@@ -12,7 +12,7 @@ defmodule Scriba.Circuit do
       seconds regardless of how generous that budget is.
 
     * **Whether repeated single-event integrity failures are one bad row or a
-      systemic mismatch.** See `record_wipeout/2`.
+      systemic mismatch.** See `record_wipeout/3`.
 
   State lives in one shared ETS table for the whole BEAM, keyed by
   `{name, version}`, following `Scriba.Position`'s model: created once at

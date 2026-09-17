@@ -670,7 +670,20 @@ defmodule Scriba.Source.Commanded do
     end
   end
 
-  defp drain_contiguous(in_flight, committed, last) do
+  # The prefix arithmetic on its own, separated from the acknowledgement it
+  # feeds so it can be exercised without a store: given the in-flight queue in
+  # delivery order and the set of event numbers whose batch committed, it
+  # returns the last event of the gapless run, the queue past it, and the
+  # committed numbers still waiting on something earlier.
+  #
+  # Exposed for tests rather than reached through the producer because the
+  # producer's version of this ends in a call to the event store. The bug this
+  # replaced acknowledged the highest committed event instead of the highest
+  # contiguous one, which is a difference of one comparison and a lost event.
+  @doc false
+  @spec drain_contiguous(:queue.queue(), MapSet.t(), term()) ::
+          {term(), :queue.queue(), MapSet.t()}
+  def drain_contiguous(in_flight, committed, last) do
     case :queue.peek(in_flight) do
       {:value, {position, event}} ->
         if MapSet.member?(committed, position) do

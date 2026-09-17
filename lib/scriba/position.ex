@@ -250,9 +250,11 @@ defmodule Scriba.Position do
   end
 
   @doc """
-  Writes one stream's position into the shared cache. Silently no-ops if
-  the shared table doesn't exist (path used by unit-test code that bypasses
-  the supervisor).
+  Writes one stream's position into the shared cache, if it is ahead of what
+  is already cached.
+
+  A cursor only ever moves forward. Silently no-ops if the shared table
+  doesn't exist (path used by unit-test code that bypasses the supervisor).
   """
   @spec cache_put(name(), version(), stream_id(), position()) :: :ok
   def cache_put(name, version, stream_id, position) do
@@ -261,7 +263,22 @@ defmodule Scriba.Position do
         :ok
 
       _ ->
-        :ets.insert(@cache_table, {{name, version, stream_id}, position})
+        key = {name, version, stream_id}
+
+        # Monotonic, for the same reason `Scriba.Watermark.put/4` uses
+        # GREATEST: this cache is what source-side dedup reads, so a cursor
+        # that moves backwards re-applies events that already committed. A
+        # replayed batch can carry a highest position below one already
+        # applied, and the read model would absorb the second write silently
+        # wherever the handler is not keyed on the event.
+        #
+        # A plain read-then-write is enough: `Scriba.Partitioner` hashes each
+        # stream to a fixed partition, so one processor owns a given key and
+        # there is no competing writer to race with.
+        if position > :ets.lookup_element(@cache_table, key, 2, -1) do
+          :ets.insert(@cache_table, {key, position})
+        end
+
         :ok
     end
   end

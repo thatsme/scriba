@@ -122,11 +122,40 @@ defmodule Scriba.PositionTest do
   end
 
   describe "cache_put/4" do
-    test "overwrites the prior value", %{name: name, version: v} do
+    test "advances to a higher position", %{name: name, version: v} do
       Position.cache_put(name, v, "stream-a", 1)
       Position.cache_put(name, v, "stream-a", 100)
 
       assert Position.cache_get(name, v, "stream-a") == {:ok, 100}
+    end
+
+    test "a late write from an older position does not move it backwards", %{
+      name: name,
+      version: v
+    } do
+      Position.cache_put(name, v, "stream-a", 100)
+      Position.cache_put(name, v, "stream-a", 1)
+
+      # This cache is what source-side dedup reads. Rewinding it would let a
+      # replayed batch re-apply events that already committed.
+      assert Position.cache_get(name, v, "stream-a") == {:ok, 100}
+    end
+
+    test "rewriting the same position is not an advance", %{name: name, version: v} do
+      Position.cache_put(name, v, "stream-a", 7)
+      Position.cache_put(name, v, "stream-a", 7)
+
+      assert Position.cache_get(name, v, "stream-a") == {:ok, 7}
+    end
+
+    test "the guard is per stream, not across them", %{name: name, version: v} do
+      Position.cache_put(name, v, "stream-a", 100)
+
+      # A stream that is genuinely behind must still be able to record where
+      # it is; only its own cursor constrains it.
+      Position.cache_put(name, v, "stream-b", 2)
+
+      assert Position.cache_get(name, v, "stream-b") == {:ok, 2}
     end
 
     test "tracks per-stream cursors independently", %{name: name, version: v} do
