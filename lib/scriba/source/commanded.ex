@@ -663,9 +663,7 @@ defmodule Scriba.Source.Commanded do
   defp watermark_config(opts) do
     case Keyword.get(opts, :scriba_watermark) do
       config when is_list(config) ->
-        repo = Keyword.get(config, :repo)
-        projection = Keyword.get(config, :projection)
-        if repo && projection, do: %{repo: repo, projection: projection}, else: nil
+        watermark_config(Keyword.get(config, :repo), Keyword.get(config, :projection))
 
       _ ->
         nil
@@ -760,6 +758,12 @@ defmodule Scriba.Source.Commanded do
          }, commanded_event}
     }
   end
+
+  # Both halves are required: a repo with no projection identity has nowhere
+  # to write, and an identity with no repo has nothing to write to.
+  defp watermark_config(nil, _projection), do: nil
+  defp watermark_config(_repo, nil), do: nil
+  defp watermark_config(repo, projection), do: %{repo: repo, projection: projection}
 
   defp ensure_commanded_loaded! do
     unless Code.ensure_loaded?(@commanded_marker) do

@@ -802,6 +802,11 @@ defmodule Scriba.Projection.Pipeline do
   defp reserved_key?({:scriba_dead_letter, _}), do: true
   defp reserved_key?(_other), do: false
 
+  # No Code.ensure_loaded?/1 here, unlike the equivalent check in
+  # Scriba.Testing: init/1 calls target_module.init/1 before Broadway starts,
+  # so the module is loaded before any message reaches this function.
+  # function_exported?/3 would otherwise answer false for a module that is
+  # merely not loaded yet, and this check would silently pass everything.
   defp target_accepts?(target_module, result) do
     if function_exported?(target_module, :valid_result?, 1) do
       target_module.valid_result?(result)

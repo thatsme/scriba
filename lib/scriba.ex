@@ -106,15 +106,13 @@ defmodule Scriba do
            {Scriba.Projection.Supervisor, opts}
          ) do
       {:ok, pid} -> {:ok, pid}
-      {:error, {:already_started, pid}} -> {:error, :already_started, pid}
+      # Both shapes mean the same thing to a caller: this projection is
+      # already running. The pid is the existing one, not a new child.
+      {:error, {:already_started, _pid}} -> {:error, :already_started}
       {:error, :already_started} -> {:error, :already_started}
       other -> other
     end
-    |> normalize_start_result()
   end
-
-  defp normalize_start_result({:error, :already_started, _pid}), do: {:error, :already_started}
-  defp normalize_start_result(other), do: other
 
   @doc """
   Returns running projections as `[%{name, version, state}]`.

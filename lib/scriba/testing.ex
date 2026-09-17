@@ -234,9 +234,15 @@ defmodule Scriba.Testing do
     if function_exported?(target_module, :valid_result?, 1) do
       target_module.valid_result?(result)
     else
-      not match?({:error, _}, result) and not match?({:exception, _, _}, result)
+      not_a_failure?(result)
     end
   end
+
+  # The fallback for a target that declares no vocabulary of its own: anything
+  # that is not a failure shape is something it might apply.
+  defp not_a_failure?({:error, _}), do: false
+  defp not_a_failure?({:exception, _, _}), do: false
+  defp not_a_failure?(_result), do: true
 
   defp invoke(handler, event_data, meta) do
     handler.handle(event_data, meta)
@@ -279,20 +285,19 @@ defmodule Scriba.Testing do
   end
 
   defp config_for(projection) do
+    # Load first, then ask once: function_exported?/3 answers false for a
+    # module that has not been loaded, so testing it before the load and again
+    # after is the same question twice with the body duplicated.
+    Code.ensure_loaded(projection)
+
     if function_exported?(projection, :__scriba_config__, 0) do
       projection.__scriba_config__()
     else
-      Code.ensure_loaded(projection)
-
-      if function_exported?(projection, :__scriba_config__, 0) do
-        projection.__scriba_config__()
-      else
-        raise ArgumentError, """
-        #{inspect(projection)} is not a Scriba projection — it does not define
-        __scriba_config__/0. Did you mean a module that has
-        `use Scriba.Projection`?
-        """
-      end
+      raise ArgumentError, """
+      #{inspect(projection)} is not a Scriba projection — it does not define
+      __scriba_config__/0. Did you mean a module that has
+      `use Scriba.Projection`?
+      """
     end
   end
 

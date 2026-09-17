@@ -405,26 +405,24 @@ defmodule Scriba.Projection.Coordinator do
 
   ## Helpers
 
+  # Exactly once per Coordinator-process lifetime: a Pipeline that goes DOWN
+  # and is re-monitored does not re-fire. See defstruct for the rationale.
+  defp emit_started_once(%{started: true} = data), do: data
+
+  defp emit_started_once(data) do
+    :telemetry.execute(
+      [:scriba, :projection, :started],
+      %{system_time: System.system_time()},
+      %{projection: %{name: data.name, version: data.version}}
+    )
+
+    %{data | started: true}
+  end
+
   defp transition_from_initializing(data) do
     case ensure_monitored(data) do
       {:ok, new_data} ->
-        # Emit :started exactly once per Coordinator-process lifetime
-        # (Pipeline DOWN → re-monitored does NOT re-fire). See defstruct
-        # for the rationale.
-        new_data =
-          if new_data.started do
-            new_data
-          else
-            :telemetry.execute(
-              [:scriba, :projection, :started],
-              %{system_time: System.system_time()},
-              %{projection: %{name: new_data.name, version: new_data.version}}
-            )
-
-            %{new_data | started: true}
-          end
-
-        {:next_state, :running, new_data}
+        {:next_state, :running, emit_started_once(new_data)}
 
       :pending ->
         {:keep_state, data, [{:state_timeout, @poll_interval, :try_monitor}]}
