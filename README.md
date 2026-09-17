@@ -32,8 +32,9 @@ That's the API. The rest is operational scaffolding you get for free.
 **Already running `commanded_ecto_projections`?** Read
 [`MIGRATION.md`](MIGRATION.md). Short version: your existing cursor
 carries over — both libraries track Commanded's global `event_number`,
-so you hand your `last_seen_event_number` to Scriba as `:start_from` and
-cut over in place. No read-model rebuild, no maintenance window.
+so you hand your `last_seen_event_number` to the source as `:start_from`
+(`source: {Scriba.Source.Commanded, application: MyApp, start_from: 12_345}`)
+and cut over in place. No read-model rebuild, no maintenance window.
 
 ---
 
@@ -90,7 +91,9 @@ Scriba is an opinionated rewrite of that role with three principles:
 3. **Sharp edges are documented, not hidden.** Dead-lettered events
    advance the cursor (skip-and-continue, not block-the-projection).
    The handler return contract is six return shapes, not a DSL. Lag is
-   a telemetry-consumer concern, not an engine feature.
+   measured in time, from the watermarked event's own timestamp, because
+   Commanded's event store adapter behaviour exposes no head position to
+   count events against.
 
 Migrating an existing projector is a mechanical rewrite —
 `project %Event{}, fn multi -> ... end` becomes `def handle(%Event{}, meta)`
@@ -151,10 +154,14 @@ database.
   `dead_letter_stats/2`, with the error-kind distribution that separates a
   poison event from a schema problem.
 - **An answer to "how far behind is it?"** — a contiguous watermark,
-  `:lag_ms` on `Scriba.info/1`, and `[:scriba, :projection, :lag]` on a
-  timer, so an idle projection still reports.
+  `:lag_ms` on `Scriba.info/1`, and `[:scriba, :projection, :lag]` every
+  `:lag_interval` milliseconds (default `5_000`; `0` disables it), so an
+  idle projection still reports.
 - **Rebuilds as a procedure** — `(name, version)` runs a new version beside
-  the old one against the same events (`REBUILDING.md`).
+  the old one against the same events, and `Scriba.reset/2` clears a
+  version's cursors and watermark so it can run again from the start. It
+  does not touch your read model — Scriba does not know which tables your
+  handler writes (`REBUILDING.md`).
 - **Standby on every other node** — one node holds the subscription, the
   rest wait and take over.
 - **Tests without a pipeline** — `Scriba.Testing.project/3` runs your
@@ -207,7 +214,8 @@ Everything else arrives transitively and is **not** optional —
 `:ecto_sql` and `:postgrex` back the position cursor and dead-letter
 tables (`Scriba.Position`, `Scriba.DeadLetter`, `Scriba.Migrations`), not
 merely `Scriba.Target.Ecto`; `:broadway` is the pipeline runtime;
-`:telemetry` and `:jason` are used throughout. You do not list them
+`:telemetry` is used throughout, and `:jason` indirectly, by Postgrex, to
+encode the dead-letter table's `event_data` column. You do not list them
 yourself, but they will be in your dependency tree.
 
 ### Scriba is a Broadway topology
@@ -365,10 +373,12 @@ per-stream cursor advances in **one** `Ecto.Multi` transaction. There
 is no observable state where the read model advanced but the cursor
 didn't — or vice versa.
 
-This is the property that makes crash recovery work: on Coordinator
-restart, the source is told to resume from the durably committed
-cursor, and Scriba's source-side dedup skips any events the upstream
-re-delivers below that cursor.
+This is the property that makes crash recovery work. On restart the source
+resumes from the event store's own subscription checkpoint, which may sit
+behind Scriba's durably committed cursor; Scriba's dedup then skips any
+event the upstream re-delivers at or below that cursor. Scriba never hands
+the cursor back to the source — `:start_from` is read once, from your
+config, when the source starts.
 
 ---
 
@@ -406,12 +416,15 @@ deliberately stays stopped, because no replay can fix a missing column.
 Isolated occurrences are normal under transient database trouble; a sustained
 stream of them means no progress.
 
-`[:scriba, :projection, :halted]` is the page. The projection hit a
-structural failure — a column that doesn't exist, a missing privilege — and
-stopped on purpose, because replaying it would loop forever and
-dead-lettering it would destroy a batch over a fixable deploy-ordering
-mistake. Nothing is lost; nothing proceeds either. The metadata carries the
-SQLSTATE.
+`[:scriba, :projection, :halted]` is the page. Either the projection hit a
+structural failure — a column that doesn't exist, a missing privilege — or
+every attempted write in a batch failed on integrity grounds, which is a
+schema the handler no longer matches. Both stop on purpose, because
+replaying would loop forever and dead-lettering would destroy a batch over a
+fixable deploy-ordering mistake. Nothing is lost; nothing proceeds either.
+The `failure` metadata carries a SQLSTATE label when the cause is a
+`Postgrex.Error`, and otherwise names what it was — a constraint, or
+`{:integrity_wipeout, n}`.
 
 Scriba attaches no handlers of its own — it emits and gets out of the
 way, so it never competes with your observability stack. You write your
@@ -436,8 +449,9 @@ dead-letter table once they've fixed the underlying issue.
 
 ### Retry policy
 
-Default: 3 attempts with exponential backoff (100ms, 1s, 10s) before
-dead-letter. Configurable per projection:
+Default: 3 attempts before dead-letter, sleeping 100ms then 1s between them.
+The third backoff entry (10s) only comes into play if you raise
+`max_attempts` to 4. Configurable per projection:
 
 ```elixir
 use Scriba.Projection,
@@ -453,8 +467,9 @@ and §9 for why this is the right primitive rather
 than `Process.send_after` (Broadway's processor model). Each retry
 attempt re-invokes `:telemetry.span/3`, so per-attempt
 `:event :start` / `:event :stop` / `:event :exception` events fire.
-Operators counting `:event :start` per `event_id` can see retry
-activity without a dedicated `:retry` event.
+Operators counting `:event :start` per `{stream_id, position}` — the span
+metadata carries no event id — can see retry activity without a dedicated
+`:retry` event.
 
 ### Pause / resume
 
@@ -465,6 +480,15 @@ signal. Both fire telemetry; both are honest about asynchrony (the
 source-pause signal is `send/2`, so by the time `pause/1` returns the
 signal is in the source's mailbox but the source's `handle_info`
 may not yet have run).
+
+A pause stops the source yielding; it does not stop the event store pushing.
+`Scriba.Source.Commanded`'s subscription keeps filling the producer's pending
+queue for the duration, so memory grows with whatever the upstream produces
+in the pause window. Pause to let a migration land, not as an off switch.
+
+A pause survives a Pipeline restart — the Coordinator reapplies it to the
+replacement producer, which starts unpaused — but not a restart of the
+projection itself, which comes back `:running`.
 
 `pause` on `:paused` and `resume` on `:running` return `{:error,
 {:invalid_state, _}}` — they are deliberately **not idempotent**.
@@ -512,8 +536,10 @@ anything Scriba cannot classify). Neither response is safe —
 dead-lettering would destroy a batch over a fixable deploy-ordering
 mistake, replaying would loop forever — so the projection **halts** and
 says so via `[:scriba, :projection, :halted]` and a log line naming the
-SQLSTATE. Nothing is acknowledged and no cursor moves, so nothing is
-lost. It resumes when you fix the cause and restart.
+SQLSTATE. Nothing in the halting batch is acknowledged, so nothing is lost;
+work the per-event pass had already committed before it reached the
+offending event stands, and dedup filters it on redelivery. It resumes when
+you fix the cause and restart the projection.
 
 **Multi failures do not retry through the per-event retry policy.**
 The retry layer wraps the handler call, not the Multi commit. If
@@ -638,6 +664,16 @@ projection — and a persistent subscription admits one subscriber. Scriba
 treats that as normal: one node acquires the subscription and projects, the
 others stand by, retrying about once a minute, and take over when the holder
 goes away. No leader election, no extra dependency, nothing to configure.
+
+The one thing to configure is `:subscription_name`, which defaults to
+`"scriba"`. That default is per subscription, not per projection, so **two
+different projections left on it contend with each other**: one acquires the
+name and the other stands by indefinitely, reporting `:running` while
+projecting nothing. Give each projection its own name.
+
+```elixir
+source: {Scriba.Source.Commanded, application: MyApp, subscription_name: "orders"}
+```
 
 ```
 [:scriba, :source, :standby]      # waiting; another subscriber holds the name

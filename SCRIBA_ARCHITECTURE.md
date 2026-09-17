@@ -87,7 +87,8 @@ violates one of these, the choice is wrong.
 1. **Correctness over throughput.** Position update is atomic with
    read-model write inside a single `Ecto.Multi`. No exceptions.
 2. **Per-stream ordering is preserved.** All events for a given
-   `stream_id` route to the same worker via consistent hashing.
+   `stream_id` route to the same worker via modular hashing, with the
+   partition count fixed at projection start.
    Within a worker, events are processed serially.
 3. **No clever metaprogramming.** The `__using__` macro generates a
    thin module. No DSL. No AST manipulation beyond what `defmacro`
@@ -152,7 +153,10 @@ A handler must return one of:
 
 The engine wraps the returned operation in an `Ecto.Multi` together
 with the position update, then calls `Repo.transaction/1`. If the
-transaction fails, the event goes to dead-letter; the worker continues.
+transaction fails, the failure is classified rather than dead-lettered on
+the spot: a transient one replays the whole batch, an integrity one is
+isolated to the offending event, and a structural one halts the projection
+(§9).
 
 #### The `meta` map
 
@@ -283,7 +287,10 @@ process and live for the application's lifetime.
   with it. If the pipeline dies, the Coordinator survives — its
   internal lifecycle state is intact.
 - **`gen_statem` for the Coordinator** with `:handle_event_function`
-  callback mode. Lifecycle is genuinely a state machine:
+  callback mode and `:state_enter`. Pipeline start and stop live in the
+  command handlers, not in entry hooks; the only `:enter` clause that does
+  anything drops the position cache on `:stopped`. Lifecycle is genuinely a
+  state machine:
   `:initializing → :running → :paused → :draining → :stopped`, plus the
   terminal `:halted`. State-entry hooks via `enter` events keep pipeline
   start/stop logic clean. See §7.
@@ -363,8 +370,10 @@ Conventions:
 ### 7.1 States
 
 - `:initializing` — coordinator started; polling for Pipeline producer
-  registration. Brief transient state; transitions to `:running`
-  automatically once the producer is up.
+  registration. Brief transient state. Once the producer is up it
+  transitions automatically to whichever of `:running`, `:paused` or
+  `:halted` the previous Pipeline was lost from — `:running` on a first
+  start (§7.2).
 - `:running` — Pipeline is live, producer is monitored, events flow
   source → processors → batchers → target.
 - `:paused` — source has been signaled to stop yielding new events.
@@ -377,8 +386,10 @@ Conventions:
   every attempted write in a batch failed on integrity grounds and
   `Scriba.Circuit` read that as a schema the handler no longer matches (§9).
   Neither replay nor dead-lettering resolves either. The Pipeline tree stays
-  alive but nothing is acknowledged and no cursor moves. The state carries
-  the cause, which `Scriba.info/2` exposes as `:halt_reason`.
+  alive but nothing in the halting batch is acknowledged, so nothing is lost;
+  work the per-event pass had already committed before reaching the offending
+  event stands, and dedup filters it on redelivery. The state carries the
+  cause, which `Scriba.info/2` exposes as `:halt_reason`.
 
 ### 7.2 Transitions
 
@@ -414,8 +425,8 @@ Coordinator beside a Pipeline it had stopped watching.
 
 None of this survives a *Coordinator* restart. The Coordinator is the process
 holding the instruction, so a projection whose Coordinator crashes comes back
-`:initializing` and then `:running`, which §7.1 treats as a restart of the
-projection as a whole.
+`:initializing` and then `:running` — the last row of the table above, a
+restart of the projection as a whole.
 
 `:running → :paused` is a **held-demand** transition, not
 stop-and-restart. The Coordinator calls `Source.pause/1` on the
@@ -448,7 +459,10 @@ Keep the Coordinator's state struct **small**:
   pipeline_pid: pid() | nil,
   pipeline_ref: reference() | nil,
   started: boolean(),          # gates once-per-lifetime :started telemetry
-  halt_reason: term() | nil    # surfaced by Scriba.info/2 as :halt_reason
+  halt_reason: term() | nil,   # surfaced by Scriba.info/2 as :halt_reason
+  ready_state: :running | :paused | :halted
+                               # state a re-monitored Pipeline returns to;
+                               # reset to :running once honoured (§7.2)
 }
 ```
 
@@ -471,8 +485,9 @@ exactly the reason below.
 
 `gen_statem`'s `state_timeout` action **resets on every event in that
 state**. The Coordinator already uses `state_timeout` for the
-pipeline-pid lookup poll (one-shot, re-armed only when the lookup
-returns `:pending`) — that pattern is correct because the timer is
+pipeline-pid lookup poll (one-shot, re-armed only when the lookup returns
+`:pending`, or when the producer disappears between being monitored and
+having a pause reapplied) — that pattern is correct because the timer is
 event-driven, not periodic.
 
 A **periodic** timer (e.g. "emit lag every 1s") cannot use
@@ -556,13 +571,18 @@ DO UPDATE SET position = GREATEST(scriba_positions.position, EXCLUDED.position),
               updated_at = EXCLUDED.updated_at
 ```
 
-Monotonicity is enforced by the database rather than by the pipeline, so a
-redelivered older event cannot move a cursor backwards no matter what order
-batches commit in.
+Monotonicity is enforced by the storage layer rather than by the pipeline, so
+a redelivered older event cannot move a cursor backwards no matter what order
+batches commit in: `GREATEST` guards the durable cursor, and
+`Scriba.Position.cache_put/4` guards the ETS copy that dedup reads.
 
 If the transaction fails, neither the read-model write nor the
-position update is applied. The event is retried (via Broadway
-re-delivery) or routed to dead-letter after N failures.
+position update is applied. What happens next is decided by the failure's
+class, not by a retry counter: the per-event retry policy wraps only the
+handler call, never the commit. A transient failure replays the whole batch
+after a `Scriba.Circuit` backoff, an integrity failure is isolated to the
+offending event and dead-lettered, and a structural failure halts the
+projection (§9).
 
 ### 8.3 ETS cache layer
 
@@ -583,9 +603,10 @@ each other's entries.
 ])
 ```
 
-Workers update the cache after a successful commit. The cache is **not
-authoritative** — it is a hot-read optimization for `Scriba.info/2` and for
-source-side dedup. `Scriba.Position.init_cache/3` wipes and preloads one
+Workers update the cache after a successful commit, and only ever forwards —
+`cache_put/4` refuses a position below the one already cached. The cache is
+**not authoritative** — it is a hot-read optimization for `Scriba.info/2` and
+for dedup against redelivered events. `Scriba.Position.init_cache/3` wipes and preloads one
 projection's entries once per Coordinator-process lifetime, from the
 Coordinator's `init/1`, so that pause → resume preserves the cache that
 dedup depends on while a Coordinator crash rebuilds it from Postgres.
@@ -623,8 +644,8 @@ recoverable.
 
 The row also carries the `occurred_at` of the event at that position, which
 makes `now() - occurred_at` the projection's lag in time. Event-count lag is
-not obtainable at all: Commanded's adapter behaviour exposes no head
-position (§13.1).
+not obtainable at all: Commanded's event store adapter behaviour exposes no
+head position to read a projection's distance from.
 
 ---
 
@@ -650,9 +671,13 @@ A commit can fail three ways, and they do **not** share a response:
      commit. Two outcomes qualify that: if any event is left unresolved the
      batch is *replayed* rather than partially acknowledged (committed work
      stands, dedup filters it on redelivery), and if **every** attempted
-     write failed on integrity grounds, `Scriba.Circuit` reads that as a
-     schema the handler no longer matches and halts rather than draining the
-     stream into `scriba_dead_letters` over an empty read model.
+     write failed on integrity grounds, `Scriba.Circuit` weighs the blast
+     radius rather than dead-lettering blindly: more than one write attempted
+     and all of them failing is a schema the handler no longer matches, so it
+     halts at once; a single-event batch is ambiguous, so it dead-letters and
+     halts only if three such batches run with nothing committing. Either way
+     the stream is not drained into `scriba_dead_letters` over an empty read
+     model.
    - `:structural` (class 42 and anything unrecognised) — schema or
      permissions do not match the code, which no replay can fix. The
      projection halts (§7.1) and stays loud.
@@ -882,6 +907,8 @@ scriba/
 ├── config/
 │   ├── config.exs
 │   └── test.exs                  # SCRIBA_TEST_DB_* gating
+├── dev/                          # release tooling; compiled in dev and test
+│   └── mix/tasks/scriba.gate.ex  # mix scriba.gate (§14); not shipped
 ├── mix.exs
 ├── mix.lock
 ├── lib/
@@ -912,7 +939,8 @@ scriba/
 │   │   ├── failure.ex            # SQLSTATE → :transient | :integrity | :structural
 │   │   ├── circuit.ex            # per-projection failure state, outlives the producer
 │   │   ├── info.ex               # %Scriba.Info{} — what Scriba.info/2 returns
-│   │   ├── partitioner.ex        # consistent hash logic
+│   │   ├── reset.ex              # clears cursors, watermark, optional dead letters
+│   │   ├── partitioner.ex        # modular hash over stream_id
 │   │   ├── telemetry.ex          # event-catalog moduledoc; no runtime code
 │   │   ├── testing.ex            # Scriba.Testing — user-facing test helpers
 │   │   ├── migrations.ex         # up/0, down/0 for users to call
@@ -983,10 +1011,12 @@ create empty placeholder files for future versions.
 
 #### Resume semantics on Pipeline restart
 
-When the Pipeline is restarted — through `Coordinator.pause/2` +
-`Coordinator.resume/2`, or as part of `rest_for_one` recovery from a
-Pipeline-or-source crash — Broadway's tree is torn down and rebuilt,
-and a fresh source process is spawned via the source's `start_link/1`.
+When the Pipeline is restarted — `rest_for_one` recovery from a
+Pipeline-or-source crash, or a `stop` followed by a fresh start — Broadway's
+tree is torn down and rebuilt, and a fresh source process is spawned via the
+source's `start_link/1`. Pause and resume do **not** restart anything: they
+signal the existing producer and leave the Broadway tree and the source
+process intact (§7.2).
 
 **The new source starts with whatever resume point its adapter
 computes on init.** For the in-process Test source

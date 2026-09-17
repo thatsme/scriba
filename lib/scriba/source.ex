@@ -40,7 +40,7 @@ defmodule Scriba.Source do
   process holding the instruction — that is a restart of the projection as a
   whole, and it comes back `:running`.
 
-  The Coordinator's `pause/2` returns `:ok` once the pause signal is
+  `Scriba.pause/2` returns `:ok` once the pause signal is
   sent to the producer (asynchronous `send/2`). It does NOT wait for
   the source's `handle_info` to run. In-flight events already in
   Pipeline processors or batchers continue through their commit

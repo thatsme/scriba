@@ -97,8 +97,10 @@ defmodule Scriba.Target.Ecto do
   batch touches. One position-update step is appended per stream, keyed
   `{:scriba_position, stream_id}`.
 
-  `dead_letters` is a list of `{event, error}` tuples for events whose
-  handler returned `{:error, _}` or raised. One dead-letter step is
+  `dead_letters` is a list of `{event, error}` tuples for every per-event
+  failure the Pipeline isolated: a handler that returned `{:error, _}` or
+  raised, an `Ecto.Multi` operation-name collision, or a return the target
+  rejected as invalid. One dead-letter step is
   appended per failed event, keyed `{:scriba_dead_letter, event.id}` (the
   same key shape `Scriba.DeadLetter.multi/4` produces).
 

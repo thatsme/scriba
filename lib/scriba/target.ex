@@ -23,7 +23,9 @@ defmodule Scriba.Target do
 
   ## Other targets
 
-  Only `Scriba.Target.Ecto` ships. Another one is perfectly implementable —
+  `Scriba.Target.Ecto` is the only production target that ships;
+  `Scriba.Target.Test` ships alongside it for tests. Another one is perfectly
+  implementable —
   `Scriba.Position.multi/5` and `Scriba.DeadLetter.multi/4` are public so an
   Ecto-based target reuses the cursor and dead-letter SQL rather than
   reimplementing it — and if you need one, **open an issue**. It will be
@@ -117,7 +119,9 @@ defmodule Scriba.Target do
   non-`:skip` result without interpreting it.
 
   Implement it when the target has a fixed result vocabulary, as
-  `Scriba.Target.Ecto` does with §4.2's six shapes. The Pipeline consults this
+  `Scriba.Target.Ecto` does with the five success shapes of §4.2 — the sixth,
+  `{:error, reason}`, is a failure the Pipeline classifies before this
+  callback is consulted. The Pipeline consults this
   *before* assembling a batch and routes anything rejected to the dead-letter
   table as a per-event failure, with `error_kind` `"invalid_return"`.
 

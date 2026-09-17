@@ -10,9 +10,9 @@ defmodule Scriba.Info do
   `:status`, `:source` and `:target` come from the Coordinator's status
   call; `:watermark` and `:lag_ms` are read from `scriba_watermarks`.
 
-  Three fields are legitimately `nil`: `:halt_reason` outside `:halted`, and
-  `:watermark`/`:lag_ms` before the projection has committed anything or for
-  a source that reports no watermark.
+  Three fields are legitimately `nil`: `:halt_reason` until a halt occurs,
+  and `:watermark`/`:lag_ms` before the projection has committed anything or
+  for a source that reports no watermark.
 
   When no Coordinator is registered, `Scriba.info/2` returns
   `{:error, :not_found}` rather than a partially-populated struct.
@@ -32,7 +32,8 @@ defmodule Scriba.Info do
 
   `:halt_reason` carries the underlying error — usually a `Postgrex.Error`
   whose SQLSTATE names the cause, or `{:integrity_wipeout, n}` when a whole
-  batch failed on integrity grounds — and is `nil` in every other state. Polling
+  batch failed on integrity grounds — and is retained once set, including
+  after `Scriba.stop/2` moves a halted projection to `:stopped`. Polling
   `status` is enough to detect it — you do not have to have been subscribed to
   `[:scriba, :projection, :halted]` at the instant it fired.
 

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-17
+
+Correctness fixes in the projection lifecycle, and a documentation pass that
+corrected around thirty-five claims across the README, the architecture
+document, the migration guide and the published moduledocs.
+
 ### Fixed
 
 - A Pipeline that dies while the projection is `:paused` or `:halted` is
@@ -21,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `:paused`. A halt likewise survives: its cause is a schema or a permission,
   which a replacement Pipeline meets in the same way.
 
+- `Scriba.Testing` no longer silently skips result validation. It asked
+  `function_exported?/3` whether the target defined `valid_result?/1`, which
+  answers `false` for a module that merely has not been loaded yet — so
+  whether an invalid handler return was reported as `:invalid` depended on
+  whether something else had happened to load the target first. It now loads
+  the module before asking.
+
 - `Scriba.Position.cache_put/4` no longer moves a stream's cursor backwards.
   The cache is what source-side dedup reads, so a lower position overwriting a
   higher one re-applies events that already committed.
@@ -34,6 +47,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rendered on HexDocs matches the current minor. The pre-release gate checks
   the repository; this checks what a reader actually meets, which is where
   0.2.0's `~> 0.1` survived.
+
+### Documentation
+
+An audit of every shipped document against the code corrected, among others:
+
+- `:start_from` was shown as a `use Scriba.Projection` option in the README's
+  migration summary. It is not one, and a reader copying it got a compile
+  error; it belongs in the source spec.
+- The retry default was described as "100ms, 1s, 10s". At the default of three
+  attempts only the first two sleeps happen.
+- The README claimed lag was "a telemetry-consumer concern, not an engine
+  feature", which 0.2.0 stopped being true.
+- The README and architecture document both said a structural halt moves no
+  cursor. Work the per-event pass had already committed does stand.
+- `MIGRATION.md`'s dead-letter table gave `error_kind` for a raised exception
+  as `"FunctionClauseError"`; the stored value is `"Elixir.FunctionClauseError"`,
+  and the filter is an exact match, so the documented query returned nothing.
+- The architecture document described pause/resume as restarting the Pipeline,
+  described `Scriba.Circuit`'s integrity-wipeout rule without its blast-radius
+  condition, and called the partitioner consistent hashing where it is modular
+  hashing.
+- `Scriba.Target`'s docs said only `Scriba.Target.Ecto` ships, and described
+  its result vocabulary as six shapes where `valid_result?/1` accepts five.
+- The README did not mention that `:subscription_name` defaults to `"scriba"`
+  for every projection, so two projections left on the default contend and one
+  stands by indefinitely while reporting `:running`.
 
 ## [0.2.1] - 2026-09-16
 
@@ -506,7 +545,8 @@ filled before it stopped being actively maintained.
   results plus per-stream cursor advances plus per-event dead-letter
   inserts; runs everything in a single `Repo.transaction/1`. Handler
   returns become Multi steps:
-    - `:skip` → no step (cursor still advances per-stream).
+    - `:skip` → no step. (This entry originally said the cursor still
+      advances. It does not; the error was corrected in 0.1.4.)
     - `{:insert, struct}` → `Ecto.Multi.insert/3`.
     - `{:update, schema, filter, [set: changes]}` → `Ecto.Multi.update_all/4`.
     - `{:delete, schema, filter}` → `Ecto.Multi.delete_all/3`.
@@ -731,5 +771,12 @@ similar:
   Database-level failure leaves the batch unacked; the source
   re-delivers when the projection's Pipeline next runs.
 
-[Unreleased]: https://github.com/thatsme/scriba/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/thatsme/scriba/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/thatsme/scriba/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/thatsme/scriba/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/thatsme/scriba/compare/v0.1.4...v0.2.0
+[0.1.4]: https://github.com/thatsme/scriba/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/thatsme/scriba/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/thatsme/scriba/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/thatsme/scriba/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/thatsme/scriba/releases/tag/v0.1.0

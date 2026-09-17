@@ -83,7 +83,8 @@ defmodule Scriba.Projection do
   projection over an incomplete read model.
 
   Loud is the choice. It is also the one that stays open: an opt-in
-  `on_unmatched: :skip` can be added in any 0.1.x without breaking anyone,
+  `on_unmatched: :skip` can be added in any patch release without breaking
+  anyone,
   whereas changing the *default* to skip would silently convert recorded
   failures into nothing.
   """

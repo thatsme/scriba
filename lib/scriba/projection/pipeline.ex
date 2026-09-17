@@ -364,8 +364,10 @@ defmodule Scriba.Projection.Pipeline do
     # dead-lettering advances the cursor past the failed event so the
     # projection doesn't get stuck. Skipped events (dedup-induced OR user
     # :skip) leave the cursor alone — critical for the dedup case where a
-    # redelivered batch of below-cursor events must not regress the cursor
-    # via Position.multi/5's unconditional ON CONFLICT update.
+    # redelivered batch of below-cursor events should produce no cursor
+    # advance at all. Regression is separately impossible — Position.multi/5
+    # upserts with GREATEST and cache_put/4 refuses a lower position — but a
+    # skip has nothing to advance past in the first place.
     stream_advances =
       messages
       |> Enum.reject(fn msg -> msg.data.handler_result == :skip end)

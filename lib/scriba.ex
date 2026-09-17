@@ -163,9 +163,11 @@ defmodule Scriba do
   it reads high and what it is not safe to build on.
 
   The `:status` field is one of `:initializing | :running | :paused |
-  :draining | :halted | :stopped`. `:initializing` is the brief window between
-  Coordinator start and Broadway producer registration; transitions to
-  `:running` automatically.
+  :draining | :halted | :stopped`. `:initializing` is the window in which the
+  Coordinator is waiting for a Pipeline and its Broadway producer to register
+  — at startup, and again after a Pipeline restart. It then transitions
+  automatically to the state the projection was in when the Pipeline was
+  lost: `:running`, `:paused` or `:halted`.
 
   `:halted` means a structural commit failure stopped the projection — it is
   making no progress and needs a human. `:halt_reason` names the cause. This
@@ -261,8 +263,9 @@ defmodule Scriba do
       where pause makes sense. The inner atom is the projection's current
       state:
 
-        - `:initializing` — engine starting up; retry once `info/1`
-          reports `:running`.
+        - `:initializing` — the Pipeline is being started or re-monitored;
+          retry once `info/1` reports a settled state, which after a
+          Pipeline restart is whichever state the projection was in before.
         - `:paused` — already paused. **No idempotency** — callers wanting
           "make sure this is paused" semantics check `info/1` first or
           pattern-match this error case as success.
@@ -318,7 +321,7 @@ defmodule Scriba do
     do: Coordinator.resume(name, version)
 
   @doc """
-  Stops a running or paused projection. Waits for in-flight Broadway
+  Stops a running, paused or halted projection. Waits for in-flight Broadway
   shutdown to complete before returning.
 
   Returns `:ok` on success, `{:error, {:invalid_state, state}}` if the

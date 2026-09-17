@@ -245,8 +245,8 @@ you migrate a projector that maintains a counter, a total, or a ranking.
 | `name:` | `name:` — but see below |
 | — | `parallelism:` (required, no default) |
 | — | `version:` (defaults to `1`) |
-| `schema_prefix:` | no equivalent |
-| `timeout:` | no equivalent |
+| `schema_prefix:` | none — rejected at compile time, with a message saying so |
+| `timeout:` | none — rejected at compile time as an unknown option |
 
 `:name` is Scriba's *projection* identity (it keys `scriba_positions`), not
 the event-store subscription name — that's `:subscription_name` on the
@@ -449,7 +449,7 @@ handlers.
 
    | `error_kind` | What you did |
    |---|---|
-   | `"FunctionClauseError"` | missing `handle/2` clause — add the `:skip` catch-all |
+   | `"Elixir.FunctionClauseError"` | missing `handle/2` clause — add the `:skip` catch-all |
    | `"invalid_return"` | returned something outside the six shapes |
    | `"multi_key_collision"` | reused a static `Ecto.Multi` key across a batch |
    | `"error"` | your handler returned `{:error, _}` |
