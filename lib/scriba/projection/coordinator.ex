@@ -31,11 +31,13 @@ defmodule Scriba.Projection.Coordinator do
     # rather than inferred, so `Scriba.info/2` can name the cause and not just
     # the state.
     halt_reason: nil,
-    # Set when a Pipeline dies while the projection is paused. A pause lives
-    # in the producer, and the supervisor's replacement producer starts
-    # unpaused, so the instruction has to be reapplied to it — otherwise a
-    # crash quietly defeats the pause. Cleared as soon as it is.
-    pause_on_ready: false
+    # Where to go once a replacement Pipeline has been monitored. A Pipeline
+    # that dies is re-monitored through :initializing, and the state it was
+    # lost from is not always the one to come back to: `:running` is, but a
+    # pause has to be reapplied to the new producer, and a halt has to be
+    # preserved rather than cleared by a restart nobody asked for. Reset to
+    # `:running` once honoured.
+    ready_state: :running
   ]
 
   # Used only for the one-shot pipeline-pid lookup re-arm (see :state_timeout
@@ -305,34 +307,32 @@ defmodule Scriba.Projection.Coordinator do
   # @poll_interval state_timeout pattern in :initializing waits for the
   # new Pipeline (and its producer) to register.
 
+  # `:paused` and `:halted` keep a live Pipeline too — a pause stops the
+  # producer yielding and a halt stops the projection acknowledging, neither
+  # tears anything down — so all three states can lose one, and all three have
+  # to re-monitor. Dropping the DOWN instead left the Coordinator holding a
+  # dead reference that matched no later DOWN, beside a Pipeline it had
+  # stopped watching for good.
+  #
+  # Which state to come back to is the part that differs, and `ready_state`
+  # carries it: a pause has to be reapplied to the replacement producer, which
+  # starts unpaused, and a halt has to survive a restart the operator did not
+  # ask for and has not fixed the cause of.
   def handle_event(
         :info,
         {:DOWN, ref, :process, _pid, _reason},
-        :running,
+        state,
         %{pipeline_ref: ref} = data
-      ) do
-    {:next_state, :initializing, %{data | pipeline_pid: nil, pipeline_ref: nil},
-     [{:next_event, :internal, :try_monitor}]}
-  end
-
-  # A paused projection still has a live Pipeline, so it can still die — the
-  # producer is built to die on commit failure to force a replay. Re-monitor
-  # it the same way `:running` does, but come back to `:paused` rather than to
-  # `:running`: the pause was an operator instruction, and the replacement
-  # producer starts unpaused. Without this clause the projection resumes
-  # processing behind the operator's back while `Scriba.info/2` still reports
-  # `:paused`, and the stale ref means no later DOWN is ever matched again.
-  def handle_event(
-        :info,
-        {:DOWN, ref, :process, _pid, _reason},
-        :paused,
-        %{pipeline_ref: ref} = data
-      ) do
+      )
+      when state in [:running, :paused, :halted] do
     {:next_state, :initializing,
-     %{data | pipeline_pid: nil, pipeline_ref: nil, pause_on_ready: true},
+     %{data | pipeline_pid: nil, pipeline_ref: nil, ready_state: state},
      [{:next_event, :internal, :try_monitor}]}
   end
 
+  # Any other state deliberately has no Pipeline to mourn: `:stopped` and
+  # `:draining` took it down themselves, and `:initializing` has not got one
+  # yet.
   def handle_event(:info, {:DOWN, _ref, _, _, _}, _state, _data),
     do: :keep_state_and_data
 
@@ -452,11 +452,22 @@ defmodule Scriba.Projection.Coordinator do
     end
   end
 
-  # Where a newly monitored Pipeline lands: `:running`, unless a pause was in
-  # force when the previous one died.
-  defp ready(%{pause_on_ready: false} = data), do: {:next_state, :running, data}
+  # Where a newly monitored Pipeline lands.
+  defp ready(%{ready_state: :running} = data), do: {:next_state, :running, data}
 
-  defp ready(data) do
+  # A halt outlives the Pipeline that reported it. The cause is a schema or a
+  # permission, so a replacement Pipeline meets exactly the same wall and
+  # would halt again on its first batch; coming back `:running` in the
+  # meantime would report progress that is not happening. `halt_reason` is
+  # already in data and stays there.
+  defp ready(%{ready_state: :halted} = data) do
+    {:next_state, :halted, %{data | ready_state: :running}}
+  end
+
+  # A pause lives in the producer, and this producer is a new one, so the
+  # instruction has to be reapplied before the state can honestly say
+  # `:paused`.
+  defp ready(%{ready_state: :paused} = data) do
     {source_module, _source_opts} = data.source_spec
 
     case Pipeline.get_producer_pid(data.name, data.version) do
@@ -471,7 +482,7 @@ defmodule Scriba.Projection.Coordinator do
         # No `[:scriba, :projection, :paused]` here: the projection is not
         # entering a pause, it is restoring one that never ended, and an
         # operator counting those events should not see a second.
-        {:next_state, :paused, %{data | pause_on_ready: false}}
+        {:next_state, :paused, %{data | ready_state: :running}}
     end
   end
 

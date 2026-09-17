@@ -388,7 +388,9 @@ Conventions:
 :paused       -- resume               --> :running
 :running      -- stop                 --> :draining --> :stopped
 :paused       -- stop                 --> :stopped     (direct terminate)
-:running      -- Pipeline DOWN        --> :initializing (rest_for_one respawn)
+:running      -- Pipeline DOWN        --> :initializing --> :running
+:paused       -- Pipeline DOWN        --> :initializing --> :paused
+:halted       -- Pipeline DOWN        --> :initializing --> :halted
 any           -- structural failure   --> :halted       (terminal; the
                                          halt cast is accepted from every
                                          state except :halted itself)
@@ -399,6 +401,21 @@ any           -- crash                --> (supervisor restarts to :initializing,
 `pause` and `resume` are rejected from `:halted` with
 `{:error, {:invalid_state, :halted}}`. `stop` is the way out, once the
 schema or permission that caused the halt has been fixed.
+
+A Pipeline can die from any of the three states that keep one alive, and each
+returns to the state it was lost from rather than to `:running`. The
+distinction matters for `:paused`: a pause lives in the producer and the
+replacement producer starts unpaused, so the Coordinator reapplies it before
+returning to `:paused`. A halt needs nothing reapplied — its cause is a schema
+or a permission, which the replacement Pipeline meets in the same way — but it
+must not be cleared by a restart nobody asked for. In all three cases the
+replacement is monitored: keeping the dead reference would leave the
+Coordinator beside a Pipeline it had stopped watching.
+
+None of this survives a *Coordinator* restart. The Coordinator is the process
+holding the instruction, so a projection whose Coordinator crashes comes back
+`:initializing` and then `:running`, which §7.1 treats as a restart of the
+projection as a whole.
 
 `:running → :paused` is a **held-demand** transition, not
 stop-and-restart. The Coordinator calls `Source.pause/1` on the

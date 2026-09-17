@@ -9,13 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A Pipeline that dies while the projection is `:paused` or `:halted` is
+  monitored again. Only `:running` handled the `:DOWN` before, so from the
+  other two the Coordinator kept a dead monitor reference that matched no
+  later `:DOWN`, and sat beside a Pipeline it had stopped watching for good.
+
 - A pause now survives a Pipeline restart. A pause lives in the producer, and
   the replacement producer starts unpaused, so a Pipeline that died while the
   projection was paused came back emitting while `Scriba.info/2` still
   reported `:paused`. The Coordinator reapplies the pause before returning to
-  `:paused`. It also monitors the replacement: previously the stale monitor
-  reference matched no later `:DOWN`, leaving the projection beside a Pipeline
-  it had stopped watching.
+  `:paused`. A halt likewise survives: its cause is a schema or a permission,
+  which a replacement Pipeline meets in the same way.
 
 - `Scriba.Position.cache_put/4` no longer moves a stream's cursor backwards.
   The cache is what source-side dedup reads, so a lower position overwriting a

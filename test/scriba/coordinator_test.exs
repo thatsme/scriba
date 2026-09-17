@@ -396,6 +396,53 @@ defmodule Scriba.Projection.CoordinatorTest do
     end
   end
 
+  describe "a Pipeline that goes DOWN while the projection is halted" do
+    test "stays halted, and keeps the cause", %{name: name, version: v} do
+      eventually(fn -> assert Coordinator.state(name, v) == :running end)
+
+      reason = %Postgrex.Error{postgres: %{pg_code: "42703", code: :undefined_column}}
+      :ok = Coordinator.halt(name, v, reason)
+      eventually(fn -> assert Coordinator.state(name, v) == :halted end)
+
+      report_pipeline_down(name, v)
+
+      # The cause is a schema or a permission, so a replacement Pipeline meets
+      # the same wall. Reporting :running until it does would be reporting
+      # progress that is not happening.
+      eventually(fn -> assert Coordinator.state(name, v) == :halted end, 2_000)
+
+      {:ok, info} = Scriba.info(name, v)
+      assert info.status == :halted
+      assert info.halt_reason == reason
+    end
+
+    test "monitors the Pipeline again", %{name: name, version: v} do
+      eventually(fn -> assert Coordinator.state(name, v) == :running end)
+      :ok = Coordinator.halt(name, v, :boom)
+      eventually(fn -> assert Coordinator.state(name, v) == :halted end)
+
+      ref_before = pipeline_ref(name, v)
+      report_pipeline_down(name, v)
+      eventually(fn -> assert Coordinator.state(name, v) == :halted end, 2_000)
+
+      ref_after = pipeline_ref(name, v)
+      assert is_reference(ref_after)
+      refute ref_after == ref_before
+    end
+
+    test "stop is still the way out afterwards", %{name: name, version: v} do
+      eventually(fn -> assert Coordinator.state(name, v) == :running end)
+      :ok = Coordinator.halt(name, v, :boom)
+      eventually(fn -> assert Coordinator.state(name, v) == :halted end)
+
+      report_pipeline_down(name, v)
+      eventually(fn -> assert Coordinator.state(name, v) == :halted end, 2_000)
+
+      assert :ok = Coordinator.stop(name, v)
+      assert Coordinator.state(name, v) == :stopped
+    end
+  end
+
   ## Test helpers
 
   defp coordinator_pid(name, v) do
