@@ -830,6 +830,11 @@ the resume-after-restart guarantee.
   `commanded_ecto_projections` did not.
 - `sandbox_harness_test.exs` — foundation test for the shared-mode Ecto
   sandbox the others depend on.
+- `position_repo_test.exs` — the repo-backed half of `Scriba.Position`: the
+  preload `Coordinator.init/1` runs, the per-stream lazy load the Pipeline
+  falls back to on a cache miss, and the direction each fails in. Its
+  counterpart `test/scriba/position_test.exs` passes no repo, so without this
+  the paths that make the cache trustworthy after a restart were unexercised.
 - `watermark_test.exs`, `lag_telemetry_test.exs`, `reset_test.exs`,
   `dead_letter_inspection_test.exs`, `test_helpers_test.exs` — the same
   treatment for the watermark, lag telemetry, `Scriba.reset/2`, dead-letter
@@ -901,6 +906,10 @@ scriba/
 ├── SCRIBA_ARCHITECTURE.md        # this file; ships in the package
 ├── docker-compose.yml            # dev Postgres on 5433
 ├── docker/
+├── bench/                        # separate Mix project: throughput harness,
+│                                 #   plus tests needing a real event store
+├── examples/
+│   └── bank/                     # separate Mix project: runnable example
 ├── docs/
 │   ├── post-v0.1.md              # deferred design notes (repo only)
 │   └── internal/                 # gitignored working documents
@@ -962,6 +971,7 @@ scriba/
         ├── lag_telemetry_test.exs
         ├── reset_test.exs
         ├── dead_letter_inspection_test.exs
+        ├── position_repo_test.exs
         └── test_helpers_test.exs
 ```
 
